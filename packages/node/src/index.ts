@@ -142,6 +142,32 @@ export type {
   AutoCaptureSource,
 } from "./auto-capture";
 
+export {
+  BACKEND_RUNTIME_EVENT,
+  DEFAULT_RUNTIME_METRIC_INTERVAL_MS,
+  MAX_RUNTIME_SAMPLE_BYTES,
+  MAX_RUNTIME_METRIC_INTERVAL_MS,
+  MIN_RUNTIME_METRIC_INTERVAL_MS,
+  buildNodeRuntimeEvent,
+  installRuntimeMetrics,
+  normalizeRuntimeMetricIntervalMs,
+  readRuntimeContainerLimits,
+} from "./runtime-metrics";
+
+export type {
+  NodeRuntimeSample,
+  RuntimeContainerLimits,
+  RuntimeCpuUsage,
+  RuntimeEventLoopDelayMonitor,
+  RuntimeEventLoopUtilization,
+  RuntimeMetricsHandle,
+  RuntimeMetricsOptions,
+  RuntimeMetricsReadFile,
+  RuntimeMemoryUsage,
+  RuntimePerformance,
+  RuntimeProcess,
+} from "./runtime-metrics";
+
 // ── Node contract capability marker ──────────────────────────────────────────
 // Append-only block. Do not reorder the exports above.
 // The hosted cloud namespace-imports this package and reads

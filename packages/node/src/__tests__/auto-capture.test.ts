@@ -5,8 +5,15 @@ import {
   autoCapture,
   __resetAutoCaptureInstallForTests,
 } from "../auto-capture";
-import { runInBackendRequestContext } from "../request-context";
+import { withCrumbtrailJob } from "../jobs";
+import {
+  getBackendRequestContext,
+  runInBackendRequestContext,
+} from "../request-context";
 import type { AutoCaptureHandle } from "../auto-capture";
+
+const PARENT_TRACEPARENT =
+  "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
 
 // A minimal stand-in for `process` the hooks attach to. It is a real
 // EventEmitter (so on/removeListener/emit behave), plus the fields autoCapture
@@ -14,6 +21,16 @@ import type { AutoCaptureHandle } from "../auto-capture";
 function makeFakeProcess(opts: {
   env?: Record<string, string | undefined>;
   loadEnvFile?: () => void;
+  runtime?: {
+    pid?: number;
+    memoryUsage?: () => {
+      rss?: number;
+      heapUsed?: number;
+      external?: number;
+    };
+    cpuUsage?: () => { user: number; system: number };
+    uptime?: () => number;
+  };
 }): NodeJS.Process {
   const emitter = new EventEmitter() as unknown as NodeJS.Process;
   (emitter as unknown as { env: Record<string, string | undefined> }).env =
@@ -23,6 +40,7 @@ function makeFakeProcess(opts: {
       opts.loadEnvFile;
   }
   (emitter as unknown as { exit: (code: number) => void }).exit = vi.fn();
+  Object.assign(emitter, opts.runtime);
   return emitter;
 }
 
@@ -514,6 +532,160 @@ describe("autoCapture", () => {
       (e) => e.k === AUTO_CAPTURE_ERROR_EVENT && e.d.source === "console.error",
     );
     expect(logged!.d.message).toBeUndefined();
+  });
+
+  it("routes runtime samples through the session and stops the sampler with capture", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      let cpuReads = 0;
+      const proc = makeFakeProcess({
+        env: { CRUMBTRAIL_KEY: "k" },
+        runtime: {
+          pid: 321,
+          memoryUsage: () => ({ rss: 4_000, heapUsed: 2_000, external: 700 }),
+          cpuUsage: () => {
+            cpuReads += 1;
+            return cpuReads === 1
+              ? { user: 10_000, system: 5_000 }
+              : { user: 10_300, system: 5_500 };
+          },
+          uptime: () => 12.5,
+        },
+      });
+      const { fetchImpl, calls } = makeFetch();
+
+      track(
+        await autoCapture({
+          endpoint: ENDPOINT,
+          processImpl: proc,
+          consoleImpl: { error: vi.fn() },
+          fetchImpl,
+          runtimeMetrics: true,
+          // The sampler clamps this to its 10 second minimum.
+          runtimeMetricIntervalMs: 1,
+          instrumentDatabases: false,
+          captureLogs: false,
+          captureRuntimeWarnings: false,
+          captureHttpRequests: false,
+          captureOutboundHttp: false,
+        }),
+      );
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(
+        eventsFrom(calls).some((event) => event.k === "backend.runtime"),
+      ).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => {
+        expect(
+          eventsFrom(calls).filter((event) => event.k === "backend.runtime"),
+        ).toHaveLength(1);
+      });
+
+      const runtimeEvent = eventsFrom(calls).find(
+        (event) => event.k === "backend.runtime",
+      );
+      expect(runtimeEvent?.d).toMatchObject({
+        rssBytes: 4_000,
+        heapUsedBytes: 2_000,
+        externalBytes: 700,
+        cpuUserDeltaMicros: 300,
+        cpuSystemDeltaMicros: 500,
+        processStartMarker: expect.stringMatching(/^node:321:/),
+      });
+      expect(runtimeEvent?.d).not.toHaveProperty("CRUMBTRAIL_KEY");
+      expect(JSON.stringify(runtimeEvent?.d).length).toBeLessThan(4_096);
+
+      const runtimeCount = eventsFrom(calls).filter(
+        (event) => event.k === "backend.runtime",
+      ).length;
+      for (const handle of openHandles) handle.stop();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(
+        eventsFrom(calls).filter((event) => event.k === "backend.runtime"),
+      ).toHaveLength(runtimeCount);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the auto-capture sink available for distributed job sessions", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const capture = track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        runtimeMetrics: false,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    const result = await runInBackendRequestContext(
+      {
+        sessionId: capture.sessionId,
+        sessionIdSource: "process",
+        requestId: "request_parent",
+        traceparent: PARENT_TRACEPARENT,
+      },
+      () =>
+        withCrumbtrailJob(
+          {
+            name: "record-payment",
+            queue: "payments",
+            jobId: "job_991",
+            now: () => 1_500,
+          },
+          async (context) => {
+            expect(context.sessionId).not.toBe(capture.sessionId);
+            expect(getBackendRequestContext()).toMatchObject({
+              sessionId: context.sessionId,
+              requestId: "request_parent",
+            });
+            return 42;
+          },
+        ),
+    );
+
+    expect(result).toBe(42);
+    const linkCall = calls.find((call) =>
+      call.url.endsWith("/api/session/link"),
+    );
+    expect(linkCall).toBeDefined();
+    expect(JSON.parse(linkCall!.init.body as string)).toMatchObject({
+      fromSessionId: capture.sessionId,
+      relation: "caused",
+      method: "trace_context",
+      matchedOn: {
+        requestId: "request_parent",
+        name: "record-payment",
+        queue: "payments",
+        jobId: "job_991",
+      },
+    });
+
+    const jobEvents = calls
+      .filter((call) => call.url.endsWith("/api/events"))
+      .flatMap((call) => {
+        const body = JSON.parse(call.init.body as string) as {
+          events?: Array<Record<string, unknown>>;
+        };
+        return body.events ?? [];
+      })
+      .filter(
+        (event) =>
+          event.k === "backend.job.start" || event.k === "backend.job.end",
+      );
+    expect(jobEvents).toHaveLength(2);
+    expect(jobEvents[0]?.sessionId).toBe(jobEvents[1]?.sessionId);
+    expect(jobEvents[0]?.sessionId).not.toBe(capture.sessionId);
   });
 
   it("onError surfaces a session-start failure (endpoint unreachable / bad cert)", async () => {
