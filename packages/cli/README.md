@@ -420,3 +420,43 @@ product that competes with Crumbtrail. See [LICENSE](LICENSE).
 
 The SDKs it installs are MIT, so nothing the installer puts into your
 application carries any restriction.
+
+## Validate a data repair
+
+A canonical data issue can carry a witness derived from its captured primary keys and
+bad values. Set `CRUMBTRAIL_ENDPOINT`, `CRUMBTRAIL_AGENT_TOKEN`, and
+`CRUMBTRAIL_PROJECT_KEY` for that project. Set `DATABASE_URL` to your database
+connection string, or to a SQLite file path.
+
+```bash
+crumbtrail witness --project "$PROJECT_ID" --issue "$ISSUE_ID" --dry-run
+crumbtrail witness --project "$PROJECT_ID" --issue "$ISSUE_ID" --fix-script ./repair.mjs
+```
+
+The repair script must be readable and executable. The command reads the witness,
+runs your script, reads it again, uploads both observations, and prints the cloud
+verdict. CI uses the same command. Add `--wait` to apply the named script yourself
+between observations. `--connection-env` selects another environment variable instead
+of `DATABASE_URL`. Endpoint and agent credentials can also come from saved CLI auth.
+
+Dry run fetches the witness and prints its shapes, parameters, and identifying columns.
+It does not connect to the database or upload observations. Normal execution prints
+counts and redacted primary keys. Other database row values are never printed.
+
+`verified_fix` requires matching rows from every statement before the repair and none
+afterwards, with distinct repair identities. `non_reproducible` means the original data
+state was absent, including data already repaired. Both outcomes exit with status zero.
+Other verdicts, missing evidence, and connection failures exit with status one. Repair
+script output is suppressed. A failed script stops before the after observation.
+
+Postgres, MySQL, SQLite, SQL Server, and MongoDB are supported. SQLite requires a Node
+runtime providing `node:sqlite`. The runner returns at most 25 identifying rows per
+statement and reports the true count separately. Generated reads run in a read only
+transaction on Postgres and MySQL. SQLite opens read only. SQL Server uses a serializable
+transaction with generated SELECT statements. MongoDB uses a bounded read aggregation.
+The runner never boots your application, copies the database, or sends the connection
+string to Crumbtrail. Your named script owns all repair writes.
+
+During setup, `--reproduction` enables data reproduction and read capture together.
+`--no-reproduction` leaves both off. Interactive setup offers the same choice. Read
+capture is capped at 25 rows per statement and can be turned off in capture settings.
