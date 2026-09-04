@@ -53,15 +53,19 @@ public sealed class CaptureMiddleware(RequestDelegate next)
             context.Response.Body = original;
             try
             {
-                var responseBody = IsJson(context.Response.ContentType)
-                    ? StructuredBody.Capture(tee.Captured.ToArray(), tee.Truncated) : new CapturedBody(null, "missing");
+                var permitsBody = !HttpMethods.IsHead(context.Request.Method) &&
+                    context.Response.StatusCode is not (>= 100 and < 200) and not 204 and not 205 and not 304;
+                var incomplete = tee.Truncated || failure is not null ||
+                    (context.Response.ContentLength is { } declared && declared != tee.WrittenBytes);
+                var responseBody = permitsBody && IsJson(context.Response.ContentType)
+                    ? StructuredBody.Capture(tee.Captured.ToArray(), incomplete) : new CapturedBody(null, "missing");
                 if (failure is not null) capture.Add("backend.req.error", new { requestId = capture.RequestId,
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, route,
                     error = new { name = failure.GetType().Name }, correlation });
                 capture.AddTerminal("backend.req.end", new { requestId = capture.RequestId,
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, pathname = path, route,
                     statusCode = failure is null ? context.Response.StatusCode : 500,
-                    durationMs = watch.Elapsed.TotalMilliseconds, responseBody = responseBody.Body, responseBodyTruncated = tee.Truncated,
+                    durationMs = watch.Elapsed.TotalMilliseconds, responseBody = responseBody.Body, responseBodyTruncated = responseBody.State == "truncated",
                     responseBodyState = responseBody.State, redaction = responseBody.RedactionFor("responseBody"),
                     correlation, service = options.Service });
                 if (capture.DroppedEvents > 0) log.LogWarning("Crumbtrail request exceeded capture limit; {Count} events omitted", capture.DroppedEvents);
@@ -84,8 +88,10 @@ public sealed class CaptureMiddleware(RequestDelegate next)
     {
         public MemoryStream Captured { get; } = new();
         public bool Truncated { get; private set; }
+        public long WrittenBytes { get; private set; }
         private void Keep(ReadOnlySpan<byte> bytes)
         {
+            WrittenBytes += bytes.Length;
             var remaining = 16384 - (int)Captured.Length;
             Captured.Write(bytes[..Math.Min(remaining, bytes.Length)]);
             Truncated |= bytes.Length > remaining;
