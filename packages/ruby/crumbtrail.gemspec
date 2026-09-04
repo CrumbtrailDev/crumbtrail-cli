@@ -6,5 +6,6 @@ Gem::Specification.new do |s|
   s.homepage = 'https://github.com/CrumbtrailDev/crumbtrail-cli'
   s.license = 'MIT'
   s.required_ruby_version = '>= 3.2'
+  s.add_dependency 'json', '>= 2.21.2', '< 3'
   s.files = Dir['lib/**/*.rb'] + ['README.md', 'LICENSE']
 end

@@ -12,7 +12,9 @@ module Crumbtrail
         @subscription ||= ActiveSupport::Notifications.monotonic_subscribe('sql.active_record') do |_name, start, finish, _id, payload|
           context = Crumbtrail.current
           next unless context
-          operation = payload[:sql].to_s.lstrip[/\A(?:SELECT|INSERT|UPDATE|DELETE|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i]&.upcase || 'OTHER'
+          sql = payload[:sql].to_s
+          sql = '' if sql.bytesize > 32_768
+          operation = sql.lstrip[/\A(?:SELECT|INSERT|UPDATE|DELETE|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i]&.upcase || 'OTHER'
           data = { engine: engine, op: %w[SELECT INSERT UPDATE DELETE].include?(operation) ? operation.downcase : 'other', table: nil, shape: '[statement omitted]', rowCount: payload[:row_count].is_a?(Integer) ? payload[:row_count] : nil, rowEvidence: 'not_captured', durationMs: (finish - start) * 1000, cached: !!payload[:cached] }
           error = payload[:exception_object]
           data.merge!(errorName: error.class.name, code: nil, category: 'unknown') if error

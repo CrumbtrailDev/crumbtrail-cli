@@ -4,11 +4,12 @@ require 'json'
 
 module Crumbtrail
   class Sender
-    def initialize(endpoint:, key:)
+    def initialize(endpoint:, key:, cert_store: nil)
       @endpoint = URI(endpoint)
       raise ArgumentError, 'Crumbtrail requires HTTPS without credentials, query or fragment' unless @endpoint.is_a?(URI::HTTPS) && @endpoint.host && !@endpoint.userinfo && !@endpoint.query && !@endpoint.fragment
       raise ArgumentError, 'Crumbtrail ingest key is required' if key.to_s.strip.empty? || key.match?(/[[:cntrl:]]/)
       @key = key
+      @cert_store = cert_store
       @queue = SizedQueue.new(64)
       @worker = Thread.new do
         while (batch = @queue.pop)
@@ -37,7 +38,9 @@ module Crumbtrail
           req['Authorization'] = "Bearer #{@key}"
           req['Content-Type'] = 'application/json'
           req.body = payload
-          res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 2, read_timeout: 3, write_timeout: 3) { |http| http.request(req) }
+          options = { use_ssl: true, open_timeout: 2, read_timeout: 3, write_timeout: 3 }
+          options[:cert_store] = @cert_store if @cert_store
+          res = Net::HTTP.start(uri.host, uri.port, **options) { |http| http.request(req) }
           return if res.code == '200'
           return unless [404, 429].include?(res.code.to_i) || res.code.to_i >= 500
         rescue StandardError

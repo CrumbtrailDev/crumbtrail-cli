@@ -12,7 +12,7 @@ module Crumbtrail
       @sequence = 0
     end
     def add(kind, data, time = (Time.now.to_f * 1000).to_i)
-      if @events.size < 200
+      if @events.size < 200 || %w[backend.req.start backend.req.end backend.req.error].include?(kind)
         @events << { t: time, k: kind, d: data.merge(requestId: @request_id, sessionId: @session_id) }
       else
         @dropped += 1
@@ -26,6 +26,7 @@ module Crumbtrail
       if @dropped > 0
         @events << { t: (Time.now.to_f * 1000).to_i, k: 'capture_gap', d: { kind: 'capture_gap', surface: 'backend_request', reason: 'scan_budget_exceeded', requestId: @request_id, droppedEvents: @dropped } }
       end
+      @events.sort_by! { |event| [event[:t], event[:k] == 'backend.req.start' ? 0 : 1] }
       @events.each_slice(20) { |events| @sink.enqueue(sessionId: @session_id, events: events) }
     rescue StandardError
       nil
@@ -130,7 +131,7 @@ module Crumbtrail
       input = Input.new(original) if original && Body.json?(env['CONTENT_TYPE'])
       env['rack.input'] = input if input
       started, started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC), (Time.now.to_f * 1000).to_i
-      base = { method: env['REQUEST_METHOD'], url: env['PATH_INFO'], pathname: env['PATH_INFO'], service: @service,
+      base = { method: env['REQUEST_METHOD'], url: env['PATH_INFO'], route: env['PATH_INFO'], pathname: env['PATH_INFO'], service: @service,
                correlation: { status: 'linked', sessionIdSource: 'header', requestIdSource: 'header' } }
       status, headers, body = nil
       finish = lambda do |bytes, truncated, error|
@@ -138,9 +139,11 @@ module Crumbtrail
         response_body, response_state = Body.json?(headers && (headers['content-type'] || headers['Content-Type'])) ? Body.capture(bytes, truncated) : [nil, 'missing']
         context.add('backend.req.start', base.merge(body: request_body, requestBodyState: request_state, redaction: Body.metadata('body', request_state)), started_at)
         context.add('backend.req.error', base.merge(error: { name: error.class.name })) if error
-        context.add('backend.req.end', base.merge(statusCode: error ? 500 : status, durationMs: (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000,
+        context.add('backend.req.end', base.merge(statusCode: status || 500, durationMs: (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000,
           responseBody: response_body, responseBodyState: response_state, responseBodyTruncated: truncated, redaction: Body.metadata('responseBody', response_state)))
         context.flush
+      ensure
+        env['rack.input'] = original
       end
       begin
         status, headers, body = Crumbtrail.with_context(context) { @app.call(env) }
@@ -151,8 +154,6 @@ module Crumbtrail
           nil
         end
         raise
-      ensure
-        env['rack.input'] = original
       end
       [status, headers, ResponseBody.new(body, context, finish)]
     end

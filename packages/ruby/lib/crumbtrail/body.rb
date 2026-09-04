@@ -6,20 +6,11 @@ module Crumbtrail
     POLICY = 'crumbtrail.backend-redaction.v1'
     DENIED = /password|passwd|passphrase|passcode|secret|token|auth|card|cvv|cvc|ssn|email|phone|address|iban|account|birth|credential|creds|cookie|session|privatekey|apikey|accesskey|securitycode|verificationcode|connection|routingnumber|taxid|nationalid|sortcode|name|postal|payload|beforejson|afterjson/i
     class Invalid < StandardError; end
-    class UniqueHash
-      def initialize; @values = {}; end
-      def size; @values.size; end
-      def to_h(&block); @values.to_h(&block); end
-      def []=(key, value)
-        raise Invalid if @values.key?(key)
-        @values[key] = value
-      end
-    end
     def self.capture(bytes, truncated = false)
       return [nil, 'truncated'] if truncated || bytes.bytesize > LIMIT
       return [nil, 'missing'] if bytes.empty?
       removed = [false]
-      value = JSON.parse(bytes, max_nesting: 8, object_class: UniqueHash)
+      value = JSON.parse(bytes, max_nesting: 8, allow_duplicate_key: false)
       value = walk(value, '', removed)
       encoded = JSON.generate(value)
       return [nil, 'truncated'] if encoded.bytesize > LIMIT
@@ -32,7 +23,7 @@ module Crumbtrail
       sensitive = key.gsub(/[^a-zA-Z0-9]/, '').match?(DENIED) || words.any? { |w| w.match?(/\A(?:pwd|pin|pan|otp|pass|sid|dob|zip|jwt|mfa|csrf|xsrf)[0-9]*\z/i) }
       unless sensitive
         case value
-        when UniqueHash
+        when Hash
           raise Invalid if value.size > 64
           return value.to_h do |k, v|
             raise Invalid unless k.bytesize <= 64 && k.match?(/\A[a-zA-Z_][a-zA-Z0-9_]*\z/)
