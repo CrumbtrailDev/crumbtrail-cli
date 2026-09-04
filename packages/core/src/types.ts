@@ -1198,6 +1198,10 @@ export interface CrumbtrailConfig {
   sessionPersistence: "session" | "memory" | "none";
   // Rolling idle window (ms). A persisted session older than this is treated as stale.
   sessionIdleMs: number;
+  /** Maximum duration for new work in a browser session. Zero disables rotation.
+   * Requires a transport supporting explicit session event delivery.
+   */
+  maxSessionDurationMs: number;
   // Explicit session id override. When set, it always wins and is persisted (if persistence is on).
   sessionId?: string;
   // Optional platform storage adapter. Defaults to browser sessionStorage when available.
@@ -1339,6 +1343,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
 
   sessionPersistence: "session",
   sessionIdleMs: 1_800_000, // 30 minutes
+  maxSessionDurationMs: 0,
 };
 
 export type CrumbtrailPreset = "full" | "light" | "passive";
@@ -1402,6 +1407,8 @@ export interface CollectorContext {
 
 export interface CrumbtrailTransport {
   sendEvents(events: BugEvent[]): Promise<void>;
+  /** Deliver late events to their originating session after browser rotation. */
+  sendSessionEvents?(sessionId: string, events: BugEvent[]): Promise<void>;
   sendBlob(
     name: string,
     blob: Blob,

@@ -639,6 +639,8 @@ export class Crumbtrail {
   private applicationRelease: ApplicationReleaseIdentity;
   private sessionStore?: SessionStore;
   private lifecycleTimer?: ReturnType<typeof setTimeout>;
+  private durationTimer?: ReturnType<typeof setTimeout>;
+  private durationDeadline?: number;
   private lifecycleClosePromise?: Promise<void>;
   private lifecycleCloseState?: {
     immediateEnd: boolean;
@@ -860,11 +862,27 @@ export class Crumbtrail {
         instance.shouldPersistEvent(event),
       );
       if (persistable.length > 0) {
-        const send = transport
-          .sendEvents(persistable)
-          .catch((error: unknown) => {
-            instance.recordDeliveryFailure(persistable, error);
-          });
+        const batches = new Map<string, BugEvent[]>();
+        for (const event of persistable) {
+          const origin =
+            config.maxSessionDurationMs > 0 &&
+            typeof event.d.sessionId === "string"
+              ? event.d.sessionId
+              : instance.sessionId;
+          const batch = batches.get(origin) ?? [];
+          batch.push(event);
+          batches.set(origin, batch);
+        }
+        const send = Promise.all(
+          [...batches].map(([id, batch]) =>
+            (config.maxSessionDurationMs > 0 && transport.sendSessionEvents
+              ? transport.sendSessionEvents(id, batch)
+              : transport.sendEvents(batch)
+            ).catch((error: unknown) =>
+              instance.recordDeliveryFailure(batch, error),
+            ),
+          ),
+        ).then(() => undefined);
         instance.pendingSends.add(send);
         void send.then(() => instance.pendingSends.delete(send));
       }
@@ -2014,6 +2032,80 @@ export class Crumbtrail {
     );
   }
 
+  private expirePersistedVisit(): void {
+    if (!(this.config.maxSessionDurationMs > 0)) return;
+    const store = this.sessionStore ?? createWebSessionStore();
+    try {
+      const persisted = store?.read();
+      if (persisted?.id === this.sessionId)
+        store?.write({ ...persisted, lastActivity: 0 });
+    } catch {
+      // Storage refusal must not prevent closing the visit.
+    }
+  }
+
+  private cancelDurationTimer(): void {
+    if (this.durationTimer !== undefined) clearTimeout(this.durationTimer);
+    this.durationTimer = undefined;
+  }
+
+  private scheduleDurationRotation(): void {
+    this.cancelDurationTimer();
+    const duration = this.config.maxSessionDurationMs;
+    if (
+      !Number.isFinite(duration) ||
+      duration <= 0 ||
+      !this.transport.sendSessionEvents ||
+      this.config.flightRecorder
+    )
+      return;
+    this.durationDeadline = Date.now() + duration;
+    this.durationTimer = setTimeout(
+      () => {
+        this.durationTimer = undefined;
+        this.rotateActiveSession();
+      },
+      Math.min(duration, 2_147_483_647),
+    );
+  }
+
+  private rotateActiveSession(): void {
+    if (!this.sessionStarted || !this.canTransport()) return;
+    const previousId = this.sessionId;
+    this.bus.flush();
+    this.expirePersistedVisit();
+    const pending = [...this.pendingSends, this.sessionMetadataWrite];
+    const replay = this.replay;
+    this.replay = undefined;
+    if (replay) pending.push(Promise.resolve(replay.stop()).catch(() => {}));
+    this.ringBuffer.clear();
+    this.lifecycleSuspended = true;
+    void this.resumeFromLifecycle(true);
+    this.configureAutoFlagController();
+    const deadline = Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS;
+    const retirement = this.waitUntilLifecycleDeadline(
+      Promise.allSettled(pending).then(() => true),
+      deadline,
+    )
+      .then((settled) =>
+        settled
+          ? this.waitUntilLifecycleDeadline(
+              Promise.resolve()
+                .then(() => this.transport.endSession(previousId))
+                .then(
+                  () => true,
+                  () => true,
+                ),
+              deadline,
+            )
+          : undefined,
+      )
+      .then(() => undefined)
+      .catch(() => {})
+      .finally(() => this.pendingSends.delete(retirement));
+    this.pendingSends.add(retirement);
+  }
+
   /** Schedule a close for a page that remains hidden after lifecycle events settle. */
   private scheduleLifecycleClose(): void {
     if (
@@ -2046,6 +2138,7 @@ export class Crumbtrail {
    * the server cannot finalize an incomplete log.
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
+    this.cancelDurationTimer();
     if (this.stopped || this.lifecycleSuspended) {
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
@@ -2073,6 +2166,7 @@ export class Crumbtrail {
       this.applicationExpectations.stop();
       this.bus.flush();
       this.lifecycleClosing = true;
+      this.expirePersistedVisit();
       try {
         const admissionSettled = await this.waitForLifecyclePhase(
           [this.sessionMetadataWrite, this.sessionAdmission],
@@ -2261,7 +2355,9 @@ export class Crumbtrail {
   }
 
   /** Start a new visit when a hidden page becomes visible again. */
-  private resumeFromLifecycle(): Promise<void> | undefined {
+  private resumeFromLifecycle(
+    preserveExpectations = false,
+  ): Promise<void> | undefined {
     const closing = this.lifecycleClosePromise;
     if (closing) {
       return closing.then(() => {
@@ -2273,11 +2369,15 @@ export class Crumbtrail {
     this.sessionId = generateSessionId();
     this.applicationAssertions = 0;
     this.applicationResponseAssertions = 0;
-    this.applicationExpectations.stop();
-    this.applicationExpectations = createApplicationExpectationManager({
-      sessionId: this.sessionId,
-      emit: (event) => this.bus.emit(event),
-    });
+    if (preserveExpectations) {
+      this.applicationExpectations.rotateSession(this.sessionId);
+    } else {
+      this.applicationExpectations.stop();
+      this.applicationExpectations = createApplicationExpectationManager({
+        sessionId: this.sessionId,
+        emit: (event) => this.bus.emit(event),
+      });
+    }
     if (this.sessionStore)
       writePersistedSession(this.sessionStore, this.sessionId);
     this.visualArtifactNames.clear();
@@ -2332,7 +2432,15 @@ export class Crumbtrail {
   }
 
   private startSessionIfAllowed(): void {
-    if (this.sessionStarted || !this.canTransport()) return;
+    if (!this.canTransport()) return;
+    if (this.sessionStarted) {
+      if (
+        this.durationDeadline !== undefined &&
+        Date.now() >= this.durationDeadline
+      )
+        this.rotateActiveSession();
+      return;
+    }
     if (
       this.config.flightRecorder &&
       this.flightRecorderState !== "triggered" &&
@@ -2343,6 +2451,7 @@ export class Crumbtrail {
       return;
     this.sessionStarted = true;
     this.startSessionWithCurrentIdentity();
+    this.scheduleDurationRotation();
     this.updateReplayState();
   }
 
@@ -2849,6 +2958,7 @@ export class Crumbtrail {
   }
 
   private async stopInternal(): Promise<{ sessionId: string }> {
+    this.cancelDurationTimer();
     const teardownFailures: StopFailure[] = [];
     const runTeardown = (
       label: string,
@@ -3007,6 +3117,7 @@ export class Crumbtrail {
     this.abortFlightRecorder();
     this.stateProviders.clear();
     this.bus.stop();
+    this.expirePersistedVisit();
     this.ringBuffer.clear();
     // The session start owns the binding proof used in its request. Retire the
     // proof only after that request settles, while retaining the transport's
