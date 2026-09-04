@@ -86,4 +86,3 @@ public sealed class CaptureSender(CaptureOptions options, HttpClient http, ILogg
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
     }
 }
-
