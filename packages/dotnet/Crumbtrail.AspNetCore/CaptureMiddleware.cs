@@ -58,12 +58,12 @@ public sealed class CaptureMiddleware(RequestDelegate next)
                 if (failure is not null) capture.Add("backend.req.error", new { requestId = capture.RequestId,
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, route,
                     error = new { name = failure.GetType().Name }, correlation });
-                capture.Events.Add(new(CaptureContext.Now, "backend.req.end", new { requestId = capture.RequestId,
+                capture.AddTerminal("backend.req.end", new { requestId = capture.RequestId,
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, pathname = path, route,
                     statusCode = failure is null ? context.Response.StatusCode : 500,
                     durationMs = watch.Elapsed.TotalMilliseconds, responseBody = responseBody.Body, responseBodyTruncated = tee.Truncated,
                     responseBodyState = responseBody.State, redaction = responseBody.RedactionFor("responseBody"),
-                    correlation, service = options.Service }));
+                    correlation, service = options.Service });
                 if (capture.DroppedEvents > 0) log.LogWarning("Crumbtrail request exceeded capture limit; {Count} events omitted", capture.DroppedEvents);
                 capture.Flush(sink);
             }
