@@ -9,6 +9,7 @@ import {
   classifyStructuredValue,
   computeRedactedShape,
   isValidRedactedShapeExample,
+  redactedShapeDetailAllowed,
   redactedShapeExample,
   redactedShapeExampleAllowed,
   REDACTED_SHAPE_EXAMPLE_MAX_LENGTH,
@@ -1046,30 +1047,35 @@ describe("computeRedactedShape", () => {
 /* ------------------------------------------------------------------ */
 
 describe("computeRedactedShape structural fields", () => {
-  it("counts whitespace separated runs", () => {
-    expect(computeRedactedShape("the quick brown fox").words).toBe(4);
-    expect(computeRedactedShape("singleword").words).toBe(1);
+  // The richer shape is opt in by reason, so every case here states one.
+  const shapeOf = (value: string) =>
+    computeRedactedShape(value, "free_text_value");
+
+  it("counts whitespace separated runs, only above one", () => {
+    expect(shapeOf("the quick brown fox").words).toBe(4);
+    // `words=1` is on the great majority of markers and adds nothing to `len`.
+    expect(shapeOf("singleword").words).toBeUndefined();
   });
 
   it("counts lines only above one", () => {
-    expect(computeRedactedShape("one line only here").lines).toBeUndefined();
-    expect(computeRedactedShape("first line\nsecond line").lines).toBe(2);
-    expect(computeRedactedShape("a line\r\nb line\rc line").lines).toBe(3);
+    expect(shapeOf("one line only here").lines).toBeUndefined();
+    expect(shapeOf("first line\nsecond line").lines).toBe(2);
+    expect(shapeOf("a line\r\nb line\rc line").lines).toBe(3);
   });
 
   it("reports which end carried whitespace", () => {
-    expect(computeRedactedShape("no edges here").edges).toBeUndefined();
-    expect(computeRedactedShape("  leading space").edges).toBe("leading");
-    expect(computeRedactedShape("trailing space  ").edges).toBe("trailing");
-    expect(computeRedactedShape("  both ends  ").edges).toBe("both");
+    expect(shapeOf("no edges here").edges).toBeUndefined();
+    expect(shapeOf("  leading space").edges).toBe("leading");
+    expect(shapeOf("trailing space  ").edges).toBe("trailing");
+    expect(shapeOf("  both ends  ").edges).toBe("both");
   });
 
   it("flags non-ASCII and emoji separately", () => {
-    expect(computeRedactedShape("plain ascii text").nonAscii).toBeUndefined();
-    expect(computeRedactedShape("plain ascii text").emoji).toBeUndefined();
-    expect(computeRedactedShape("café au lait").nonAscii).toBe(true);
-    expect(computeRedactedShape("café au lait").emoji).toBeUndefined();
-    const emoji = computeRedactedShape("thanks 🙂 lots");
+    expect(shapeOf("plain ascii text").nonAscii).toBeUndefined();
+    expect(shapeOf("plain ascii text").emoji).toBeUndefined();
+    expect(shapeOf("café au lait").nonAscii).toBe(true);
+    expect(shapeOf("café au lait").emoji).toBeUndefined();
+    const emoji = shapeOf("thanks 🙂 lots");
     expect(emoji.emoji).toBe(true);
     expect(emoji.nonAscii).toBe(true);
   });
@@ -1086,7 +1092,7 @@ describe("computeRedactedShape structural fields", () => {
     ["1234.56", "decimal"],
     ["1,234,567.89", "grouped_number"],
   ])("reports the structural pattern of %s as %s", (value, pattern) => {
-    expect(computeRedactedShape(value).pattern).toBe(pattern);
+    expect(shapeOf(value).pattern).toBe(pattern);
   });
 
   it("names no sensitive class as a pattern", () => {
@@ -1097,11 +1103,11 @@ describe("computeRedactedShape structural fields", () => {
       "GB29NWBK60161331926819",
       JWT,
     ]) {
-      expect(computeRedactedShape(value).pattern).not.toBe("email");
-      expect(computeRedactedShape(value).pattern).not.toBe("phone");
-      expect(computeRedactedShape(value).pattern).not.toBe("card");
-      expect(computeRedactedShape(value).pattern).not.toBe("iban");
-      expect(computeRedactedShape(value).pattern).not.toBe("token");
+      expect(shapeOf(value).pattern).not.toBe("email");
+      expect(shapeOf(value).pattern).not.toBe("phone");
+      expect(shapeOf(value).pattern).not.toBe("card");
+      expect(shapeOf(value).pattern).not.toBe("iban");
+      expect(shapeOf(value).pattern).not.toBe("token");
     }
   });
 
@@ -1115,7 +1121,7 @@ describe("computeRedactedShape structural fields", () => {
       expect(shape.example).toBeUndefined();
     }
     // The one-bit fields still describe a short value.
-    expect(computeRedactedShape(" a b ").edges).toBe("both");
+    expect(shapeOf(" a b ").edges).toBe("both");
   });
 });
 
@@ -1168,7 +1174,10 @@ describe("redactedShapeExample", () => {
 });
 
 describe("redactedShapeExampleAllowed", () => {
-  const withHash = computeRedactedShape("a long enough free text value");
+  const withHash = computeRedactedShape(
+    "a long enough free text value",
+    "free_text_value",
+  );
 
   it("allows only the free prose reason", () => {
     expect(redactedShapeExampleAllowed("free_text_value", withHash)).toBe(true);
@@ -2075,7 +2084,7 @@ describe("query parameters answer to the same keep list", () => {
 
     expect(absent.has("q")).toBe(false);
     expect(empty.get("q")).toBe("");
-    expect(redacted.get("q")).toBe("[REDACTED;len=6;charset=alpha;words=1]");
+    expect(redacted.get("q")).toBe("[REDACTED;len=6;charset=alpha]");
   });
 
   it("keeps numeric scale in a redacted query value", () => {
@@ -2098,7 +2107,7 @@ describe("query parameters answer to the same keep list", () => {
     ).searchParams.get("amount");
 
     expect(value).toBe(
-      "[REDACTED;len=8;charset=mixed;separators=1.dot,5.comma;words=1]",
+      "[REDACTED;len=8;charset=mixed;separators=1.dot,5.comma]",
     );
     expect(
       redactUrl(`/api/search?amount=${encodeURIComponent(value!)}`).value,
@@ -2114,7 +2123,7 @@ describe("query parameters answer to the same keep list", () => {
   it("redacts every undeclared word value by default", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
-      "/api/search?q=[REDACTED;len=6;charset=alpha;words=1]&productId=1",
+      "/api/search?q=[REDACTED;len=6;charset=alpha]&productId=1",
     );
   });
 
@@ -2166,7 +2175,7 @@ describe("query parameters answer to the same keep list", () => {
   it("still redacts a sensitive value inside a kept parameter", () => {
     setRedactionKeepFields(["q"]);
     expect(redactUrl("/api/search?q=someone%40example.com").value).toBe(
-      "/api/search?q=[REDACTED;len=19;charset=mixed;words=1]",
+      "/api/search?q=[REDACTED;len=19;charset=mixed]",
     );
   });
 
@@ -2324,7 +2333,7 @@ describe("shape string form", () => {
       "/s?q=[REDACTED;len=35;charset=mixed;words=6;lines=2;edges=both;nonAscii;emoji]",
     );
     expect(redactUrl("/s?d=2026-09-04").value).toBe(
-      "/s?d=[REDACTED;len=10;charset=mixed;words=1;pattern=date]",
+      "/s?d=[REDACTED;len=10;charset=mixed;pattern=date]",
     );
   });
 
@@ -2344,5 +2353,131 @@ describe("shape string form", () => {
 
     expect(encoded).not.toContain(marker);
     expect(unescapeRedactionMarker(encoded)).toBe(`q=${marker}`);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The floor is the default: only a classifier prose reason widens it   */
+/* ------------------------------------------------------------------ */
+
+const FLOOR_KEYS = [
+  "$redacted",
+  "len",
+  "charset",
+  "separators",
+  "hash8",
+  "casefoldHash8",
+];
+const DETAIL_KEYS = [
+  "words",
+  "lines",
+  "edges",
+  "nonAscii",
+  "emoji",
+  "pattern",
+  "example",
+];
+
+describe("richer shape is opt in by reason", () => {
+  const structured = {
+    contentType: "application/json",
+    mode: "structured" as const,
+  };
+  // Prose that would light up every field if the reason allowed it: multiple
+  // words, a trailing space, a non-ASCII letter, an emoji, and a date.
+  const LOUD = "2026-09-04 rejected my café refund 🙂 ";
+
+  const expectFloorOnly = (placeholder: Record<string, unknown>) => {
+    for (const key of DETAIL_KEYS) expect(placeholder[key]).toBeUndefined();
+    for (const key of Object.keys(placeholder))
+      expect(FLOOR_KEYS).toContain(key);
+    // The floor itself is still there.
+    expect(placeholder.$redacted).toBe("[REDACTED]");
+    expect(typeof placeholder.len).toBe("number");
+    expect(placeholder.charset).toBe("mixed");
+  };
+
+  it("gives no reason at all the floor", () => {
+    expect(redactedShapeDetailAllowed(undefined)).toBe(false);
+    const shape = computeRedactedShape(LOUD);
+    for (const key of DETAIL_KEYS)
+      expect(shape[key as keyof typeof shape]).toBeUndefined();
+    expect(shape.hash8).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it.each([
+    "input_value",
+    "sensitive_input_value",
+    "masked_input_type",
+    "deny_field",
+    "sensitive_container_number",
+    "sensitive_short_numeric_field",
+    "email_value",
+    "jwt_value",
+    "luhn_value",
+    "iban_value",
+    "token_like_value",
+    "high_entropy_value",
+    "unknown_value",
+  ])("gives %s the floor and nothing more", (reason) => {
+    expect(redactedShapeDetailAllowed(reason)).toBe(false);
+    const shape = computeRedactedShape(LOUD, reason);
+    for (const key of DETAIL_KEYS)
+      expect(shape[key as keyof typeof shape]).toBeUndefined();
+  });
+
+  it("a password JSON key gets the floor", () => {
+    const parsed = JSON.parse(
+      redactNetworkTextBody(
+        JSON.stringify({ password: LOUD, ssn: LOUD, dateOfBirth: LOUD }),
+        structured,
+      ).body!,
+    ) as Record<string, Record<string, unknown>>;
+
+    for (const key of Object.keys(parsed)) expectFloorOnly(parsed[key]);
+    // The narrowing this rule exists to stop.
+    expect(parsed.dateOfBirth.pattern).toBeUndefined();
+  });
+
+  it("a sensitive query name gets the floor", () => {
+    setRedactionKeepFields([]);
+    const value = redactUrl(
+      `/api?token=${encodeURIComponent(LOUD)}&ssn=${encodeURIComponent(LOUD)}`,
+    ).value;
+
+    expect(value).toContain("token=[REDACTED;len=38;charset=mixed]");
+    expect(value).toContain("ssn=[REDACTED;len=38;charset=mixed]");
+    for (const marker of [
+      ";words=",
+      ";lines=",
+      ";edges=",
+      ";nonAscii",
+      ";emoji",
+      ";pattern=",
+    ])
+      expect(value).not.toContain(marker);
+  });
+
+  it("a query value under an ordinary name still gets the richer shape", () => {
+    setRedactionKeepFields([]);
+    const value = redactUrl(`/api?note=${encodeURIComponent(LOUD)}`).value;
+
+    expect(value).toBe(
+      "/api?note=[REDACTED;len=38;charset=mixed;words=6;edges=trailing;nonAscii;emoji]",
+    );
+  });
+
+  it("free text in a body still gets every field", () => {
+    const parsed = JSON.parse(
+      redactNetworkTextBody(JSON.stringify({ note: LOUD }), structured).body!,
+    ) as { note: Record<string, unknown> };
+
+    expect(parsed.note).toMatchObject({
+      words: 6,
+      edges: "trailing",
+      nonAscii: true,
+      emoji: true,
+    });
+    expect(parsed.note.example).toBeDefined();
   });
 });

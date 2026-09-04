@@ -149,7 +149,7 @@ describe("interactionCollector redaction", () => {
     );
     expect(initNav?.d).toMatchObject({
       from: "",
-      to: "http://localhost:3000/start?token=[REDACTED;len=6;charset=alpha;words=1]",
+      to: "http://localhost:3000/start?token=[REDACTED;len=6;charset=alpha]",
       toOrigin: "http://localhost:3000",
       frame: expect.objectContaining({
         top: true,
@@ -170,8 +170,8 @@ describe("interactionCollector redaction", () => {
       (event) => event.k === "nav" && event.d.tr === "push",
     );
     expect(pushNav?.d).toMatchObject({
-      from: "http://localhost:3000/start?token=[REDACTED;len=6;charset=alpha;words=1]",
-      to: "http://localhost:3000/checkout?session=[REDACTED;len=6;charset=alpha;words=1]",
+      from: "http://localhost:3000/start?token=[REDACTED;len=6;charset=alpha]",
+      to: "http://localhost:3000/checkout?session=[REDACTED;len=6;charset=alpha]",
       fromOrigin: "http://localhost:3000",
       toOrigin: "http://localhost:3000",
     });

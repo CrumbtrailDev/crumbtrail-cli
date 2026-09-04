@@ -871,7 +871,17 @@ function redactQueryString(
       ) {
         params.append(safeKey, value);
       } else {
-        params.append(safeKey, redactedQueryValue(value));
+        // A sensitive NAME gets the floor and nothing more. The richer shape
+        // is opt in by reason precisely so this branch can withhold it: a
+        // `pattern` or an `edges` on `?ssn=` narrows the value, and the name
+        // already told us it must not be narrowed.
+        params.append(
+          safeKey,
+          redactedQueryValue(
+            value,
+            isSensitiveQueryName(key) ? undefined : "url_query_value",
+          ),
+        );
         fields.push({
           path: `${path}.query.${safeKey}`,
           reason: "url_query_value",
@@ -917,8 +927,8 @@ function isRedactedQueryShape(value: string): boolean {
   return true;
 }
 
-function redactedQueryValue(value: string): string {
-  return redactedShapeString(computeRedactedShape(value));
+function redactedQueryValue(value: string, reason?: string): string {
+  return redactedShapeString(computeRedactedShape(value, reason));
 }
 
 /**
@@ -2827,6 +2837,41 @@ function redactedShapeEdges(text: string): RedactedShapeEdges | undefined {
 }
 
 /**
+ * Redaction reasons that may carry the richer shape, beyond the floor of `len`,
+ * `charset`, `separators` and the hashes.
+ *
+ * The floor is the default and this is the whole opt in, so a call site that
+ * passes no reason gets the floor. That direction matters: the fields below are
+ * safe on prose and are a real narrowing on a credential. `pattern: "date"` on a
+ * value redacted under a `dob` name says it parsed as a date and hands back most
+ * of what the redaction removed; `edges`, `words` and `nonAscii` each cut a
+ * password's candidate space. So a value redacted for its NAME (`deny_field`,
+ * `sensitive_input_value`, a sensitive container or short numeric field), for
+ * its input TYPE (password, email, tel), by POLICY (`masked_input_type`), or by
+ * the `captureInputValues` opt out (`input_value`) gets exactly what it got
+ * before this existed.
+ *
+ * `free_text_value` is the classifier saying it found ordinary prose: every
+ * validated credential and personal pattern was tested first and failed.
+ * `url_query_value` is the query catch-all, and its call site passes it only
+ * when the parameter name is not sensitive, because that path does not classify
+ * the value itself.
+ *
+ * The value-based credential reasons are deliberately absent. `email_value`,
+ * `jwt_value`, `luhn_value`, `iban_value`, `token_like_value` and
+ * `high_entropy_value` each name a format, so anything further narrows a value
+ * the classifier already judged secret.
+ */
+const SHAPE_DETAIL_REASONS = new Set(["free_text_value", "url_query_value"]);
+
+/** May a value redacted for this reason carry more than the floor? */
+export function redactedShapeDetailAllowed(
+  reason: string | undefined,
+): boolean {
+  return reason !== undefined && SHAPE_DETAIL_REASONS.has(reason);
+}
+
+/**
  * Redaction reasons whose value is ordinary prose, and the only reasons that
  * may carry an `example`.
  *
@@ -2894,8 +2939,15 @@ export function computeRedactedShape(
         `${getStructuredShapeSalt()}:${casefolded}`,
       );
     }
+  }
+  // Everything below the floor is opt in by reason. See SHAPE_DETAIL_REASONS.
+  if (!redactedShapeDetailAllowed(reason)) return shape;
+  if (shape.hash8 !== undefined) {
     const trimmed = text.trim();
-    shape.words = trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length;
+    const words = trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length;
+    // Only above one, for the same reason `lines` is: `words=1` is on the great
+    // majority of markers and says nothing that `len` did not already say.
+    if (words > 1) shape.words = words;
     SHAPE_LINE_BREAK_RE.lastIndex = 0;
     const breaks = text.match(SHAPE_LINE_BREAK_RE)?.length ?? 0;
     if (breaks > 0) shape.lines = breaks + 1;

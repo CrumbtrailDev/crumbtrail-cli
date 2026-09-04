@@ -70,7 +70,7 @@ describe("errorCollector", () => {
     expect(events[0].d).toMatchObject({
       transport: "resource",
       element: "img",
-      url: "http://localhost:3000/vendor.js?token=[REDACTED;len=6;charset=alpha;words=1]",
+      url: "http://localhost:3000/vendor.js?token=[REDACTED;len=6;charset=alpha]",
       loading: expect.any(Boolean),
     });
     expect(JSON.stringify(events[0])).not.toContain("inline content");
@@ -110,7 +110,7 @@ describe("errorCollector", () => {
     expect(events[0].d.msg).toContain("[REDACTED]");
     expect(events[0].d.msg).not.toContain("hunter2");
     expect(events[0].d.file).toBe(
-      "https://app.example.test/reset?token=[REDACTED;len=6;charset=alnum;words=1]",
+      "https://app.example.test/reset?token=[REDACTED;len=6;charset=alnum]",
     );
     expect(events[0].d.stk).not.toContain("sk_fake_abcdefghijklmnopqrstuvwxyz");
     expect(events[0].d.redaction).toMatchObject({

@@ -439,6 +439,17 @@ word entry from a pasted paragraph, and nothing recoverable.
 (numeric under 12 characters, or anything under 6), and `words`, `lines` and
 `example` are withheld with it.
 
+The last seven rows of that table are emitted only when the classifier redacted
+the value as ordinary prose, or for a query value whose parameter name is not
+sensitive. A value redacted for its **name** (`password`, `ssn`, a `denyFields`
+entry), for its input **type** (password, email, tel), by the `maskInputTypes`
+**policy**, or by the `captureInputValues` opt out reports `len`, `charset`,
+`separators` and the hashes, and nothing else. Those fields are safe on prose
+and are a narrowing on a credential: `pattern: "date"` under a `dob` name hands
+back most of what the redaction removed, and `edges`, `words` and `nonAscii`
+each cut a password's candidate space. The floor is the default, so a value
+whose reason is unknown gets the floor.
+
 `example` is built from a fixed alphabet: `X` for an uppercase ASCII letter,
 `x` for a lowercase one, `0` for a digit, `é` for a Latin letter with a
 diacritic, one fixed letter per other script, `🙂` for an emoji, whitespace and
@@ -458,8 +469,11 @@ check yourself.
 The query string form spells the same fields out in one marker:
 
 ```
-?q=[REDACTED;len=35;charset=mixed;words=6;lines=2;edges=both;nonAscii;emoji]
+?note=[REDACTED;len=35;charset=mixed;words=6;lines=2;edges=both;nonAscii;emoji]
+?ssn=[REDACTED;len=35;charset=mixed]
 ```
+
+A sensitive parameter name gets the floor, as it does everywhere else.
 
 `example` is deliberately absent from that form. A query string is the plane
 most likely to be re-serialized and pasted, and the stand in is the one field

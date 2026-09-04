@@ -1260,25 +1260,70 @@ describe("a redacted input carries its shape in metadata", () => {
     });
   });
 
-  it("withholds the stand-in for every reason that is not free prose", () => {
-    expect(
-      fieldOf("hunter2secret", { name: "token", type: "password" }).shape
-        ?.example,
-    ).toBeUndefined();
-    expect(
-      fieldOf("a long enough value", { name: "ssn" }).shape?.example,
-    ).toBeUndefined();
-    expect(
-      fieldOf("a long enough value", { name: "note", maskedByPolicy: true })
-        .shape?.example,
-    ).toBeUndefined();
+  // The richer shape is a real narrowing on a credential: `pattern: "date"` on
+  // a value redacted under a `dob` name hands back most of what the redaction
+  // removed, and each of the others cuts a password's candidate space. So every
+  // name based, type based, policy based and opted out redaction keeps exactly
+  // the floor it had before these fields existed.
+  const expectFloorOnly = (field: ReturnType<typeof fieldOf>) => {
+    expect(field.shape?.words).toBeUndefined();
+    expect(field.shape?.lines).toBeUndefined();
+    expect(field.shape?.edges).toBeUndefined();
+    expect(field.shape?.nonAscii).toBeUndefined();
+    expect(field.shape?.emoji).toBeUndefined();
+    expect(field.shape?.pattern).toBeUndefined();
+    expect(field.shape?.example).toBeUndefined();
+    // The floor is still reported.
+    expect(field.shape?.len).toBeGreaterThan(0);
+    expect(field.shape?.charset).toBeDefined();
+  };
+
+  // Would light up every field if the reason allowed it.
+  const LOUD = "2026-09-04 rejected my café refund 🙂 ";
+
+  it("gives a password input the floor and nothing more", () => {
+    expectFloorOnly(fieldOf(LOUD, { name: "token", type: "password" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "contact", type: "email" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "contact", type: "tel" }));
+  });
+
+  it("gives a sensitive field name the floor and nothing more", () => {
+    expectFloorOnly(fieldOf(LOUD, { name: "ssn" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "dateOfBirth" }));
+  });
+
+  it("gives a masked input type the floor and nothing more", () => {
+    expectFloorOnly(fieldOf(LOUD, { name: "note", maskedByPolicy: true }));
+  });
+
+  // captureInputValues: false only ever removes. A new field on an opted out
+  // input would be the opt out handing back something it did not before.
+  it("gives an opted out input the floor and nothing more", () => {
+    setCaptureInputValues(false);
+    expectFloorOnly(fieldOf(LOUD, { name: "note" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "anything" }));
+  });
+
+  it("withholds the stand-in for a value caught on its content", () => {
     expect(
       fieldOf("person@example.com", { name: "note" }).shape?.example,
     ).toBeUndefined();
-    setCaptureInputValues(false);
     expect(
-      fieldOf("a long enough value", { name: "note" }).shape?.example,
+      fieldOf("4111111111111111", { name: "note" }).shape?.example,
     ).toBeUndefined();
+  });
+
+  it("still gives free prose every field", () => {
+    const field = fieldOf(LOUD, { name: "note" });
+
+    expect(field.reason).toBe("free_text_value");
+    expect(field.shape).toMatchObject({
+      words: 6,
+      edges: "trailing",
+      nonAscii: true,
+      emoji: true,
+    });
+    expect(field.shape?.example).toBeDefined();
   });
 
   it("withholds words, lines and the stand-in below the hash floor", () => {
