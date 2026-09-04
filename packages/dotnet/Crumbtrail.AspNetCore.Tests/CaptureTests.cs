@@ -122,6 +122,7 @@ public sealed class CaptureTests
         Assert.Contains("0123456789abcdef0123456789abcdef",wire);
         Assert.DoesNotContain("do-not-capture",wire); Assert.DoesNotContain("must-not-leak",wire); Assert.DoesNotContain("a@example.com",wire);
         using var end = JsonDocument.Parse(JsonSerializer.Serialize(events.Last().d));
+        Assert.Equal("responseBody", end.RootElement.GetProperty("redaction").GetProperty("fields")[0].GetProperty("path").GetString());
         Assert.Equal(200,end.RootElement.GetProperty("statusCode").GetInt32());
         Assert.Contains("24",end.RootElement.GetProperty("responseBody").GetString());
         context.Response.Body.Position=0;

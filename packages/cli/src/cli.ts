@@ -2802,14 +2802,18 @@ async function applyBatchInjection(
     const res = deps.executePlan(otlpGuidePlan(candidate.dir, body));
     deps.ui.out(
       ok(
-        `Speaks OpenTelemetry, so no SDK is needed. Wrote ${color.brand(res.written.join(", "))}.`,
+        `Wrote backend setup guidance to ${color.brand(res.written.join(", "))}.`,
       ),
     );
     return {
       status: "guidance",
       filesTouched: res.written,
       // The summary already prefixes each note with the service name.
-      notes: ["add the OTLP exporter from the guide file to start reporting."],
+      notes: [
+        candidate.detected.otlpStack === "dotnet"
+          ? "follow the guide to configure traces or install ASP.NET Core request capture."
+          : "add the OTLP exporter from the guide file to start reporting.",
+      ],
     };
   }
 
@@ -4144,12 +4148,10 @@ async function applyInjection(
   if (plan.kind === "otlp-guidance") {
     // Intentional path (not an apology): a non-JS backend that already speaks
     // OpenTelemetry. Print the OTLP setup guidance + agent prompt; touch nothing.
+    ui.out(ok("Detected a backend requiring the setup steps below."));
     ui.out(
-      ok(
-        "Detected a non-JS backend that already speaks OpenTelemetry, so no SDK is needed.",
-      ),
+      color.dim("Configure backend telemetry using the supplied guidance:"),
     );
-    ui.out(color.dim("Point your existing OTLP exporter at Crumbtrail:"));
     if (plan.snippet) ui.out(plan.snippet);
     if (plan.agentPrompt) {
       ui.out(color.dim("\nOr hand this to your coding agent:"));
@@ -4738,6 +4740,8 @@ export async function runCli(
   deps: WizardDeps = defaultDeps(),
   nodeVersion: string = process.version,
 ): Promise<number> {
+  if (argv[2] === "dotnet")
+    return (await import("./dotnet-command")).runDotnetCommand(argv.slice(3));
   if (argv[2] === "witness")
     return (await import("./witness/command")).runWitnessCommand(argv.slice(3));
   const parsed = parseArgs(argv);

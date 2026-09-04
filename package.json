@@ -29,7 +29,9 @@
     "dev:harness": "node scripts/dev-harness/harness.mjs",
     "dev:link": "node scripts/dev-harness/link.mjs link",
     "dev:unlink": "node scripts/dev-harness/link.mjs unlink",
-    "dev:status": "node scripts/dev-harness/link.mjs status"
+    "dev:status": "node scripts/dev-harness/link.mjs status",
+    "test:dotnet": "dotnet test packages/dotnet/Crumbtrail.AspNetCore.Tests",
+    "pack:dotnet": "dotnet pack packages/dotnet/Crumbtrail.AspNetCore -o .local-packs/dotnet"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

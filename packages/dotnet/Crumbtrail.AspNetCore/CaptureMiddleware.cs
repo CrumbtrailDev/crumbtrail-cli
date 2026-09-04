@@ -19,7 +19,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
         var route = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? path;
         var watch = Stopwatch.StartNew();
         var requestBody = new CapturedBody(null, "missing");
-        if (context.Request.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) == true &&
+        if (IsJson(context.Request.ContentType) &&
             context.Request.ContentLength is null or > 0)
         {
             try
@@ -41,7 +41,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
         var correlation = new { status = "linked", sessionIdSource = "header", requestIdSource = "header" };
         capture.Add("backend.req.start", new { requestId = capture.RequestId, sessionId = capture.SessionId,
             method = context.Request.Method, url = path, pathname = path, route, correlation, service = options.Service,
-            body = requestBody.Body, requestBodyState = requestBody.State, redaction = requestBody.Redaction });
+            body = requestBody.Body, requestBodyState = requestBody.State, redaction = requestBody.RedactionFor("body") });
         var original = context.Response.Body;
         var tee = new ResponseTee(original);
         context.Response.Body = tee;
@@ -53,7 +53,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
             context.Response.Body = original;
             try
             {
-                var responseBody = context.Response.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) == true
+                var responseBody = IsJson(context.Response.ContentType)
                     ? StructuredBody.Capture(tee.Captured.ToArray(), tee.Truncated) : new CapturedBody(null, "missing");
                 if (failure is not null) capture.Add("backend.req.error", new { requestId = capture.RequestId,
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, route,
@@ -62,7 +62,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, pathname = path, route,
                     statusCode = failure is null ? context.Response.StatusCode : 500,
                     durationMs = watch.Elapsed.TotalMilliseconds, responseBody = responseBody.Body, responseBodyTruncated = tee.Truncated,
-                    responseBodyState = responseBody.State, redaction = responseBody.Redaction,
+                    responseBodyState = responseBody.State, redaction = responseBody.RedactionFor("responseBody"),
                     correlation, service = options.Service }));
                 if (capture.DroppedEvents > 0) log.LogWarning("Crumbtrail request exceeded capture limit; {Count} events omitted", capture.DroppedEvents);
                 capture.Flush(sink);
@@ -70,6 +70,14 @@ public sealed class CaptureMiddleware(RequestDelegate next)
             catch { log.LogWarning("Crumbtrail could not prepare request evidence"); }
             tee.Captured.Dispose();
         }
+    }
+
+    private static bool IsJson(string? contentType)
+    {
+        var mediaType = contentType?.Split(';', 2)[0].Trim();
+        return string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase) ||
+            (mediaType?.StartsWith("application/", StringComparison.OrdinalIgnoreCase) == true &&
+             mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase));
     }
 
     private sealed class ResponseTee(Stream inner) : Stream

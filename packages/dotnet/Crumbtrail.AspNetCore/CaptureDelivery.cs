@@ -16,7 +16,7 @@ public sealed record CaptureBatch(string sessionId, IReadOnlyList<CaptureEvent> 
 public sealed record CaptureOptions(Uri? Endpoint, string? Key, string Service)
 {
     public bool Enabled => Endpoint is { IsAbsoluteUri: true } && Endpoint.Scheme == "https" &&
-        Endpoint.UserInfo == "" && Endpoint.Query == "" && Endpoint.Fragment == "" && !string.IsNullOrWhiteSpace(Key);
+        Endpoint.UserInfo == "" && Endpoint.Query == "" && Endpoint.Fragment == "" && !string.IsNullOrWhiteSpace(Key) && !Key.Any(char.IsControl);
     public Func<HttpContext, bool> ShouldCapture { get; init; } = _ => false;
     public static CaptureOptions FromEnvironment(string service)
     {
@@ -69,6 +69,12 @@ public sealed class CaptureSender(CaptureOptions options, HttpClient http, ILogg
         }
         log.LogWarning("Crumbtrail request evidence delivery exhausted its retry budget");
         return false;
+    }
+
+    public override void Dispose()
+    {
+        http.Dispose();
+        base.Dispose();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

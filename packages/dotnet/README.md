@@ -53,3 +53,17 @@ accepted. Delivery retries cover a brief session registration race.
 Update the package reference to update capture behavior. Do not copy its source
 into the application. Database, cache and job instrumentation are separate from
 this HTTP integration.
+
+## Verify and pack a release
+
+From the repository root with the .NET 9 SDK on PATH:
+
+```sh
+pnpm test:dotnet
+pnpm pack:dotnet
+```
+
+The package is written to `.local-packs/dotnet`. Install that artifact into a
+fresh consumer using the CLI's `--source` option and build the consumer before
+publishing. Publish version `0.1.0` to NuGet before merging an application change
+that references it. The npm release workflow does not publish NuGet packages.

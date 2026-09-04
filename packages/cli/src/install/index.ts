@@ -1,3 +1,4 @@
+import { DOTNET_PACKAGE, DOTNET_VERSION } from "../dotnet-package";
 // Pure, framework-agnostic install-instruction routing for the /welcome wizard.
 //
 // This module holds NO React and NO I/O. It maps every one of the 18 supported
@@ -363,6 +364,23 @@ export function buildAgentPrompt(
   const explicitServiceName = opts.serviceName?.trim() || null;
   const serviceName = explicitServiceName ?? "<your-app-name>";
   const hasExplicitServiceName = explicitServiceName !== null;
+
+  if (stack === "dotnet") {
+    return [
+      "Set up Crumbtrail HTTP evidence using its maintained ASP.NET Core package.",
+      `Requires .NET 9 and ${DOTNET_PACKAGE} ${DOTNET_VERSION} in the configured NuGet source.`,
+      "Identify the API csproj, then run crumbtrail dotnet install <project.csproj>.",
+      "Do not copy or write middleware, redaction, buffering or delivery implementations.",
+      `Configure CRUMBTRAIL_ENDPOINT=${endpoint} and CRUMBTRAIL_INGEST_KEY in the runtime environment.`,
+      "Never commit the ingest key.",
+      `Register builder.Services.AddCrumbtrail(CaptureOptions.FromEnvironment(${JSON.stringify(serviceName)}) with { ShouldCapture = ... });`,
+      "Add using Crumbtrail. Select eligible routes from this application's code and exclude authentication routes.",
+      "Register app.UseCrumbtrail() after routing and before endpoints execute.",
+      "Keep existing OpenTelemetry exporters. They do not supply native JSON request evidence.",
+      "Verify build, unchanged application bytes, skipped auth routes, and correlated backend.req.start and backend.req.end events.",
+      "If the package cannot restore or eligible routes cannot be established, report the missing step and stop.",
+    ].join("\n");
+  }
 
   if (kind === "otlp") {
     const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
