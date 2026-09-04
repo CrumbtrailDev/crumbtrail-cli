@@ -89,6 +89,21 @@ export interface BackendRequestEndEventInput extends BackendRequestEventInput {
   /** Whether the caller truncated `responseBody` at its cap. */
   responseBodyTruncated?: boolean;
   /**
+   * The operands the caller sent, already bounded by the caller and never read
+   * off the application's stream (see `backend-request-body.ts`).
+   *
+   * Redacted here under the same policy as the response body. It rides the END
+   * event rather than the start event deliberately: `backend.req.start` is
+   * where the request semantically belongs, but it is emitted before a single
+   * body byte has been pushed into the readable and before any parser has run,
+   * so at that moment nothing can say what the request contained. The terminal
+   * event is the first point at which the operands and the answer they produced
+   * can be stated together, which is also the join a reader wants.
+   */
+  requestBody?: string;
+  /** Whether the caller truncated `requestBody` at its cap. */
+  requestBodyTruncated?: boolean;
+  /**
    * Where the application wrote a 5xx response, repo-relative where derivable.
    *
    * A failure that never touches the database has no `db.diff` and therefore no
@@ -193,6 +208,9 @@ export function buildBackendRequestEndEvent(
   if (Number.isFinite(input.durationMs))
     payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
   attachResponseEvidence(payload, input);
+  // After the response attachment, and merging whatever it wrote: the payload
+  // carries ONE redaction declaration, and both bodies have to appear in it.
+  attachRequestEvidence(payload, input);
   return buildEvent(
     BACKEND_REQUEST_END_EVENT,
     payload,
@@ -246,6 +264,65 @@ function attachResponseEvidence(
   if (result.bodySummary) payload.responseBodySummary = result.bodySummary;
   if (input.responseBodyTruncated) payload.responseBodyTruncated = true;
   attachBackendRedactionMetadata(payload, result.metadata);
+}
+
+/**
+ * Attaches what the caller sent, redacted.
+ *
+ * The response half of this pair says what came back. Without this half a
+ * session investigating a wrong total holds the total and none of the numbers
+ * it was computed from, which is a pointer to the defect rather than the
+ * defect. Same engine, same policy declaration, same keep list as the response
+ * body: the two directions of one request must never answer to two allowlists.
+ *
+ * The content type is read from the REQUEST's headers, which the caller passes
+ * through untouched, so a form post is parsed as a form post and a JSON body as
+ * JSON.
+ */
+function attachRequestEvidence(
+  payload: Record<string, unknown>,
+  input: BackendRequestEndEventInput,
+): void {
+  if (typeof input.requestBody !== "string" || input.requestBody === "") return;
+
+  const contentType = requestHeaderValueOf(input.headers, "content-type");
+  const result = redactNetworkTextBody(input.requestBody, {
+    ...(contentType ? { contentType } : {}),
+    path: "requestBody",
+    mode: "structured",
+    ...(input.keepFields && input.keepFields.length > 0
+      ? { keepFields: [...input.keepFields] }
+      : {}),
+  });
+  if (result.body !== undefined) payload.requestBody = result.body;
+  if (result.bodySummary) payload.requestBodySummary = result.bodySummary;
+  if (input.requestBodyTruncated) payload.requestBodyTruncated = true;
+  // The backend plane, restamped over whatever the shared engine claimed, and
+  // merged with any metadata an earlier attachment already wrote to the payload.
+  attachBackendRedactionMetadata(
+    payload,
+    existingRedactionMetadata(payload),
+    result.metadata,
+  );
+}
+
+/** Redaction metadata already written onto a payload, so a later attachment merges instead of replacing. */
+function existingRedactionMetadata(
+  payload: Record<string, unknown>,
+): RedactionMetadata | undefined {
+  const existing = payload.redaction;
+  return existing && typeof existing === "object"
+    ? (existing as RedactionMetadata)
+    : undefined;
+}
+
+/** {@link headerValueOf} over the inbound request's own headers, which may be arrays. */
+function requestHeaderValueOf(
+  headers: BackendRequestHeaders | undefined,
+  name: string,
+): string | undefined {
+  const raw = readHeader(headers, name);
+  return raw === undefined || raw === "" ? undefined : raw;
 }
 
 function headerValueOf(

@@ -291,6 +291,8 @@ export interface AutoCaptureOptions {
    * identical in shape and default to the Express middleware's.
    */
   httpResponseCapture?: HttpRequestCaptureOptions["response"];
+  /** Request body capture policy for the inbound HTTP recorder. Off unless set. */
+  httpRequestBodyCapture?: HttpRequestCaptureOptions["request"];
   /** `node:http`/`node:https` the request capture patches (tests). */
   httpModules?: Pick<
     HttpRequestCaptureOptions,
@@ -1714,6 +1716,9 @@ export async function autoCapture(
         now: options.nowImpl,
         ...(options.httpResponseCapture
           ? { response: options.httpResponseCapture }
+          : {}),
+        ...(options.httpRequestBodyCapture
+          ? { request: options.httpRequestBodyCapture }
           : {}),
         emit: (event) => {
           if (stopped) return;

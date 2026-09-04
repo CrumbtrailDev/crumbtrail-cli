@@ -8,6 +8,7 @@ import {
   STRUCTURED_BODY_MAX_DEPTH,
   STRUCTURED_BODY_MAX_KEY_LENGTH,
   STRUCTURED_BODY_MAX_OBJECT_KEYS,
+  classifyStructuredValue,
   mergeRedactionMetadata,
   redactNetworkTextBody,
   summarizeOmittedPayload,
@@ -255,5 +256,38 @@ describe("clean and absent captures (D3)", () => {
 
     const dropped = summarizeOmittedPayload("body_read_failed");
     expect(dropped.bodySummary?.action).toBe("dropped");
+  });
+});
+
+describe("the omitted-depth marker survives a second pass", () => {
+  function deeplyNested(levels: number): string {
+    let value: unknown = { leaf: 1 };
+    for (let index = 0; index < levels; index += 1) value = { n: value };
+    return JSON.stringify(value);
+  }
+
+  it("classifies the marker as an engine marker rather than free text", () => {
+    expect(classifyStructuredValue(OMITTED_DEPTH_VALUE)).toEqual({
+      action: "keep",
+    });
+  });
+
+  it("still redacts the marker when the field name is denied", () => {
+    const result = structured(JSON.stringify({ ssn: OMITTED_DEPTH_VALUE }));
+    expect(result.body).not.toContain(OMITTED_DEPTH_VALUE);
+  });
+
+  it("does not invent a value shape for a subtree that was never read", () => {
+    const first = structured(deeplyNested(STRUCTURED_BODY_MAX_DEPTH + 6));
+    expect(first.body).toContain(OMITTED_DEPTH_VALUE);
+
+    const second = structured(first.body as string);
+    expect(second.body).toContain(OMITTED_DEPTH_VALUE);
+    // The fabricated shape the cloud had to work around: a $redacted wrapper
+    // describing the marker's own characters as if they were a captured value.
+    expect(second.body).not.toContain("$redacted");
+    expect(fieldsByReason(second.metadata?.fields, "free_text_value")).toEqual(
+      [],
+    );
   });
 });

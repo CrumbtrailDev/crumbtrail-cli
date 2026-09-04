@@ -234,6 +234,15 @@ already captures both in the same process and the middleware would only patch
 stdout a second time. Set `captureResponseBody` to `"error"` or `"all"` when you
 want the response text that explains a failure.
 
+`captureRequestBody` is the operand half of the same evidence, and it is off
+unless you set it. A response body is written by your application; a request
+body is written by whoever called it, and on sign in, password reset, checkout
+and token exchange it carries the credential itself. Redaction still runs over
+everything captured, under the same keep list as the response. Set it to
+`"error"` or `"all"` when you need the numbers a wrong answer was computed from,
+and mount the middleware before your body parser so it sees what actually
+arrived.
+
 It writes none of it when the SDK could not be installed. An import for a package
 that is not there does not degrade, it fails the build, so a failed install ends
 with your repository untouched and a note saying what to install.

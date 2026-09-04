@@ -3400,6 +3400,16 @@ export function classifyStructuredValue(
   if (value === null || typeof value === "boolean") return { action: "keep" };
   if (typeof value !== "string")
     return { action: "redact", reason: "unknown_value" };
+  // An engine marker, not a captured value. The bounded walker writes
+  // `[OMITTED:depth]` where it stopped descending, so the string names an
+  // ABSENCE: nothing was ever read at that position, and nothing was judged
+  // sensitive there. Classifying it as free text made the second pass — the
+  // capture server's re-classification, or any consumer calling this directly —
+  // wrap it in a value shape, so the stored payload reported a 15 character
+  // mixed-charset string with a hash and an example for a value that never
+  // existed. Placed after the deny-name check above, so a hostile client that
+  // posts the literal under `ssn` is still refused the exemption.
+  if (value === OMITTED_DEPTH_VALUE) return { action: "keep" };
   if (STRUCTURED_EMAIL_RE.test(value))
     return { action: "redact", reason: "email_value" };
   if (STRUCTURED_JWT_RE.test(value))
@@ -4237,6 +4247,11 @@ function redactStructuredStringValue(
   policy: StructuredFieldPolicy,
   fields: RedactionField[],
 ): unknown {
+  // The walker's own marker, returned verbatim. It has to be recognised here as
+  // well as in the classifier because `OMITTED:depth` reads as a scheme to the
+  // URL pass below, which rewrote the marker to `[REDACTED]` before any
+  // classification ran.
+  if (value === OMITTED_DEPTH_VALUE) return value;
   const urlOptions: UrlRedactionOptions = {
     ignoreKeepFields: true,
     allowOnlyHttpSchemes: true,

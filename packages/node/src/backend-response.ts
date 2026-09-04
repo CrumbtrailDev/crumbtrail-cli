@@ -93,9 +93,18 @@ export const DEFAULT_RESPONSE_BODY_MAX_BYTES = 4096;
 const TEXTUAL_CONTENT_TYPE =
   /^(application\/(json|.*\+json|xml|.*\+xml|x-www-form-urlencoded|x-ndjson|graphql|csv|yaml|x-yaml)|text\/)/i;
 
+/**
+ * Whether a content type is worth reading as text, per {@link TEXTUAL_CONTENT_TYPE}.
+ * Shared with the request recorder so both directions of one request answer to
+ * the same gate.
+ */
+export function isTextualContentType(contentType: string): boolean {
+  return TEXTUAL_CONTENT_TYPE.test(contentType);
+}
+
 /** Test seam for the content-type gate. Not part of any recorder's contract. */
 export function isCapturableContentTypeForTest(contentType: string): boolean {
-  return TEXTUAL_CONTENT_TYPE.test(contentType);
+  return isTextualContentType(contentType);
 }
 
 export interface ResponseRecorder {
