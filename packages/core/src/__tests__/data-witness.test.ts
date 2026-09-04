@@ -107,7 +107,13 @@ describe("witness compilation", () => {
           statements: [
             {
               ...proposed.statements[0],
-              relatedRows: [{ ...related, sql: "DELETE FROM payments" }],
+              // An untrusted caller can put anything on the wire, including a
+              // raw `sql` field the related-row type does not declare. The cast
+              // is what lets the test hand the compiler that shape at all; the
+              // assertion below is that compileDataWitness rejects it.
+              relatedRows: [
+                { ...related, sql: "DELETE FROM payments" } as typeof related,
+              ],
             },
           ],
         }),
