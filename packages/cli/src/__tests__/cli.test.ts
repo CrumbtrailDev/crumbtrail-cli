@@ -398,6 +398,51 @@ describe("normalizeRepoUrl", () => {
       "git.internal:7999/team/app",
     );
   });
+
+  // The result is sent to the cloud as `repo` and printed to the terminal, so
+  // a credential that survives normalization is a credential that leaves the
+  // machine. Anchored userinfo stripping is not enough: a password may hold
+  // `/`, `:` or `@`, and each of those breaks a different anchor.
+  it("drops the credential whatever the password contains", () => {
+    const secrets = ["pa/ss", "pa:ss", "pa@ss", "s3cret"];
+    for (const secret of secrets) {
+      const normalized = normalizeRepoUrl(
+        `https://user:${secret}@github.com/acme/billing.git`,
+      );
+      expect(normalized).toBe("github.com/acme/billing");
+    }
+  });
+
+  it("keeps every credential free form intact", () => {
+    expect(normalizeRepoUrl("git@github.com:acme/billing")).toBe(
+      "github.com/acme/billing",
+    );
+    expect(normalizeRepoUrl("https://github.com/acme/billing")).toBe(
+      "github.com/acme/billing",
+    );
+    expect(normalizeRepoUrl("acme/billing")).toBe("acme/billing");
+  });
+
+  it("emits nothing that still contains a credential", () => {
+    const inputs = [
+      "https://user:pa/ss@github.com/acme/billing",
+      "https://user:pa:ss@github.com/acme/billing",
+      "https://user:pa@ss@github.com/acme/billing",
+      "https://user:s3cret@github.com/acme/billing.git",
+      "http://tokenuser:b64+pad/==@git.internal:7999/team/app.git",
+      "ssh://deploy:s3cret@git.internal/team/app.git",
+      "git@github.com:acme/billing.git",
+      "https://github.com/acme/billing",
+      "acme/billing",
+    ];
+    for (const input of inputs) {
+      const normalized = normalizeRepoUrl(input);
+      for (const secret of ["s3cret", "pa/ss", "pa:ss", "pa@ss", "b64+pad/=="]) {
+        expect(normalized).not.toContain(secret.toLowerCase());
+      }
+      expect(normalized).not.toContain("@");
+    }
+  });
 });
 
 describe("the final verdict says whether anything was captured", () => {
