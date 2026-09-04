@@ -14,7 +14,9 @@ public sealed class CaptureCommands(CaptureContext capture) : DbCommandIntercept
     // the shape can leave the process. Unrecognized syntax fails closed.
     public static string Shape(string sql)
     {
-        if (sql.Length > 32768) return "[statement omitted]";
+        // Backslash interpretation depends on PostgreSQL session settings. Withhold
+        // the statement rather than parse one interpretation and leak the other.
+        if (sql.Contains('\\') || sql.Length > 32768) return "[statement omitted]";
         var output = new System.Text.StringBuilder();
         for (var i = 0; i < sql.Length;)
         {
@@ -77,7 +79,8 @@ public sealed class CaptureCommands(CaptureContext capture) : DbCommandIntercept
             if (error is null)
             { payload["rowCount"] = rows is >= 0 ? rows : null; payload["rowEvidence"] = "not_captured"; }
             else
-            { payload["code"] = error is DbException dbError ? dbError.SqlState : null; payload["category"] = "unknown"; payload["errorName"] = error.GetType().Name; }
+            { var code = error is DbException dbError && dbError.SqlState is { } state && Regex.IsMatch(state, "^[0-9A-Z]{5}$") ? state : null;
+              payload["code"] = code; payload["category"] = code?[..2] switch { "23" => "constraint", "40" => "transaction", "08" => "connection", "42" => "syntax", _ => "unknown" }; payload["errorName"] = error.GetType().Name; }
             capture.Add(error is null ? "db.statement" : "db.error", payload);
         }
         catch { /* Observing a command cannot change its outcome. */ }

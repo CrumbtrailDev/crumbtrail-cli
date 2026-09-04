@@ -18,7 +18,7 @@ public static class StructuredBody
     private const string Redacted = "[REDACTED]";
     private static readonly Regex DeniedName = new("password|passwd|passphrase|passcode|secret|token|auth|card|cvv|cvc|ssn|email|phone|address|iban|account|birth|credential|creds|cookie|session|privatekey|apikey|accesskey|securitycode|verificationcode|connection|routingnumber|taxid|nationalid|sortcode|name|postal|payload|beforejson|afterjson", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex DeniedWord = new("^(pwd|pin|pan|otp|pass|sid|dob|zip|jwt|mfa|csrf|xsrf)[0-9]*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static bool Sensitive(string key)
+    internal static bool Sensitive(string key)
     {
         var words = Regex.Replace(key, "([a-z0-9])([A-Z])", "$1 $2");
         var compact = Regex.Replace(key, "[^a-zA-Z0-9]", "");

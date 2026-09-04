@@ -1,3 +1,4 @@
+using System.Transactions;
 using Microsoft.Extensions.Logging;
 using System.Data.Common;
 using System.Diagnostics;
@@ -5,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Crumbtrail;
 
@@ -30,26 +32,32 @@ public sealed class CapturedChanges(CaptureContext capture, ILogger<CapturedChan
     private void BeforeCore(DbContext? db)
     {
         if (!capture.Active || db is null) return;
-        if (System.Transactions.Transaction.Current is not null)
-        {
-            capture.Add("capture_gap", new { surface = "db_diff", reason = "unsupported_transaction", requestId = capture.RequestId });
-            return;
-        }
+        pending.Remove(db);
         try
         {
-            db.ChangeTracker.DetectChanges();
+            if (System.Transactions.Transaction.Current is not null || db.Database.GetEnlistedTransaction() is not null)
+            {
+                capture.Add("capture_gap", new { surface = "db_diff", reason = "unsupported_transaction", requestId = capture.RequestId });
+                return;
+            }
             var entries = db.ChangeTracker.Entries().Where(e => e.State is EntityState.Added or EntityState.Modified or EntityState.Deleted).ToList();
             if (entries.Count > 100)
             {
                 log.LogWarning("Crumbtrail database snapshot limit omitted {Count} tracked rows", entries.Count - 100);
                 capture.Add("capture_gap", new { kind = "capture_gap", surface = "db_diff", reason = "scan_budget_exceeded", requestId = capture.RequestId, detail = "Tracked row snapshot limit reached", omittedRows = entries.Count - 100 });
             }
-            var rows = entries.Take(100).Select(e => new Pending(e, e.Metadata.GetTableName() ?? e.Metadata.ClrType.Name,
+            var bounded = entries.Take(100).Where(e =>
+            {
+                if (e.Properties.Take(65).Count() <= 64) return true;
+                capture.Add("capture_gap", new { surface = "db_diff", reason = "property_budget_exceeded", requestId = capture.RequestId });
+                return false;
+            });
+            var rows = bounded.Select(e => new Pending(e, e.Metadata.GetTableName() ?? e.Metadata.ClrType.Name,
                     e.State == EntityState.Added ? "insert" : e.State == EntityState.Deleted ? "delete" : "update",
                     e.State == EntityState.Added ? null : Row(e, true), capture.Callsite?.Invoke())).ToList();
             pending[db] = (rows, Stopwatch.GetTimestamp());
         }
-        catch { log.LogWarning("Crumbtrail could not snapshot pending database changes"); }
+        catch { capture.Add("capture_gap", new { surface = "db_diff", reason = "snapshot_failed", requestId = capture.RequestId }); log.LogWarning("Crumbtrail could not snapshot pending database changes"); }
     }
     private void AfterCore(DbContext? db)
     {
@@ -71,14 +79,15 @@ public sealed class CapturedChanges(CaptureContext capture, ILogger<CapturedChan
                 if (tx is { } id)
                 {
                     data["transactionId"] = id.ToString();
+                    if (transactions.Values.Sum(v => v.Count) >= 200)
+                    { capture.Add("capture_gap", new { kind = "capture_gap", surface = "db_diff", reason = "scan_budget_exceeded", requestId = capture.RequestId, detail = "Transaction row snapshot limit reached" }); break; }
                     if (!transactions.TryGetValue(id, out var list)) transactions[id] = list = [];
-                    if (transactions.Values.Sum(v => v.Count) < 200) list.Add(data);
-                    else { capture.Add("capture_gap", new { kind = "capture_gap", surface = "db_diff", reason = "scan_budget_exceeded", requestId = capture.RequestId, detail = "Transaction row snapshot limit reached" }); break; }
+                    list.Add(data);
                 }
                 else capture.Add("db.diff", data);
             }
         }
-        catch { log.LogWarning("Crumbtrail could not record saved database changes"); }
+        catch { capture.Add("capture_gap", new { surface = "db_diff", reason = "snapshot_failed", requestId = capture.RequestId }); log.LogWarning("Crumbtrail could not record saved database changes"); }
     }
     private void CompleteCore(Guid id, bool committed)
     {
@@ -93,7 +102,7 @@ public sealed class CapturedChanges(CaptureContext capture, ILogger<CapturedChan
     }
     private static object? PrimaryKey(EntityEntry entry) => entry.Metadata.FindPrimaryKey()?.Properties.ToDictionary(
         p => p.GetColumnName(StoreObjectIdentifier.Table(entry.Metadata.GetTableName()!,entry.Metadata.GetSchema())) ?? p.Name,
-        p => CapturePrivacy.Value(p.Name,entry.Property(p.Name).CurrentValue));
+        p => CapturePrivacy.PrimaryKey(p.GetColumnName(StoreObjectIdentifier.Table(entry.Metadata.GetTableName()!,entry.Metadata.GetSchema())) ?? p.Name,entry.Property(p.Name).CurrentValue));
 }
 
 public sealed class CaptureSaveChanges(CapturedChanges changes) : SaveChangesInterceptor
