@@ -974,10 +974,23 @@ function Checkout({ crumbtrail }) {
 }
 ```
 
-Values are **redacted by default** using the same policy as the rest of the SDK,
+Values are **redacted by default** by the same engine the rest of the SDK uses,
 so a state field called `token` or `password` never leaves the browser in the
-clear. Pass `{ captureRawState: true }` as the fourth argument only when you are
+clear. The engine also classifies on the value, so an email address, a card
+number, a JWT or a high entropy secret is redacted even under a field name that
+reads as ordinary. A redacted value is replaced by a shape record carrying its
+length, character classes and a stable hash, so two different secrets stay
+distinguishable without either one leaving the browser. Snapshots are bounded:
+a cycle, a very deep graph, a very long list or a very wide object is replaced
+only where it broke the bound, and the rest of the snapshot is delivered.
+
+Pass `{ captureRawState: true }` as the fourth argument only when you are
 certain the value is safe.
+
+`CrumbtrailErrorBoundary` redacts the error message, the stack and the component
+stack as free text, which keeps every stack frame and substitutes only embedded
+secrets. Both the boundary and `useBugState` report what they removed as
+redaction metadata on the captured event.
 
 React 18 or newer. For React Native and Expo, use
 [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native)
