@@ -707,6 +707,11 @@ path, so a truncated list is never mistaken for a short one. Anything else,
 including non JSON and oversized responses, carries the content type and byte
 size only.
 
+Each response retains its own bounded, redacted body, including repeated
+responses from the same URL. Reading a retained response does not require an
+earlier event to resolve a body reference. Repeated responses can therefore use
+more capture storage, within the existing body and session limits.
+
 ### Content Security Policy refusals (`csp`)
 
 A policy refusal is the quietest way for a feature to stop existing. The browser
