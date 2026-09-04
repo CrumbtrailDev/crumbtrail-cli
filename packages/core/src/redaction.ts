@@ -21,8 +21,106 @@ export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
  * only markers this module just substituted are decoded.
  */
 const ENCODED_REDACTED_VALUE_RE = /%5BREDACTED%5D/gi;
-const ENCODED_REDACTED_SHAPE_RE =
-  /%5BREDACTED%3Blen%3D\d{1,7}%3Bcharset%3D(?:alpha|num|alnum|mixed)(?:%3Bseparators%3D[0-9a-z.,_%-]+)?%5D/gi;
+
+/* ------------------------------------------------------------------ */
+/* Redacted shape string grammar                                       */
+/* ------------------------------------------------------------------ */
+
+/** Charset classes reported by {@link computeRedactedShape}. */
+export const REDACTED_SHAPE_CHARSETS = [
+  "alpha",
+  "num",
+  "alnum",
+  "mixed",
+] as const;
+
+/** Which end of the value carried whitespace. */
+export const REDACTED_SHAPE_EDGES = ["leading", "trailing", "both"] as const;
+
+/**
+ * Structural patterns a redacted value may match.
+ *
+ * Deliberately holds no sensitive class. There is no `email`, `phone`, `card`,
+ * `iban` or `token` entry: a value of that kind is already redacted under a
+ * reason that names it, and a pattern label would narrow the candidate space
+ * of the very values that most need it wide.
+ */
+export const REDACTED_SHAPE_PATTERNS = [
+  "datetime",
+  "date",
+  "time",
+  "url",
+  "uuid",
+  "decimal",
+  "grouped_number",
+] as const;
+
+interface ShapeGrammarTokens {
+  lb: string;
+  rb: string;
+  semi: string;
+  eq: string;
+  comma: string;
+  dot: string;
+}
+
+const PLAIN_SHAPE_TOKENS: ShapeGrammarTokens = {
+  lb: "\\[",
+  rb: "\\]",
+  semi: ";",
+  eq: "=",
+  comma: ",",
+  dot: "\\.",
+};
+
+/**
+ * The same grammar after a URL or form serializer has escaped its delimiters.
+ * Each token accepts the raw and the percent-encoded form, so a partly encoded
+ * marker still parses.
+ */
+const ENCODED_SHAPE_TOKENS: ShapeGrammarTokens = {
+  lb: "(?:\\[|%5B)",
+  rb: "(?:\\]|%5D)",
+  semi: "(?:;|%3B)",
+  eq: "(?:=|%3D)",
+  comma: "(?:,|%2C)",
+  dot: "\\.",
+};
+
+/**
+ * One definition of the `[REDACTED;len=..;charset=..]` string form, used to
+ * build every regex that parses it.
+ *
+ * Two regexes previously spelled the grammar out by hand, one plain and one
+ * percent-encoded, and a field added to the writer had to be added to both. A
+ * regex that has drifted from the writer does not fail loudly: it stops
+ * recognising the marker, so the next redaction pass treats an already redacted
+ * value as fresh input and describes the placeholder instead of the value.
+ *
+ * Capture groups, in order: len, charset, separators, words, lines, edges,
+ * pattern. `nonAscii` and `emoji` are bare flags and capture nothing.
+ */
+function redactedShapeGrammarSource(tokens: ShapeGrammarTokens): string {
+  const separator = `\\d{1,7}${tokens.dot}(?:dot|comma|space)`;
+  return (
+    `${tokens.lb}REDACTED` +
+    `${tokens.semi}len${tokens.eq}(\\d{1,7})` +
+    `${tokens.semi}charset${tokens.eq}(${REDACTED_SHAPE_CHARSETS.join("|")})` +
+    `(?:${tokens.semi}separators${tokens.eq}((?:${separator})(?:${tokens.comma}${separator})*))?` +
+    `(?:${tokens.semi}words${tokens.eq}(\\d{1,7}))?` +
+    `(?:${tokens.semi}lines${tokens.eq}(\\d{1,7}))?` +
+    `(?:${tokens.semi}edges${tokens.eq}(${REDACTED_SHAPE_EDGES.join("|")}))?` +
+    `(?:${tokens.semi}nonAscii)?` +
+    `(?:${tokens.semi}emoji)?` +
+    `(?:${tokens.semi}pattern${tokens.eq}(${REDACTED_SHAPE_PATTERNS.join("|")}))?` +
+    `${tokens.rb}`
+  );
+}
+
+const ENCODED_REDACTED_SHAPE_RE = new RegExp(
+  redactedShapeGrammarSource(ENCODED_SHAPE_TOKENS),
+  "gi",
+);
 
 /**
  * Restore a redaction marker in an already percent-encoded URL or query string.
@@ -53,6 +151,16 @@ export interface RedactionField {
   path: string;
   reason: string;
   action: RedactionAction;
+  /**
+   * Shape facts about the value this field replaced.
+   *
+   * Carried here rather than in the value because an input keeps the bare
+   * `[REDACTED]` token: what a user typed is read as text by every consumer,
+   * and swapping the token for an object would break all of them. The shape
+   * rides in the metadata entry instead, where a reader that wants it can find
+   * it and one that does not is unaffected.
+   */
+  shape?: RedactedValueShape;
 }
 
 export interface PayloadSummary {
@@ -782,31 +890,64 @@ function redactQueryString(
   };
 }
 
-const REDACTED_QUERY_SHAPE_RE =
-  /^\[REDACTED;len=(\d{1,7});charset=(alpha|num|alnum|mixed)(?:;separators=((?:\d{1,7}\.(?:dot|comma|space))(?:,\d{1,7}\.(?:dot|comma|space))*))?\]$/;
+const REDACTED_QUERY_SHAPE_RE = new RegExp(
+  `^${redactedShapeGrammarSource(PLAIN_SHAPE_TOKENS)}$`,
+);
 
 function isRedactedQueryShape(value: string): boolean {
   const match = REDACTED_QUERY_SHAPE_RE.exec(value);
   if (!match) return false;
   const length = Number(match[1]);
-  if (match[3] === undefined) return true;
-  return match[3].split(",").every((separator) => {
-    const index = Number(separator.split(".", 1)[0]);
-    return Number.isInteger(index) && index >= 0 && index < length;
-  });
+  if (
+    match[3] !== undefined &&
+    !match[3].split(",").every((separator) => {
+      const index = Number(separator.split(".", 1)[0]);
+      return Number.isInteger(index) && index >= 0 && index < length;
+    })
+  )
+    return false;
+  if (match[4] !== undefined) {
+    const words = Number(match[4]);
+    if (words < 1 || words > length) return false;
+  }
+  if (match[5] !== undefined) {
+    const lines = Number(match[5]);
+    if (lines < 2 || lines > length + 1) return false;
+  }
+  return true;
 }
 
 function redactedQueryValue(value: string): string {
-  const shape = computeRedactedShape(value);
+  return redactedShapeString(computeRedactedShape(value));
+}
+
+/**
+ * The string form of a shape, for planes that cannot carry an object: query
+ * values and any URL a serializer will re-encode.
+ *
+ * `example` is deliberately absent. It is the one shape field that carries the
+ * original's punctuation positions, and a query string is the plane most likely
+ * to be re-serialized, logged and pasted, so it stays in the JSON placeholder
+ * where its validation runs.
+ */
+function redactedShapeString(shape: RedactedValueShape): string {
   const separators = shape.separators
     ?.map(({ index, char }) => {
       const name = char === "." ? "dot" : char === "," ? "comma" : "space";
       return `${index}.${name}`;
     })
     .join(",");
-  return `[REDACTED;len=${shape.len};charset=${shape.charset}${
-    separators ? `;separators=${separators}` : ""
-  }]`;
+  return (
+    `[REDACTED;len=${shape.len};charset=${shape.charset}` +
+    (separators ? `;separators=${separators}` : "") +
+    (shape.words !== undefined ? `;words=${shape.words}` : "") +
+    (shape.lines !== undefined ? `;lines=${shape.lines}` : "") +
+    (shape.edges !== undefined ? `;edges=${shape.edges}` : "") +
+    (shape.nonAscii ? ";nonAscii" : "") +
+    (shape.emoji ? ";emoji" : "") +
+    (shape.pattern !== undefined ? `;pattern=${shape.pattern}` : "") +
+    "]"
+  );
 }
 
 /**
@@ -2310,7 +2451,11 @@ function replaceSensitiveMarkupPayloadAttributes(attrs: string): string {
 
 export type StructuredRedactionMode = "structured" | "full";
 
-export type RedactedShapeCharset = "alpha" | "num" | "alnum" | "mixed";
+export type RedactedShapeCharset = (typeof REDACTED_SHAPE_CHARSETS)[number];
+
+export type RedactedShapeEdges = (typeof REDACTED_SHAPE_EDGES)[number];
+
+export type RedactedShapePattern = (typeof REDACTED_SHAPE_PATTERNS)[number];
 
 export type RedactedShapeSeparator = {
   index: number;
@@ -2336,6 +2481,28 @@ export interface RedactedValueShape {
    * case-only identity collisions without learning or recovering the value.
    */
   casefoldHash8?: string;
+  /**
+   * Whitespace-separated runs. Present only alongside `hash8`: on a value short
+   * enough that the hash is withheld, a word count is a real cut of an already
+   * enumerable candidate space.
+   */
+  words?: number;
+  /** Line breaks plus one, present only above one and only alongside `hash8`. */
+  lines?: number;
+  /** Which end carried whitespace. One of three states, so at most two bits. */
+  edges?: RedactedShapeEdges;
+  /** Any code point above 0x7F. */
+  nonAscii?: true;
+  /** Any Extended_Pictographic code point. */
+  emoji?: true;
+  /** A structural pattern the whole value matched. Never a sensitive class. */
+  pattern?: RedactedShapePattern;
+  /**
+   * A pasteable stand-in built from a fixed alphabet, so it shows the value's
+   * shape and carries nothing of its content. Emitted only for free prose and
+   * only alongside `hash8`; see {@link redactedShapeExample}.
+   */
+  example?: string;
 }
 
 export type StructuredClassification =
@@ -2609,13 +2776,92 @@ function redactedShapeSeparators(
   return separators.length > 0 ? separators : undefined;
 }
 
+const SHAPE_EMOJI_RE = /\p{Extended_Pictographic}/u;
+const SHAPE_NON_ASCII_RE = /[^\u0000-\u007f]/;
+const SHAPE_LINE_BREAK_RE = /\r\n|\r|\n/g;
+
+const SHAPE_UUID_RE =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const SHAPE_DATETIME_RE =
+  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?$/;
+const SHAPE_DATE_RE =
+  /^(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})$/;
+const SHAPE_TIME_RE = /^\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?: ?[AaPp][Mm])?$/;
+const SHAPE_URL_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+$/;
+const SHAPE_DECIMAL_RE = /^[+-]?\d+\.\d+$/;
+const SHAPE_GROUPED_NUMBER_RE =
+  /^[+-]?\d{1,3}(?:[, ]\d{3})+(?:\.\d+)?$/;
+
+/**
+ * The one structural pattern the whole value matches, or nothing.
+ *
+ * Ordered most specific first: an ISO instant matches both the datetime and
+ * (by prefix) nothing else, but a grouped number and a decimal overlap, so
+ * grouping is tested before the plain decimal form.
+ */
+function redactedShapePattern(text: string): RedactedShapePattern | undefined {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return undefined;
+  if (SHAPE_UUID_RE.test(trimmed)) return "uuid";
+  if (SHAPE_DATETIME_RE.test(trimmed)) return "datetime";
+  if (SHAPE_DATE_RE.test(trimmed)) return "date";
+  if (SHAPE_TIME_RE.test(trimmed)) return "time";
+  if (SHAPE_URL_RE.test(trimmed)) return "url";
+  if (SHAPE_GROUPED_NUMBER_RE.test(trimmed)) return "grouped_number";
+  if (SHAPE_DECIMAL_RE.test(trimmed)) return "decimal";
+  return undefined;
+}
+
+function redactedShapeEdges(text: string): RedactedShapeEdges | undefined {
+  const leading = /^\s/.test(text);
+  const trailing = /\s$/.test(text);
+  if (leading && trailing) return "both";
+  if (leading) return "leading";
+  if (trailing) return "trailing";
+  return undefined;
+}
+
+/**
+ * Redaction reasons whose value is ordinary prose, and the only reasons that
+ * may carry an `example`.
+ *
+ * Everything else is withheld because the reason itself already narrows the
+ * value: `email_value`, `jwt_value`, `luhn_value`, `iban_value`,
+ * `token_like_value` and `high_entropy_value` name a format, a sensitive field
+ * name says the value is personal, and `masked_input_type` is a deployment
+ * asking for nothing at all. A punctuation-preserving stand-in for a value of
+ * any of those kinds narrows it further, and the whole point of the field is
+ * that it must not.
+ */
+const SHAPE_EXAMPLE_REASONS = new Set(["free_text_value"]);
+
+/** May a value redacted for this reason carry an `example`? */
+export function redactedShapeExampleAllowed(
+  reason: string | undefined,
+  shape: RedactedValueShape,
+): boolean {
+  return (
+    reason !== undefined &&
+    SHAPE_EXAMPLE_REASONS.has(reason) &&
+    shape.hash8 !== undefined
+  );
+}
+
 /**
  * Shape metadata for a redacted value — length, charset class, numeric separator
- * positions, and a salted one-way hash. The hash is omitted for low-entropy
- * values whose candidate space is trivially enumerable (numeric with len < 12,
- * or any len < 6).
+ * positions, a salted one-way hash, and the structural facts a reader needs to
+ * tell a one-word entry from a pasted paragraph. The hash is omitted for
+ * low-entropy values whose candidate space is trivially enumerable (numeric with
+ * len < 12, or any len < 6), and `words`, `lines` and `example` are omitted with
+ * it.
+ *
+ * @param reason The redaction reason, which decides whether an `example` is
+ * emitted. Omitted means no example.
  */
-export function computeRedactedShape(value: unknown): RedactedValueShape {
+export function computeRedactedShape(
+  value: unknown,
+  reason?: string,
+): RedactedValueShape {
   const text =
     typeof value === "string" ? value : (JSON.stringify(value) ?? "");
   const charset: RedactedShapeCharset = /^[A-Za-z]+$/.test(text)
@@ -2626,6 +2872,8 @@ export function computeRedactedShape(value: unknown): RedactedValueShape {
         ? "alnum"
         : "mixed";
   const separators = redactedShapeSeparators(text);
+  const edges = redactedShapeEdges(text);
+  const pattern = redactedShapePattern(text);
   const shape: RedactedValueShape = {
     len: text.length,
     charset,
@@ -2641,8 +2889,193 @@ export function computeRedactedShape(value: unknown): RedactedValueShape {
         `${getStructuredShapeSalt()}:${casefolded}`,
       );
     }
+    const trimmed = text.trim();
+    shape.words = trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length;
+    SHAPE_LINE_BREAK_RE.lastIndex = 0;
+    const breaks = text.match(SHAPE_LINE_BREAK_RE)?.length ?? 0;
+    if (breaks > 0) shape.lines = breaks + 1;
   }
+  if (edges !== undefined) shape.edges = edges;
+  if (SHAPE_NON_ASCII_RE.test(text)) shape.nonAscii = true;
+  if (SHAPE_EMOJI_RE.test(text)) shape.emoji = true;
+  if (pattern !== undefined) shape.pattern = pattern;
+  if (redactedShapeExampleAllowed(reason, shape))
+    shape.example = redactedShapeExample(text);
   return shape;
+}
+
+/* ------------------------------------------------------------------ */
+/* Fake example                                                        */
+/* ------------------------------------------------------------------ */
+
+export const REDACTED_SHAPE_EXAMPLE_MAX_LENGTH = 120;
+const SHAPE_EXAMPLE_ELLIPSIS = "…";
+const SHAPE_EXAMPLE_ASCII_PUNCTUATION_RE = /[!-/:-@[-`{-~]/;
+
+/**
+ * One fixed letter per script, so a stand-in shows that a value was Cyrillic or
+ * Han without showing which letters it used. Ordered, and only the first match
+ * counts.
+ */
+const SHAPE_EXAMPLE_SCRIPT_LETTERS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\p{Script=Latin}/u, "é"],
+  [/\p{Script=Greek}/u, "α"],
+  [/\p{Script=Cyrillic}/u, "д"],
+  [/\p{Script=Hebrew}/u, "ש"],
+  [/\p{Script=Arabic}/u, "ش"],
+  [/\p{Script=Devanagari}/u, "क"],
+  [/\p{Script=Thai}/u, "ก"],
+  [/\p{Script=Han}/u, "漢"],
+  [/\p{Script=Hiragana}/u, "あ"],
+  [/\p{Script=Katakana}/u, "ア"],
+  [/\p{Script=Hangul}/u, "한"],
+];
+
+/** A letter in a script with no listed representative. */
+const SHAPE_EXAMPLE_OTHER_LETTER = "ə";
+/** Astral and BMP pictographic stand-ins, chosen to preserve code unit width. */
+const SHAPE_EXAMPLE_ASTRAL_EMOJI = "🙂";
+const SHAPE_EXAMPLE_BMP_EMOJI = "☺";
+/** Anything else: an ASCII control character, or a non-ASCII non-letter. */
+const SHAPE_EXAMPLE_ASCII_OTHER = "?";
+const SHAPE_EXAMPLE_NON_ASCII_OTHER = "¤";
+
+const SHAPE_EXAMPLE_ALPHABET = new Set<string>([
+  "X",
+  "x",
+  "0",
+  SHAPE_EXAMPLE_ASCII_OTHER,
+  SHAPE_EXAMPLE_NON_ASCII_OTHER,
+  SHAPE_EXAMPLE_ASTRAL_EMOJI,
+  SHAPE_EXAMPLE_BMP_EMOJI,
+  SHAPE_EXAMPLE_OTHER_LETTER,
+  ...SHAPE_EXAMPLE_SCRIPT_LETTERS.map(([, letter]) => letter),
+]);
+
+function shapeExampleReplacement(codePoint: string): string {
+  if (codePoint.length === 1 && codePoint.charCodeAt(0) < 0x80) {
+    if (codePoint >= "A" && codePoint <= "Z") return "X";
+    if (codePoint >= "a" && codePoint <= "z") return "x";
+    if (codePoint >= "0" && codePoint <= "9") return "0";
+    if (/\s/.test(codePoint)) return codePoint;
+    if (SHAPE_EXAMPLE_ASCII_PUNCTUATION_RE.test(codePoint)) return codePoint;
+    return SHAPE_EXAMPLE_ASCII_OTHER;
+  }
+  if (SHAPE_EMOJI_RE.test(codePoint))
+    return codePoint.length === 2
+      ? SHAPE_EXAMPLE_ASTRAL_EMOJI
+      : SHAPE_EXAMPLE_BMP_EMOJI;
+  if (/\p{L}/u.test(codePoint)) {
+    for (const [script, letter] of SHAPE_EXAMPLE_SCRIPT_LETTERS)
+      if (script.test(codePoint)) return letter;
+    return SHAPE_EXAMPLE_OTHER_LETTER;
+  }
+  return SHAPE_EXAMPLE_NON_ASCII_OTHER;
+}
+
+/**
+ * A replacement occupying exactly as many UTF-16 code units as the code point
+ * it stands for, so `example.length` and `len` are comparable without the
+ * server holding the original. An astral code point with a BMP stand-in is
+ * written twice; the reverse cannot occur, and is defended against anyway.
+ */
+function shapeExampleUnits(codePoint: string): string {
+  const replacement = shapeExampleReplacement(codePoint);
+  if (replacement.length === codePoint.length) return replacement;
+  if (replacement.length > codePoint.length)
+    return SHAPE_EXAMPLE_ASCII_OTHER.repeat(codePoint.length);
+  return replacement.repeat(codePoint.length / replacement.length);
+}
+
+/**
+ * A pasteable stand-in for a redacted value: the same length, the same
+ * whitespace and ASCII punctuation, and fixed letters everywhere else.
+ *
+ * Fixed rather than seeded random, because a random alphabet is verifiable only
+ * by trusting the client, and 120 characters of free letters is enough room to
+ * carry the value the field exists to hide. Fixed letters make what the field
+ * can carry small and checkable: {@link isValidRedactedShapeExample} rejects
+ * anything outside the alphabet, of the wrong length, or inconsistent with the
+ * charset and the non-ASCII and emoji flags.
+ *
+ * The residual is punctuation. Under `charset: "mixed"` the stand-in keeps the
+ * original's punctuation characters and their positions, which is the structure
+ * it is there to show and is also the one thing a lying client could write
+ * freely. That is bounded by the alphabet and accepted; the alternative is a
+ * stand-in that shows nothing.
+ */
+export function redactedShapeExample(text: string): string {
+  let out = "";
+  for (const codePoint of text) {
+    out += shapeExampleUnits(codePoint);
+    if (out.length >= REDACTED_SHAPE_EXAMPLE_MAX_LENGTH) break;
+  }
+  if (text.length <= REDACTED_SHAPE_EXAMPLE_MAX_LENGTH) return out;
+  let cut = Math.min(out.length, REDACTED_SHAPE_EXAMPLE_MAX_LENGTH);
+  const last = out.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return out.slice(0, cut) + SHAPE_EXAMPLE_ELLIPSIS;
+}
+
+function isShapeExampleCharacter(codePoint: string): boolean {
+  if (SHAPE_EXAMPLE_ALPHABET.has(codePoint)) return true;
+  if (codePoint.length !== 1) return false;
+  if (codePoint.charCodeAt(0) >= 0x80) return false;
+  return (
+    /\s/.test(codePoint) || SHAPE_EXAMPLE_ASCII_PUNCTUATION_RE.test(codePoint)
+  );
+}
+
+/**
+ * Does this `example` match the shape it claims to describe?
+ *
+ * The capture server regenerates nothing — it never sees the original — so this
+ * is what stands between a lying client and a value smuggled through in a field
+ * that reads as harmless. It checks the alphabet, the length against `len`, and
+ * agreement with `charset`, `nonAscii` and `emoji`. A truncated example is held
+ * to the one-directional half of the flag checks, because the flags describe the
+ * whole value and the example only its first 120 code units.
+ */
+export function isValidRedactedShapeExample(
+  example: unknown,
+  shape: Pick<RedactedValueShape, "len" | "charset" | "nonAscii" | "emoji">,
+): boolean {
+  if (typeof example !== "string" || example.length === 0) return false;
+  const truncated = shape.len > REDACTED_SHAPE_EXAMPLE_MAX_LENGTH;
+  let body = example;
+  if (truncated) {
+    if (!example.endsWith(SHAPE_EXAMPLE_ELLIPSIS)) return false;
+    body = example.slice(0, -SHAPE_EXAMPLE_ELLIPSIS.length);
+    if (
+      body.length !== REDACTED_SHAPE_EXAMPLE_MAX_LENGTH &&
+      body.length !== REDACTED_SHAPE_EXAMPLE_MAX_LENGTH - 1
+    )
+      return false;
+  } else if (body.length !== shape.len) {
+    return false;
+  }
+  let sawNonAscii = false;
+  let sawEmoji = false;
+  for (const codePoint of body) {
+    if (!isShapeExampleCharacter(codePoint)) return false;
+    if (
+      codePoint === SHAPE_EXAMPLE_ASTRAL_EMOJI ||
+      codePoint === SHAPE_EXAMPLE_BMP_EMOJI
+    )
+      sawEmoji = true;
+    if (codePoint.length > 1 || codePoint.charCodeAt(0) >= 0x80)
+      sawNonAscii = true;
+  }
+  if (sawEmoji && shape.emoji !== true) return false;
+  if (sawNonAscii && shape.nonAscii !== true) return false;
+  if (!truncated) {
+    if (!sawEmoji && shape.emoji === true) return false;
+    if (!sawNonAscii && shape.nonAscii === true) return false;
+  }
+  if (shape.charset === "alpha") return /^[Xx]*$/.test(body);
+  if (shape.charset === "num") return /^0*$/.test(body);
+  if (shape.charset === "alnum") return /^[Xx0]*$/.test(body);
+  return true;
 }
 
 /**
@@ -3386,8 +3819,11 @@ function isStructuredKeepName(
   return keepFields.some((keep) => compactFieldName(keep) === compact);
 }
 
-function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
-  const shape = computeRedactedShape(value);
+function redactedShapePlaceholder(
+  value: unknown,
+  reason?: string,
+): Record<string, unknown> {
+  const shape = computeRedactedShape(value, reason);
   const placeholder: Record<string, unknown> = {
     $redacted: REDACTED_VALUE,
     len: shape.len,
@@ -3397,6 +3833,13 @@ function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
   if (shape.hash8 !== undefined) placeholder.hash8 = shape.hash8;
   if (shape.casefoldHash8 !== undefined)
     placeholder.casefoldHash8 = shape.casefoldHash8;
+  if (shape.words !== undefined) placeholder.words = shape.words;
+  if (shape.lines !== undefined) placeholder.lines = shape.lines;
+  if (shape.edges !== undefined) placeholder.edges = shape.edges;
+  if (shape.nonAscii === true) placeholder.nonAscii = true;
+  if (shape.emoji === true) placeholder.emoji = true;
+  if (shape.pattern !== undefined) placeholder.pattern = shape.pattern;
+  if (shape.example !== undefined) placeholder.example = shape.example;
   return placeholder;
 }
 
@@ -3407,6 +3850,13 @@ const PLACEHOLDER_KEYS = new Set([
   "separators",
   "hash8",
   "casefoldHash8",
+  "words",
+  "lines",
+  "edges",
+  "nonAscii",
+  "emoji",
+  "pattern",
+  "example",
 ]);
 const CHARSET_RE = /^[a-z]+$/;
 const HASH8_RE = /^[0-9a-f]{8}$/;
@@ -3428,53 +3878,120 @@ const HASH8_RE = /^[0-9a-f]{8}$/;
  * carry a secret, so treating it as already-redacted grants a caller nothing.
  */
 function isRedactedPlaceholder(value: unknown): boolean {
-  if (value === null || typeof value !== "object" || Array.isArray(value))
+  return sanitizeRedactedPlaceholder(value) !== undefined;
+}
+
+function isValidPlaceholderSeparators(
+  entry: unknown,
+  len: unknown,
+): boolean {
+  if (!Array.isArray(entry) || entry.length > MAX_REDACTED_SHAPE_SEPARATORS)
     return false;
+  for (const separator of entry) {
+    if (
+      separator === null ||
+      typeof separator !== "object" ||
+      Array.isArray(separator)
+    )
+      return false;
+    const separatorRecord = separator as Record<string, unknown>;
+    const separatorIndex = separatorRecord.index;
+    const separatorChar = separatorRecord.char;
+    if (
+      Object.keys(separatorRecord).some(
+        (separatorKey) => !["index", "char"].includes(separatorKey),
+      ) ||
+      typeof separatorIndex !== "number" ||
+      !Number.isInteger(separatorIndex) ||
+      separatorIndex < 0 ||
+      (typeof len === "number" && separatorIndex >= len) ||
+      (separatorChar !== "." && separatorChar !== "," && separatorChar !== " ")
+    )
+      return false;
+  }
+  return true;
+}
+
+function isPlaceholderCount(entry: unknown, len: unknown, max: number): boolean {
+  if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 0)
+    return false;
+  return typeof len !== "number" || entry <= len + max;
+}
+
+/**
+ * The placeholder this module would accept, with an unverifiable `example`
+ * removed, or `undefined` when the value is not a placeholder at all.
+ *
+ * Everything except `example` is a fact the value's own shape forces, so a
+ * client that writes a wrong one gains nothing. `example` is different: it is a
+ * free string, and the capture server never sees the original it claims to
+ * stand for. So it is checked structurally against the rest of the placeholder
+ * and dropped when it disagrees, rather than trusted or rejected wholesale — a
+ * forged example must not cost the session the shape facts beside it.
+ */
+function sanitizeRedactedPlaceholder(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    return undefined;
   const record = value as Record<string, unknown>;
-  if (record.$redacted !== REDACTED_VALUE) return false;
+  if (record.$redacted !== REDACTED_VALUE) return undefined;
+  let exampleValid = true;
   for (const [key, entry] of Object.entries(record)) {
-    if (!PLACEHOLDER_KEYS.has(key)) return false;
+    if (!PLACEHOLDER_KEYS.has(key)) return undefined;
     if (key === "$redacted") continue;
     if (key === "len") {
-      if (typeof entry !== "number" || !Number.isFinite(entry)) return false;
-      continue;
-    }
-    if (typeof entry !== "string") return false;
-    if (key === "charset") {
-      if (!CHARSET_RE.test(entry) || entry.length > 16) return false;
+      if (typeof entry !== "number" || !Number.isFinite(entry))
+        return undefined;
       continue;
     }
     if (key === "separators") {
-      if (!Array.isArray(entry) || entry.length > 32) return false;
-      for (const separator of entry) {
-        if (
-          separator === null ||
-          typeof separator !== "object" ||
-          Array.isArray(separator)
-        )
-          return false;
-        const separatorRecord = separator as Record<string, unknown>;
-        const separatorIndex = separatorRecord.index;
-        const separatorChar = separatorRecord.char;
-        if (
-          Object.keys(separatorRecord).some(
-            (separatorKey) => !["index", "char"].includes(separatorKey),
-          ) ||
-          typeof separatorIndex !== "number" ||
-          !Number.isInteger(separatorIndex) ||
-          separatorIndex < 0 ||
-          (typeof record.len === "number" && separatorIndex >= record.len) ||
-          (separatorChar !== "." &&
-            separatorChar !== "," &&
-            separatorChar !== " ")
-        )
-          return false;
-      }
+      if (!isValidPlaceholderSeparators(entry, record.len)) return undefined;
       continue;
     }
-    if (!HASH8_RE.test(entry)) return false;
+    if (key === "words") {
+      if (!isPlaceholderCount(entry, record.len, 0)) return undefined;
+      continue;
+    }
+    if (key === "lines") {
+      if (!isPlaceholderCount(entry, record.len, 1) || (entry as number) < 2)
+        return undefined;
+      continue;
+    }
+    if (key === "nonAscii" || key === "emoji") {
+      if (entry !== true) return undefined;
+      continue;
+    }
+    if (key === "example") {
+      if (typeof entry !== "string") return undefined;
+      exampleValid = isValidRedactedShapeExample(entry, {
+        len: typeof record.len === "number" ? record.len : -1,
+        charset: record.charset as RedactedShapeCharset,
+        ...(record.nonAscii === true ? { nonAscii: true as const } : {}),
+        ...(record.emoji === true ? { emoji: true as const } : {}),
+      });
+      continue;
+    }
+    if (typeof entry !== "string") return undefined;
+    if (key === "charset") {
+      if (!CHARSET_RE.test(entry) || entry.length > 16) return undefined;
+      continue;
+    }
+    if (key === "edges") {
+      if (!(REDACTED_SHAPE_EDGES as readonly string[]).includes(entry))
+        return undefined;
+      continue;
+    }
+    if (key === "pattern") {
+      if (!(REDACTED_SHAPE_PATTERNS as readonly string[]).includes(entry))
+        return undefined;
+      continue;
+    }
+    if (!HASH8_RE.test(entry)) return undefined;
   }
-  return true;
+  if (exampleValid) return record;
+  const { example: _dropped, ...rest } = record;
+  return rest;
 }
 
 type StructuredContainerContext = "card" | "account" | undefined;
@@ -3547,7 +4064,7 @@ function redactStructuredStringValue(
   );
   if (classification.action === "keep") return urlResult.value;
   fields.push({ path, reason: classification.reason, action: "redacted" });
-  return redactedShapePlaceholder(value);
+  return redactedShapePlaceholder(value, classification.reason);
 }
 
 function maskUrlsForClassification(value: string): string {
@@ -3569,8 +4086,11 @@ function redactStructuredJsonValue(
   inheritedContainer?: StructuredContainerContext,
 ): unknown {
   // Already redacted by an earlier pass. Re-wrapping it would replace the
-  // original value's shape facts with the placeholder's own.
-  if (isRedactedPlaceholder(value)) return value;
+  // original value's shape facts with the placeholder's own. An `example` that
+  // does not match the shape beside it is dropped here: this pass is the one
+  // that runs at the capture server, where the client is not trusted.
+  const existingPlaceholder = sanitizeRedactedPlaceholder(value);
+  if (existingPlaceholder !== undefined) return existingPlaceholder;
   const container = structuredContainerContext(keyName, inheritedContainer);
   if (isStructuredContainerNumber(keyName, container)) {
     fields.push({
@@ -4157,7 +4677,12 @@ function redactedInput(
 ): RedactionResult<string> {
   return withMetadata(
     REDACTED_VALUE,
-    { path, reason, action: "redacted" },
+    {
+      path,
+      reason,
+      action: "redacted",
+      shape: computeRedactedShape(value, reason),
+    },
     buildSummary("input", "redacted", reason, value.length),
   );
 }

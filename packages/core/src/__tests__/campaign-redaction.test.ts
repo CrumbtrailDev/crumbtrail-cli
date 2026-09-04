@@ -177,6 +177,6 @@ describe("redactQueryString is unchanged by the campaign allowance", () => {
       .searchParams;
 
     for (const name of ALLOWED)
-      expect(params.get(name)).toBe("[REDACTED;len=10;charset=alpha]");
+      expect(params.get(name)).toBe("[REDACTED;len=10;charset=alpha;words=1]");
   });
 });

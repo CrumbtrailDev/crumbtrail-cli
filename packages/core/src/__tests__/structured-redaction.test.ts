@@ -1841,7 +1841,7 @@ describe("query parameters answer to the same keep list", () => {
 
     expect(absent.has("q")).toBe(false);
     expect(empty.get("q")).toBe("");
-    expect(redacted.get("q")).toBe("[REDACTED;len=6;charset=alpha]");
+    expect(redacted.get("q")).toBe("[REDACTED;len=6;charset=alpha;words=1]");
   });
 
   it("keeps numeric scale in a redacted query value", () => {
@@ -1864,7 +1864,7 @@ describe("query parameters answer to the same keep list", () => {
     ).searchParams.get("amount");
 
     expect(value).toBe(
-      "[REDACTED;len=8;charset=mixed;separators=1.dot,5.comma]",
+      "[REDACTED;len=8;charset=mixed;separators=1.dot,5.comma;words=1]",
     );
     expect(
       redactUrl(`/api/search?amount=${encodeURIComponent(value!)}`).value,
@@ -1880,7 +1880,7 @@ describe("query parameters answer to the same keep list", () => {
   it("redacts every undeclared word value by default", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
-      "/api/search?q=[REDACTED;len=6;charset=alpha]&productId=1",
+      "/api/search?q=[REDACTED;len=6;charset=alpha;words=1]&productId=1",
     );
   });
 
@@ -1932,7 +1932,7 @@ describe("query parameters answer to the same keep list", () => {
   it("still redacts a sensitive value inside a kept parameter", () => {
     setRedactionKeepFields(["q"]);
     expect(redactUrl("/api/search?q=someone%40example.com").value).toBe(
-      "/api/search?q=[REDACTED;len=19;charset=mixed]",
+      "/api/search?q=[REDACTED;len=19;charset=mixed;words=1]",
     );
   });
 
