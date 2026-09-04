@@ -86,7 +86,7 @@ describe("the redaction marker survives URL serialization unescaped", () => {
 
   it("writes the marker literally in a query value", () => {
     const value = redactUrl("https://api.test/search?q=widget&token=abc").value;
-    expect(value).toContain("q=[REDACTED;len=6;charset=alpha]");
+    expect(value).toContain("q=[REDACTED;len=6;charset=alpha;words=1]");
     expect(value).toContain("token=[REDACTED;len=3;charset=alpha]");
     expect(value).not.toContain("%5B");
   });

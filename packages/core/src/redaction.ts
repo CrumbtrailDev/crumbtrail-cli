@@ -2777,20 +2777,25 @@ function redactedShapeSeparators(
 }
 
 const SHAPE_EMOJI_RE = /\p{Extended_Pictographic}/u;
-const SHAPE_NON_ASCII_RE = /[^\u0000-\u007f]/;
+/** Any code point above 0x7F. A loop, because the regex form trips no-control-regex. */
+function hasNonAscii(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) > 0x7f) return true;
+  }
+  return false;
+}
 const SHAPE_LINE_BREAK_RE = /\r\n|\r|\n/g;
 
 const SHAPE_UUID_RE =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const SHAPE_DATETIME_RE =
   /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?$/;
-const SHAPE_DATE_RE =
-  /^(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})$/;
-const SHAPE_TIME_RE = /^\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?: ?[AaPp][Mm])?$/;
+const SHAPE_DATE_RE = /^(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})$/;
+const SHAPE_TIME_RE =
+  /^\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?: ?[AaPp][Mm])?$/;
 const SHAPE_URL_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+$/;
 const SHAPE_DECIMAL_RE = /^[+-]?\d+\.\d+$/;
-const SHAPE_GROUPED_NUMBER_RE =
-  /^[+-]?\d{1,3}(?:[, ]\d{3})+(?:\.\d+)?$/;
+const SHAPE_GROUPED_NUMBER_RE = /^[+-]?\d{1,3}(?:[, ]\d{3})+(?:\.\d+)?$/;
 
 /**
  * The one structural pattern the whole value matches, or nothing.
@@ -2896,7 +2901,7 @@ export function computeRedactedShape(
     if (breaks > 0) shape.lines = breaks + 1;
   }
   if (edges !== undefined) shape.edges = edges;
-  if (SHAPE_NON_ASCII_RE.test(text)) shape.nonAscii = true;
+  if (hasNonAscii(text)) shape.nonAscii = true;
   if (SHAPE_EMOJI_RE.test(text)) shape.emoji = true;
   if (pattern !== undefined) shape.pattern = pattern;
   if (redactedShapeExampleAllowed(reason, shape))
@@ -3861,30 +3866,7 @@ const PLACEHOLDER_KEYS = new Set([
 const CHARSET_RE = /^[a-z]+$/;
 const HASH8_RE = /^[0-9a-f]{8}$/;
 
-/**
- * True only for a value this module itself produced.
- *
- * Redaction runs more than once over the same payload: the SDK classifies a
- * body before sending it, and the capture server re-classifies it at rest,
- * deliberately, so a client that lies about its policy cannot store secrets.
- * Without this check the second pass sees a placeholder OBJECT under a
- * free-text name and wraps it in another placeholder, so the stored value is
- * `$redacted` inside `$redacted` and the `len`/`hash8` shape facts detectors
- * join against describe the first placeholder rather than the original value.
- *
- * The check is exact rather than structural on purpose. Every key must be one
- * of the shape fields this module emits, `$redacted` must be the literal marker,
- * `len` a finite number, and the hashes 8 hex digits. Nothing that shape can
- * carry a secret, so treating it as already-redacted grants a caller nothing.
- */
-function isRedactedPlaceholder(value: unknown): boolean {
-  return sanitizeRedactedPlaceholder(value) !== undefined;
-}
-
-function isValidPlaceholderSeparators(
-  entry: unknown,
-  len: unknown,
-): boolean {
+function isValidPlaceholderSeparators(entry: unknown, len: unknown): boolean {
   if (!Array.isArray(entry) || entry.length > MAX_REDACTED_SHAPE_SEPARATORS)
     return false;
   for (const separator of entry) {
@@ -3912,7 +3894,11 @@ function isValidPlaceholderSeparators(
   return true;
 }
 
-function isPlaceholderCount(entry: unknown, len: unknown, max: number): boolean {
+function isPlaceholderCount(
+  entry: unknown,
+  len: unknown,
+  max: number,
+): boolean {
   if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 0)
     return false;
   return typeof len !== "number" || entry <= len + max;
@@ -3922,12 +3908,26 @@ function isPlaceholderCount(entry: unknown, len: unknown, max: number): boolean 
  * The placeholder this module would accept, with an unverifiable `example`
  * removed, or `undefined` when the value is not a placeholder at all.
  *
- * Everything except `example` is a fact the value's own shape forces, so a
- * client that writes a wrong one gains nothing. `example` is different: it is a
- * free string, and the capture server never sees the original it claims to
- * stand for. So it is checked structurally against the rest of the placeholder
- * and dropped when it disagrees, rather than trusted or rejected wholesale — a
- * forged example must not cost the session the shape facts beside it.
+ * Redaction runs more than once over the same payload: the SDK classifies a
+ * body before sending it, and the capture server re-classifies it at rest,
+ * deliberately, so a client that lies about its policy cannot store secrets.
+ * Without this check the second pass sees a placeholder OBJECT under a
+ * free-text name and wraps it in another placeholder, so the stored value is
+ * `$redacted` inside `$redacted` and the `len`/`hash8` shape facts detectors
+ * join against describe the first placeholder rather than the original value.
+ *
+ * The check is exact rather than structural. Every key must be one of the shape
+ * fields this module emits, `$redacted` must be the literal marker, `len` a
+ * finite number, the hashes 8 hex digits, and `edges` and `pattern` members of
+ * their closed lists. None of that can carry a secret, so treating it as
+ * already-redacted grants a caller nothing.
+ *
+ * `example` is the one exception, and the reason this returns a value rather
+ * than a boolean. Every other field is a fact the value's own shape forces, but
+ * `example` is a free string and the capture server never sees the original it
+ * claims to stand for. So it is checked against the rest of the placeholder and
+ * dropped when it disagrees, rather than trusted or rejected wholesale: a forged
+ * example must not cost the session the shape facts beside it.
  */
 function sanitizeRedactedPlaceholder(
   value: unknown,

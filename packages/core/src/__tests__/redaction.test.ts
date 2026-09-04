@@ -1216,3 +1216,78 @@ describe("captureInputValues opt-out", () => {
     expect(redactInputValue("250", { name: "maxPrice" }).value).toBe("250");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Input shape metadata                                                */
+/* ------------------------------------------------------------------ */
+
+describe("a redacted input carries its shape in metadata", () => {
+  afterEach(() => {
+    setRedactionKeepFields([]);
+    setCaptureInputValues(undefined);
+  });
+
+  const fieldOf = (...args: Parameters<typeof redactInputValue>) => {
+    const result = redactInputValue(...args);
+    expect(result.value).toBe(REDACTED_VALUE);
+    return result.metadata!.fields[0];
+  };
+
+  it("keeps the bare token in the value and puts the shape beside it", () => {
+    const value = "the landlord rejected my deposit refund";
+    const field = fieldOf(value, { name: "note" });
+
+    expect(field.reason).toBe("free_text_value");
+    expect(field.shape).toMatchObject({
+      len: value.length,
+      charset: "mixed",
+      words: 6,
+    });
+    expect(field.shape?.hash8).toMatch(/^[0-9a-f]{8}$/);
+    expect(field.shape?.example).toBe(
+      "xxx xxxxxxxx xxxxxxxx xx xxxxxxx xxxxxx",
+    );
+  });
+
+  it("reports lines, edges and emoji for a pasted block", () => {
+    const field = fieldOf("first line  \nsecond line 🙂 ", { name: "note" });
+
+    expect(field.shape).toMatchObject({
+      lines: 2,
+      edges: "trailing",
+      emoji: true,
+      nonAscii: true,
+    });
+  });
+
+  it("withholds the stand-in for every reason that is not free prose", () => {
+    expect(
+      fieldOf("hunter2secret", { name: "token", type: "password" }).shape
+        ?.example,
+    ).toBeUndefined();
+    expect(
+      fieldOf("a long enough value", { name: "ssn" }).shape?.example,
+    ).toBeUndefined();
+    expect(
+      fieldOf("a long enough value", { name: "note", maskedByPolicy: true })
+        .shape?.example,
+    ).toBeUndefined();
+    expect(
+      fieldOf("person@example.com", { name: "note" }).shape?.example,
+    ).toBeUndefined();
+    setCaptureInputValues(false);
+    expect(
+      fieldOf("a long enough value", { name: "note" }).shape?.example,
+    ).toBeUndefined();
+  });
+
+  it("withholds words, lines and the stand-in below the hash floor", () => {
+    const field = fieldOf("a b", { name: "note" });
+
+    expect(field.shape?.hash8).toBeUndefined();
+    expect(field.shape?.words).toBeUndefined();
+    expect(field.shape?.lines).toBeUndefined();
+    expect(field.shape?.example).toBeUndefined();
+    expect(field.shape?.len).toBe(3);
+  });
+});
