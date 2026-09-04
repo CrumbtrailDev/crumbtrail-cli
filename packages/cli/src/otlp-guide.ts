@@ -10,6 +10,7 @@
 // change to executor.ts is needed.
 
 import path from "node:path";
+import { DOTNET_STRUCTURED_BODY_SOURCE } from "./dotnet-body-capture";
 import type { Stack } from "crumbtrail-core";
 import { OTLP_GUIDE_FILENAME } from "./otlp";
 import type { Plan } from "./inject";
@@ -75,6 +76,36 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
     input.agentPrompt,
     "```",
     "",
+    ...(input.stack === "dotnet"
+      ? [
+          "## Optional JSON request evidence",
+          "",
+          "OTLP traces do not capture JSON operands. Native body capture remains a manual integration.",
+          "Save the following source as StructuredBody.cs in your API project. It requires .NET 9.",
+          "Call StructuredBody.Capture on at most 16385 UTF8 bytes before queuing evidence.",
+          "Pass truncated: true when the read limit was exceeded. Do not capture authentication routes.",
+          "Emit result.Body as body on backend.req.start or responseBody on backend.req.end,",
+          "result.State as requestBodyState or responseBodyState, and result.Redaction as redaction.",
+          "Send the native events envelope to /api/events with the project ingest key as a Bearer header.",
+          "Use the browser session and request correlation headers and the actual service name.",
+          "Buffer and rewind requests and tee responses without changing application bytes.",
+          "Queue delivery outside the request and bound retries. Missing correlation means no capture.",
+          "",
+          "The backend policy retains safe numbers, booleans, null, short lowercase enums,",
+          "three uppercase letter units and digit identifiers up to twelve digits.",
+          "It removes sensitive named fields, card shaped numbers, unsafe integers and other strings.",
+          "UUIDs, free text and dates are withheld by this narrower profile. Do not infer identity from names.",
+          "Duplicate keys and invalid JSON are invalid. Oversized bodies are truncated and omitted.",
+          "The cloud reclassifies every declared body using its canonical structured classifier.",
+          "A policy declaration never grants permission to store a value. Old missing operands require fresh capture.",
+          "Verify captured, redacted, missing, invalid and truncated states through ingest and the resulting bundle.",
+          "",
+          "```csharp",
+          DOTNET_STRUCTURED_BODY_SOURCE,
+          "```",
+          "",
+        ]
+      : []),
     "## Keep the key out of git",
     "",
     `Once you replace ${placeholder} with a real key, this file holds a live`,
