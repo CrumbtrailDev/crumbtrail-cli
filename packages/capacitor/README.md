@@ -139,6 +139,16 @@ one of them.
 The Android back button listener observes the press and does nothing else. It
 never calls `preventDefault` or exits the app.
 
+Deep links go through the same redaction engine as every other URL Crumbtrail
+captures. A deep link is where OAuth callback codes, magic link tokens, password
+reset tokens and invite codes reach a mobile app, so the URL is never emitted
+raw: credentials in the authority are stripped, the fragment is dropped, and
+sensitive query values are replaced with a shape token that records the length
+and character class of what was removed. The event carries a `redaction` entry
+naming each field that was changed. Custom app schemes such as `myapp://` are
+handled the same way as `https://`. The URL is also bounded at 2048 characters,
+because the OS decides how long it is, not your app.
+
 ## Defaults
 
 The web collectors are left exactly as `crumbtrail-core` ships them, with two
