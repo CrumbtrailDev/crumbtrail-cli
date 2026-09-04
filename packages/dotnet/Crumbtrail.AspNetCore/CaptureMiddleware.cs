@@ -10,13 +10,13 @@ public sealed class CaptureMiddleware(RequestDelegate next)
     public async Task InvokeAsync(HttpContext context, CaptureContext capture, CaptureOptions options,
         ICaptureSink sink, ILogger<CaptureMiddleware> log)
     {
-        if (!options.Enabled || !options.ShouldCapture(context) ||
+        if (!options.Enabled || !Eligible(options, context) ||
             !capture.Start(context.Request.Headers["x-crumbtrail-session-id"].ToString(),
                 context.Request.Headers["x-crumbtrail-request-id"].ToString()))
         { await next(context); return; }
 
-        var path = context.Request.Path.Value ?? "/";
-        var route = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? path;
+        var route = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? "/";
+        var path = route;
         var watch = Stopwatch.StartNew();
         var requestBody = new CapturedBody(null, "missing");
         if (IsJson(context.Request.ContentType) &&
@@ -33,7 +33,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
                     if (read == 0) break;
                     count += read;
                 }
-                requestBody = StructuredBody.Capture(bytes[..count]);
+                requestBody = StructuredBody.Capture(bytes[..count], context.Request.ContentLength is { } declared && declared != count);
             }
             catch { log.LogWarning("Crumbtrail could not capture the request body"); }
             finally { if (context.Request.Body.CanSeek) context.Request.Body.Position = 0; }
@@ -64,7 +64,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
                     error = new { name = failure.GetType().Name }, correlation });
                 capture.AddTerminal("backend.req.end", new { requestId = capture.RequestId,
                     sessionId = capture.SessionId, method = context.Request.Method, url = path, pathname = path, route,
-                    statusCode = failure is null ? context.Response.StatusCode : 500,
+                    statusCode = failure is null || context.Response.HasStarted ? context.Response.StatusCode : 500,
                     durationMs = watch.Elapsed.TotalMilliseconds, responseBody = responseBody.Body, responseBodyTruncated = responseBody.State == "truncated",
                     responseBodyState = responseBody.State, redaction = responseBody.RedactionFor("responseBody"),
                     correlation, service = options.Service });
@@ -74,6 +74,12 @@ public sealed class CaptureMiddleware(RequestDelegate next)
             catch { log.LogWarning("Crumbtrail could not prepare request evidence"); }
             tee.Captured.Dispose();
         }
+    }
+
+    private static bool Eligible(CaptureOptions options, HttpContext context)
+    {
+        try { return options.ShouldCapture(context); }
+        catch { return false; }
     }
 
     private static bool IsJson(string? contentType)
