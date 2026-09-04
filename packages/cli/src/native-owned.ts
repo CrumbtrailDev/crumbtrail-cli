@@ -1,8 +1,11 @@
 import type { Stack } from "crumbtrail-core";
 
-const PACKAGES: Partial<Record<Stack, { package: string; docs: string; registration: string[] }>> = {
+const PACKAGES: Partial<
+  Record<Stack, { package: string; docs: string; registration: string[] }>
+> = {
   django: {
-    package: "crumbtrail-python 0.1.0", docs: "python",
+    package: "crumbtrail-python 0.1.0",
+    docs: "python",
     registration: [
       "Create crumbtrail.Client(service=..., should_capture=...) after each worker forks.",
       "In wsgi.py use crumbtrail.django.wrap_wsgi(get_wsgi_application(), client).",
@@ -11,7 +14,8 @@ const PACKAGES: Partial<Record<Stack, { package: string; docs: string; registrat
     ],
   },
   flask: {
-    package: "crumbtrail-python 0.1.0", docs: "python",
+    package: "crumbtrail-python 0.1.0",
+    docs: "python",
     registration: [
       "Create crumbtrail.Client(service=..., should_capture=...) after each worker forks.",
       "Register crumbtrail.flask.install(app, client) before serving requests.",
@@ -20,7 +24,8 @@ const PACKAGES: Partial<Record<Stack, { package: string; docs: string; registrat
     ],
   },
   fastapi: {
-    package: "crumbtrail-python 0.1.0", docs: "python",
+    package: "crumbtrail-python 0.1.0",
+    docs: "python",
     registration: [
       "Create crumbtrail.Client(service=..., should_capture=...) after each worker forks.",
       "Register app.add_middleware(crumbtrail.ASGIMiddleware, client=client).",
@@ -29,14 +34,16 @@ const PACKAGES: Partial<Record<Stack, { package: string; docs: string; registrat
     ],
   },
   rails: {
-    package: "crumbtrail gem 0.1.0", docs: "ruby",
+    package: "crumbtrail gem 0.1.0",
+    docs: "ruby",
     registration: [
       "Read the package README and register Crumbtrail::Middleware in the Rack middleware stack.",
       "Register the maintained ActiveRecord adapter once. Create the sender after each worker forks and close it during shutdown.",
     ],
   },
   go: {
-    package: "github.com/CrumbtrailDev/crumbtrail-cli/packages/go", docs: "go",
+    package: "github.com/CrumbtrailDev/crumbtrail-cli/packages/go",
+    docs: "go",
     registration: [
       "Read the package README and wrap the net/http handler with crumbtrail.Middleware.",
       "Use crumbtrail.WrapDB for database/sql observation, with the actual driver name.",
@@ -45,19 +52,25 @@ const PACKAGES: Partial<Record<Stack, { package: string; docs: string; registrat
   },
 };
 
-export function nativeCaptureSetup(stack: Stack, endpoint: string, service: string): string | null {
+export function nativeCaptureSetup(
+  stack: Stack,
+  endpoint: string,
+  service: string,
+): string | null {
   const native = PACKAGES[stack];
   if (!native) return null;
   return [
     `Set up owned backend evidence with ${native.package}.`,
     "These native integrations require a released package or an explicitly configured, verified local package source.",
-    "Package source and setup: https://github.com/CrumbtrailDev/crumbtrail-cli/tree/main/packages/" + native.docs,
+    "Package source and setup: https://github.com/CrumbtrailDev/crumbtrail-cli/tree/main/packages/" +
+      native.docs,
     "Verify the package can restore before editing startup. If unavailable, report the missing package and stop this native setup.",
     "Do not copy or implement middleware, redaction, event construction, buffering or delivery in the application.",
     `Use service ${JSON.stringify(service)} and HTTPS capture endpoint ${JSON.stringify(endpoint)}.`,
-    "Read the backend ingest key from the runtime environment, never committed source. Follow the package README for configuration names.",
+    "Set CRUMBTRAIL_ENDPOINT and CRUMBTRAIL_INGEST_KEY in the runtime environment, never committed source.",
     "Select eligible routes from application code and exclude authentication routes. No eligible routes means no native capture.",
     "Native request capture requires the existing browser session and request correlation headers.",
+    "Replace <your-app-name> with a stable name for this app before running it.",
     ...native.registration,
     "Database adapters report query metadata. SQL text, parameters and row values are withheld. Row diffs and transaction state are not provided.",
     "Keep existing OpenTelemetry exporters. OTLP traces and native JSON evidence have separate verification steps.",

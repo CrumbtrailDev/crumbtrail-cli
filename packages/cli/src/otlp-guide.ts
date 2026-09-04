@@ -51,7 +51,11 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
   const mint = input.mintUrl
     ? `Mint one at ${input.mintUrl} and paste it in.`
     : "Mint one on the Setup page of your Crumbtrail dashboard and paste it in.";
-  const nativeSetup = nativeCaptureSetup(input.stack, input.endpoint, input.serviceName);
+  const nativeSetup = nativeCaptureSetup(
+    input.stack,
+    input.endpoint,
+    input.serviceName,
+  );
   return [
     `# Crumbtrail: ${input.serviceName}`,
     "",
@@ -74,7 +78,9 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
     input.snippet,
     "```",
     "",
-    "## 2. Or hand this to a coding agent",
+    nativeSetup
+      ? "## 2. Configure native evidence with a coding agent"
+      : "## 2. Or hand this to a coding agent",
     "",
     "```",
     input.agentPrompt,
@@ -109,16 +115,17 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
           "The package handles bounded buffering, redaction, response capture and queued delivery.",
           "Verify backend.req.start and backend.req.end in a browser session, including safe JSON values.",
           "Oversized bodies are omitted. Unsupported values are withheld by a conservative profile.",
+          "For EF9 install Crumbtrail.EntityFrameworkCore 0.1.0 from the verified NuGet source.",
+          "Register AddCrumbtrailEntityFramework and add AddCrumbtrail(services) to the existing provider configuration.",
+          "CaptureCache.Observe and CaptureJob.RunAsync own cache and job events. Keep application tenant authorization and identity decisions local.",
+          "Read the SDK packages/dotnet/README.md for registration and transaction limitations.",
           "Update the package to update capture behavior. Do not copy middleware or redaction source.",
           "",
         ]
       : []),
-    ...(nativeSetup ? [
-      "## Capture native request and database evidence",
-      "",
-      nativeSetup,
-      "",
-    ] : []),
+    ...(nativeSetup && nativeSetup !== input.agentPrompt
+      ? ["## Maintained native capture setup", "", nativeSetup, ""]
+      : []),
     "## Keep the key out of git",
     "",
     `Once you replace ${placeholder} with a real key, this file holds a live`,

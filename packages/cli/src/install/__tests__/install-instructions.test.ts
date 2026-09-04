@@ -251,22 +251,14 @@ describe("install-instructions snippets", () => {
     expect(p).toContain('service: "payments-api"');
   });
 
-  it("agent prompt uses the OTLP path (no SDK) for non-JS backends", () => {
+  it("routes native backends to maintained packages and keeps OTLP distinct", () => {
     const p = buildAgentPrompt("django", keys);
-    expect(p).toContain(
-      "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
-    );
-    // The prompt must not carry a live key into a coding agent. It tells the
-    // reader to set the server env var and have the exporter read it.
+    expect(p).toContain("crumbtrail-python 0.1.0");
     expect(p).not.toContain("bl_live_xyz");
-    expect(p).toContain("CRUMBTRAIL_KEY");
-    expect(p).toContain("crumbtrail.session.id");
-    expect(p).toContain("Optional");
-    expect(p).toContain("sessionless OTLP is accepted");
-    expect(p).toContain("OTEL_SERVICE_NAME=<your-app-name>");
-    expect(p).toContain(
-      "Replace <your-app-name> with a stable name for this app before running it.",
-    );
+    expect(p).toContain("runtime environment");
+    expect(p).toContain("Keep existing OpenTelemetry exporters");
+    expect(p).toContain("No eligible routes means no native capture");
+    expect(p).toContain("Django ASGI database capture is unsupported");
     expect(p).not.toContain("PRESET_PASSIVE");
   });
 

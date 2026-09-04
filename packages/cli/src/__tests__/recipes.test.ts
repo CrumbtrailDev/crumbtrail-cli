@@ -1623,8 +1623,8 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     // The coding-agent hand-off uses the runtime env var instead of carrying
     // even the placeholder key into the prompt.
     expect(plan.agentPrompt).not.toContain(KEY_PLACEHOLDER);
-    expect(plan.agentPrompt).toContain("CRUMBTRAIL_KEY");
-    expect(plan.agentPrompt).toContain("sessionless OTLP is accepted");
+    expect(plan.agentPrompt).toContain("CRUMBTRAIL_INGEST_KEY");
+    expect(plan.agentPrompt).toContain("existing browser session");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
     // otlp injects no key via an env var — it uses OTLP headers instead.
     expect(plan.keyEnvVar).toBeUndefined();
@@ -1645,7 +1645,7 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     // The receiver resolves an app from service.name when the key names none,
     // and every OTLP SDK sets service.name from OTEL_SERVICE_NAME.
     expect(plan.snippet).toContain("OTEL_SERVICE_NAME=billing-api");
-    expect(plan.agentPrompt).toContain("OTEL_SERVICE_NAME=billing-api");
+    expect(plan.agentPrompt).toContain('Use service "billing-api"');
 
     // With no provisioned name, it asks for one rather than filing under none.
     const unnamed = buildPlan(
@@ -1670,7 +1670,7 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
       io,
     );
     expect(plan.kind).toBe("otlp-guidance");
-    expect(plan.agentPrompt).toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+    expect(plan.agentPrompt).toContain("packages/go");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
   });
 

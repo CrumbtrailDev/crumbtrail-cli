@@ -2530,20 +2530,32 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
       return `${process}: python crumbtrail_otel.py ${launch}`;
     },
   );
+  const nativeGuidePath = path.join(input.cwd, "CRUMBTRAIL_NATIVE_SETUP.md");
+  const nativeGuide = nativeCaptureSetup(stack!, endpoint, serviceName);
+  const existingNativeGuide = io.readFile(nativeGuidePath);
   if (
     processes > 0 &&
     configured === processes &&
     dependencyEdit.content === requirements
   ) {
+    if (nativeGuide && existingNativeGuide == null) {
+      return {
+        recipe: input.recipe,
+        kind: "create",
+        targetPath: nativeGuidePath,
+        content: `# Configure native backend evidence\n\n${nativeGuide}\n`,
+        keyEnvVar: "CRUMBTRAIL_KEY",
+        warnings: [
+          "Tracing is configured. Native evidence requires separate package registration.",
+        ],
+      };
+    }
     const plan = skipPlan(input);
     plan.keyEnvVar = "CRUMBTRAIL_KEY";
     return plan;
   }
   if (wrapped === 0) return null;
 
-  const nativeGuidePath = path.join(input.cwd, "CRUMBTRAIL_NATIVE_SETUP.md");
-  const nativeGuide = nativeCaptureSetup(stack!, endpoint, serviceName);
-  const existingNativeGuide = io.readFile(nativeGuidePath);
   const dirty = [procfilePath, requirementsPath, helperPath].some(
     (target) => io.gitStatus(input.cwd, target).dirty,
   );
@@ -2566,12 +2578,16 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
         content: helperContent,
         label: "added the Python OpenTelemetry launch helper",
       },
-      ...(nativeGuide && existingNativeGuide == null ? [{
-        path: nativeGuidePath,
-        mode: "create" as const,
-        content: `# Configure native backend evidence\n\n${nativeGuide}\n`,
-        label: "added native package setup instructions",
-      }] : []),
+      ...(nativeGuide && existingNativeGuide == null
+        ? [
+            {
+              path: nativeGuidePath,
+              mode: "create" as const,
+              content: `# Configure native backend evidence\n\n${nativeGuide}\n`,
+              label: "added native package setup instructions",
+            },
+          ]
+        : []),
     ],
     sdkPackages: dependencyEdit.packages,
     keyEnvVar: "CRUMBTRAIL_KEY",
