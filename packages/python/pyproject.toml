@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crumbtrail-python"
+version = "0.1.0"
+description = "Maintained Crumbtrail request and database capture for Python services"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "Flask>=3,<4", "fastapi>=0.115,<1", "httpx>=0.27,<1", "Django>=4.2,<5", "SQLAlchemy>=2,<3", "build>=1,<2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
