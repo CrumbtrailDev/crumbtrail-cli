@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>Crumbtrail.AspNetCore</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Bounded, correlated ASP.NET Core request evidence for Crumbtrail.</Description>
+    <Authors>Crumbtrail</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/CrumbtrailDev/crumbtrail-cli</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>
