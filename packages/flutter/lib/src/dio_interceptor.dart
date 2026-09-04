@@ -40,8 +40,8 @@ class CrumbtrailDioInterceptor extends Interceptor {
   }
 
   @override
-  void onError(DioException error, ErrorInterceptorHandler handler) {
-    _record(error.requestOptions, error.response?.statusCode, error.type.name);
-    handler.next(error);
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    _record(err.requestOptions, err.response?.statusCode, err.type.name);
+    handler.next(err);
   }
 }
