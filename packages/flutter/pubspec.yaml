@@ -12,13 +12,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # The ONLY runtime dependency, and it is a first-party flutter.dev package.
-  # Session continuity across cold starts needs durable storage, and making that
-  # opt-in would mean every launch opens a new session by default — turning a
-  # user's week of intermittent reports into unrelated one-event sessions.
-  # Device and OS facts come from dart:io instead of device_info_plus, so that
-  # is one dependency rather than three.
   shared_preferences: ^2.3.0
+  http: ^1.2.0
+  dio: ^5.7.0
 
 dev_dependencies:
   flutter_test:

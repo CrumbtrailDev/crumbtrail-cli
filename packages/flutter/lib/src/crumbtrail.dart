@@ -30,6 +30,7 @@ class CrumbtrailCaptureGap {
 class CrumbtrailCollectors {
   const CrumbtrailCollectors({
     this.errors = true,
+    this.network = true,
     this.appLifecycle = true,
     this.environment = true,
     this.nativeDiagnostics = true,
@@ -37,6 +38,7 @@ class CrumbtrailCollectors {
   });
 
   final bool errors;
+  final bool network;
   final bool appLifecycle;
   final bool environment;
   final bool nativeDiagnostics;

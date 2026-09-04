@@ -12,3 +12,6 @@ export 'src/native_diagnostics.dart';
 export 'src/redaction.dart';
 export 'src/session.dart';
 export 'src/transport.dart';
+
+export 'src/http_client.dart';
+export 'src/dio_interceptor.dart';

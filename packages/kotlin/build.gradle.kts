@@ -51,6 +51,8 @@ dependencies {
         // and test — which is most of the SDK and all of the shared behaviour.
         logger.warn("android.jar not found: Android bindings will be skipped")
     }
+    compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation(kotlin("test"))
 }
 
