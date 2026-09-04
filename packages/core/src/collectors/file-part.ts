@@ -1,5 +1,5 @@
 import { computeRedactedShape, type RedactedValueShape } from "../redaction";
-import { extractFileExtension, now } from "../utils";
+import { extractFileExtension } from "../utils";
 import type { EventBus } from "../event-bus";
 
 /**
@@ -311,23 +311,27 @@ export async function sniffFile(file: FilePartLike): Promise<FileSniffResult> {
 }
 
 /**
- * Describes every file part of a request's `FormData`, without ever delaying
- * the request that carries it.
+ * Describes every file part of a request's `FormData` with exactly one
+ * `net.req.file` event each, without ever delaying the request that carries
+ * it.
  *
  * The synchronous facts (extension, name shape, declared type) are computed
- * and emitted immediately, before the caller dispatches the real request —
- * they cost no I/O. Byte sniffing does cost I/O (`file.slice().arrayBuffer()`
- * resolves on a microtask at best), so it is kicked off here but never
- * awaited: this function returns as soon as the synchronous work is done, and
- * each sniff result is emitted later, whenever its own read finishes, as a
- * second `net.req.file` event carrying the same `id`/`field`/`index` so a
- * reader can join the two. A request dispatched immediately after calling
- * this never waits on a single byte of its own upload being read back.
+ * immediately — they cost no I/O. Byte sniffing does cost I/O
+ * (`file.slice().arrayBuffer()` resolves on a microtask at best), so it is
+ * kicked off here but never awaited: this function returns as soon as the
+ * synchronous work is done, and the request dispatches right after, never
+ * waiting on a single byte of its own upload being read back. The one event
+ * per part is emitted from the sniff's promise continuation once it settles
+ * — carrying the sync fields and the sniffed fields together — or, if the
+ * sniff rejects or the file has no `slice`, carrying the sync fields alone.
+ * `t` is the request's own start time, not the time the event happens to be
+ * emitted, so it sorts beside its `net.req` even though it is written later.
  */
 export function emitFilePartEvents(
   bus: EventBus,
   requestId: number,
   formData: Iterable<[string, unknown]>,
+  requestTime: number,
 ): void {
   let tasks: FileSniffTask[];
   try {
@@ -342,25 +346,26 @@ export function emitFilePartEvents(
     } catch {
       sync = {};
     }
-    if (Object.keys(sync).length > 0) {
+    const emit = (sniffed: FileSniffResult) => {
       bus.emit({
-        t: now(),
+        t: requestTime,
         k: "net.req.file",
-        d: { id: requestId, field: task.field, index: task.index, ...sync },
+        d: {
+          id: requestId,
+          field: task.field,
+          index: task.index,
+          ...sync,
+          ...sniffed,
+        },
       });
-    }
+    };
     sniffFile(task.file)
-      .then((result) => {
-        if (result.sniffedType === undefined && result.width === undefined) return;
-        bus.emit({
-          t: now(),
-          k: "net.req.file",
-          d: { id: requestId, field: task.field, index: task.index, ...result },
-        });
-      })
+      .then(emit)
       .catch(() => {
-        // Sniffing is best effort. A read failure describes nothing further,
-        // and must never surface as an error the host application sees.
+        // Sniffing is best effort. A read failure describes nothing further
+        // than the synchronous facts, and must never surface as an error the
+        // host application sees.
+        emit({});
       });
   }
 }

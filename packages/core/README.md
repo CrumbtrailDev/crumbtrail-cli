@@ -693,11 +693,24 @@ on a separate `net.req.file` event rather than inside the body's JSON text. A
 MIME type such as `application/pdf` would fail the enum-shaped rule that lets an
 ordinary short body value survive redaction untouched, so fields that are
 already shape-only or grammar-validated ride outside that redaction instead of
-through it. `net.req.file` carries `id` (joining it to its `net.req`), `field`
-(the FormData key), and `index` (position among files under that same key), and
-may arrive in two parts: the synchronous fields immediately, and the sniffed
-fields once the bounded byte read resolves — never delaying the request itself,
-which dispatches without waiting on either.
+through it.
+
+Exactly one `net.req.file` event is emitted per file part:
+
+```
+{ k: "net.req.file", t, d: { id, field, index, ext?, nameShape?, declaredType?, sniffedType?, width?, height? } }
+```
+
+`id` joins it to its `net.req`, `field` is the FormData key, and `index` is the
+part's position among files under that same key. Reading the file's own bytes
+is async, so the event is written once the byte sniff settles — successfully or
+not — carrying the synchronous fields (`ext`, `nameShape`, `declaredType`)
+alongside whatever the sniff found; a file with no `slice` method or a sniff
+that fails still gets its one event, with the synchronous fields alone. `t` is
+stamped with the request's own start time so the event sorts beside its
+`net.req` regardless of when the sniff actually finished. None of this ever
+delays the request itself, which dispatches without waiting on a single byte
+of its own upload being read back.
 
 Server-side multipart bodies are unaffected by any of this; describing a
 multipart part on the Node SDK needs a boundary parser it does not have yet.

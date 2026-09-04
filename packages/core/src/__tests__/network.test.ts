@@ -1123,7 +1123,7 @@ describe("networkCollector — XHR", () => {
 
   // Same policy as the fetch path: nameShape/declaredType ride net.req.file rather than the
   // redacted body, and describing/sniffing an upload never delays MockXHR's synchronous send().
-  it("describes a FormData file part on net.req.file without delaying send()", () => {
+  it("describes a FormData file part on net.req.file without delaying send()", async () => {
     const { events, bus, cleanup } = collect();
 
     const form = new FormData();
@@ -1144,14 +1144,16 @@ describe("networkCollector — XHR", () => {
     expect(mock).toBeDefined();
 
     mock._respond(200, "ok");
+
+    // The one net.req.file event is written from the sniff's promise continuation, so it
+    // lands a few microtasks after send(), not synchronously within it.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     bus.flush();
 
-    const fileEvent = events.find(
-      (e) => e.k === "net.req.file" && e.d.nameShape !== undefined,
-    );
-    expect(fileEvent).toBeDefined();
-    expect(fileEvent!.d.field).toBe("invoice");
-    expect(fileEvent!.d.declaredType).toBe("application/pdf");
+    const fileEvents = events.filter((e) => e.k === "net.req.file");
+    expect(fileEvents).toHaveLength(1);
+    expect(fileEvents[0].d.field).toBe("invoice");
+    expect(fileEvents[0].d.declaredType).toBe("application/pdf");
 
     cleanup();
   });

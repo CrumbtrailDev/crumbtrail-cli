@@ -738,7 +738,7 @@ function wrapFetch(
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
     if (requestBody.formData) {
-      emitFilePartEvents(bus, id, requestBody.formData.entries());
+      emitFilePartEvents(bus, id, requestBody.formData.entries(), startTime);
     }
 
     pending.set(id, { method, url: urlResult.value, startTime });
@@ -1337,7 +1337,7 @@ function wrapXHR(
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
     if (typeof FormData !== "undefined" && body instanceof FormData) {
-      emitFilePartEvents(bus, meta.id, body.entries());
+      emitFilePartEvents(bus, meta.id, body.entries(), meta.startTime);
     }
 
     const emitResponse = () => {
