@@ -311,6 +311,16 @@ export class HttpTransport implements CrumbtrailTransport {
     await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId);
   }
 
+  async sendSessionEvents(sessionId: string, events: BugEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    const session = this.sessions.get(sessionId);
+    await session?.ready;
+    const standing = this.standingRefusal(events.length, session?.refusedStatus);
+    if (standing) throw standing;
+    if (!session?.admitted) throw new EventDeliveryError(0, events.length);
+    await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId, true);
+  }
+
   /**
    * Greedy halving until every chunk's serialized body fits the cap.
    *
@@ -346,13 +356,14 @@ export class HttpTransport implements CrumbtrailTransport {
     chunks: BugEvent[][],
     depth = 0,
     sessionId = this.sessionId,
+    allowPreviousSession = false,
   ): Promise<void> {
     let first: EventDeliveryError | undefined;
     let lost = 0;
     for (const chunk of chunks) {
-      if (sessionId !== this.sessionId) return;
+      if (!allowPreviousSession && sessionId !== this.sessionId) return;
       try {
-        await this.deliverChunk(chunk, depth, sessionId);
+        await this.deliverChunk(chunk, depth, sessionId, allowPreviousSession);
       } catch (error) {
         const failure =
           error instanceof EventDeliveryError
@@ -381,9 +392,10 @@ export class HttpTransport implements CrumbtrailTransport {
     events: BugEvent[],
     depth: number,
     sessionId: string,
+    allowPreviousSession = false,
   ): Promise<void> {
     try {
-      await this.postEvents(events, sessionId);
+      await this.postEvents(events, sessionId, allowPreviousSession);
     } catch (error) {
       const oversized =
         error instanceof EventDeliveryError &&
@@ -396,6 +408,7 @@ export class HttpTransport implements CrumbtrailTransport {
         [events.slice(0, mid), events.slice(mid)],
         depth + 1,
         sessionId,
+        allowPreviousSession,
       );
     }
   }
@@ -421,8 +434,9 @@ export class HttpTransport implements CrumbtrailTransport {
   private async postEvents(
     events: BugEvent[],
     sessionId: string,
+    allowPreviousSession = false,
   ): Promise<void> {
-    if (sessionId !== this.sessionId) return;
+    if (!allowPreviousSession && sessionId !== this.sessionId) return;
     const body = this.eventsBody(events, sessionId);
     const init: RequestInit = {
       method: "POST",

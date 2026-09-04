@@ -639,6 +639,8 @@ export class Crumbtrail {
   private applicationRelease: ApplicationReleaseIdentity;
   private sessionStore?: SessionStore;
   private lifecycleTimer?: ReturnType<typeof setTimeout>;
+  private durationTimer?: ReturnType<typeof setTimeout>;
+  private retiringSessions = new Set<Promise<void>>();
   private lifecycleClosePromise?: Promise<void>;
   private lifecycleCloseState?: {
     immediateEnd: boolean;
@@ -860,11 +862,20 @@ export class Crumbtrail {
         instance.shouldPersistEvent(event),
       );
       if (persistable.length > 0) {
-        const send = transport
-          .sendEvents(persistable)
-          .catch((error: unknown) => {
-            instance.recordDeliveryFailure(persistable, error);
-          });
+        const batches = new Map<string, BugEvent[]>();
+        for (const event of persistable) {
+          const origin = config.maxSessionDurationMs > 0 && typeof event.d.sessionId === "string"
+            ? event.d.sessionId : instance.sessionId;
+          const batch = batches.get(origin) ?? [];
+          batch.push(event);
+          batches.set(origin, batch);
+        }
+        const send = Promise.all([...batches].map(([id, batch]) =>
+          (config.maxSessionDurationMs > 0 && transport.sendSessionEvents
+            ? transport.sendSessionEvents(id, batch)
+            : transport.sendEvents(batch))
+            .catch((error: unknown) => instance.recordDeliveryFailure(batch, error)),
+        )).then(() => undefined);
         instance.pendingSends.add(send);
         void send.then(() => instance.pendingSends.delete(send));
       }
@@ -2014,6 +2025,41 @@ export class Crumbtrail {
     );
   }
 
+  private cancelDurationTimer(): void {
+    if (this.durationTimer !== undefined) clearTimeout(this.durationTimer);
+    this.durationTimer = undefined;
+  }
+
+  private scheduleDurationRotation(): void {
+    this.cancelDurationTimer();
+    const duration = this.config.maxSessionDurationMs;
+    if (!Number.isFinite(duration) || duration <= 0 ||
+        !this.transport.sendSessionEvents || this.config.flightRecorder) return;
+    this.durationTimer = setTimeout(() => {
+      this.durationTimer = undefined;
+      this.rotateActiveSession();
+    }, Math.min(duration, 2_147_483_647));
+  }
+
+  private rotateActiveSession(): void {
+    if (!this.sessionStarted || !this.canTransport()) return;
+    const previousId = this.sessionId;
+    this.applicationExpectations.stop();
+    this.bus.flush();
+    const pending = [...this.pendingSends, this.sessionMetadataWrite];
+    const replay = this.replay;
+    this.replay = undefined;
+    if (replay) pending.push(Promise.resolve(replay.stop()).catch(() => {}));
+    this.ringBuffer.clear();
+    this.lifecycleSuspended = true;
+    void this.resumeFromLifecycle();
+    const retirement = Promise.allSettled(pending)
+      .then(() => this.transport.endSession(previousId))
+      .catch(() => {})
+      .finally(() => this.retiringSessions.delete(retirement));
+    this.retiringSessions.add(retirement);
+  }
+
   /** Schedule a close for a page that remains hidden after lifecycle events settle. */
   private scheduleLifecycleClose(): void {
     if (
@@ -2046,6 +2092,7 @@ export class Crumbtrail {
    * the server cannot finalize an incomplete log.
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
+    this.cancelDurationTimer();
     if (this.stopped || this.lifecycleSuspended) {
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
@@ -2343,6 +2390,7 @@ export class Crumbtrail {
       return;
     this.sessionStarted = true;
     this.startSessionWithCurrentIdentity();
+    this.scheduleDurationRotation();
     this.updateReplayState();
   }
 
@@ -2849,6 +2897,7 @@ export class Crumbtrail {
   }
 
   private async stopInternal(): Promise<{ sessionId: string }> {
+    this.cancelDurationTimer();
     const teardownFailures: StopFailure[] = [];
     const runTeardown = (
       label: string,
