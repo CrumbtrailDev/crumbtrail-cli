@@ -40,6 +40,7 @@ import {
 import { emitResourceFailure } from "../resource-failure-event";
 import { now, readStructuredBody } from "../utils";
 import { captureCallStack } from "../call-stack";
+import { emitFilePartEvents } from "./file-part";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -372,13 +373,19 @@ function extractMethod(input: RequestInfo | URL, init?: RequestInit): string {
 function extractRequestBody(
   input: RequestInfo | URL,
   init?: RequestInit,
-): { body?: string; nonText: boolean } {
+): { body?: string; nonText: boolean; formData?: FormData } {
   const body =
     init?.body ?? (input instanceof Request ? input.body : undefined);
   if (body == null) return { nonText: false };
   if (typeof body === "string") return { body, nonText: false };
   const readable = readStructuredBody(body);
-  if (readable !== undefined) return { body: readable, nonText: false };
+  if (readable !== undefined) {
+    const formData =
+      typeof FormData !== "undefined" && body instanceof FormData
+        ? body
+        : undefined;
+    return { body: readable, nonText: false, ...(formData ? { formData } : {}) };
+  }
   return { nonText: true };
 }
 
@@ -727,6 +734,12 @@ function wrapFetch(
     attachRedactionMetadata(reqData, ...reqMetadata);
 
     bus.emit({ t: startTime, k: "net.req", d: reqData });
+
+    // Fire-and-forget: describing and sniffing an upload never delays
+    // dispatching the request it rides on. See `emitFilePartEvents`.
+    if (requestBody.formData) {
+      emitFilePartEvents(bus, id, requestBody.formData.entries(), startTime);
+    }
 
     pending.set(id, { method, url: urlResult.value, startTime });
     let response: Response;
@@ -1320,6 +1333,12 @@ function wrapXHR(
     attachRedactionMetadata(reqData, ...reqMetadata);
 
     bus.emit({ t: meta.startTime, k: "net.req", d: reqData });
+
+    // Fire-and-forget: describing and sniffing an upload never delays
+    // dispatching the request it rides on. See `emitFilePartEvents`.
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      emitFilePartEvents(bus, meta.id, body.entries(), meta.startTime);
+    }
 
     const emitResponse = () => {
       const dur = now() - meta.startTime;

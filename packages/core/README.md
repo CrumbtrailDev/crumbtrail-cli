@@ -758,10 +758,43 @@ because of the container it arrived in.
 
 Both are now read without consuming them, and the same body redaction runs over
 the result. A `FormData` is rendered as a JSON object keyed by field name, so a
-repeated field becomes an array. File parts are described, never read: the form
-field name survives as the key and the part reports `{ file: true, bytes }`. The
-file's own name and MIME type are free text and answer to the same value rules as
-any other string in a body.
+repeated field becomes an array. File parts are described, never read: the file's
+own bytes are never stored, only sniffed and discarded. The form field name
+survives as the key and the part reports `{ file: true, bytes, ext }` — `ext` is
+the lowercased tail of the file name after its last dot (never the stem), kept
+only when it is short and alphanumeric enough to be a type rather than free text.
+
+The rest of the file's description — `nameShape` (the same shape a redacted
+value gets, computed over the file name), `declaredType` (`file.type`, kept only
+when it matches a strict MIME grammar), and `sniffedType`/`width`/`height` (read
+from the file's own bytes: the first 32 bytes identify PNG, JPEG, GIF, WebP, PDF,
+ZIP, MP4, or plain text, and carry dimensions for PNG/GIF/WebP; a JPEG's
+dimensions come from scanning its marker segments in the first 64 KB) — arrives
+on a separate `net.req.file` event rather than inside the body's JSON text. A
+MIME type such as `application/pdf` would fail the enum-shaped rule that lets an
+ordinary short body value survive redaction untouched, so fields that are
+already shape-only or grammar-validated ride outside that redaction instead of
+through it.
+
+Exactly one `net.req.file` event is emitted per file part:
+
+```
+{ k: "net.req.file", t, d: { id, field, index, ext?, nameShape?, declaredType?, sniffedType?, width?, height? } }
+```
+
+`id` joins it to its `net.req`, `field` is the FormData key, and `index` is the
+part's position among files under that same key. Reading the file's own bytes
+is async, so the event is written once the byte sniff settles — successfully or
+not — carrying the synchronous fields (`ext`, `nameShape`, `declaredType`)
+alongside whatever the sniff found; a file with no `slice` method or a sniff
+that fails still gets its one event, with the synchronous fields alone. `t` is
+stamped with the request's own start time so the event sorts beside its
+`net.req` regardless of when the sniff actually finished. None of this ever
+delays the request itself, which dispatches without waiting on a single byte
+of its own upload being read back.
+
+Server-side multipart bodies are unaffected by any of this; describing a
+multipart part on the Node SDK needs a boundary parser it does not have yet.
 
 ### GraphQL operation identity (`net.req d.gql`)
 

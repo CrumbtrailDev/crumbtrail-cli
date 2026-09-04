@@ -194,6 +194,7 @@ describe("networkCollector – form-shaped request bodies", () => {
     expect(body).toContain("invoice");
     expect(body).toContain('"file":true');
     expect(body).toContain('"bytes":20');
+    expect(body).toContain('"ext":"pdf"');
     expect(body).not.toContain("SECRET-DOCUMENT-BODY");
   });
 
@@ -219,6 +220,179 @@ describe("networkCollector – form-shaped request bodies", () => {
     });
 
     expect(reqEvent().d.body).not.toBe("[1,2,3]");
+  });
+});
+
+/**
+ * `nameShape` and `declaredType` cannot ride inside the redacted JSON body (a MIME type's `/` fails
+ * the enum-shaped keep rule and gets redacted as free text), so they and the byte-sniffed fields ride
+ * a separate `net.req.file` event instead, joined to `net.req` by id/field/index. Exactly one such
+ * event is emitted per file part: it is written once the sniff settles (or fails), carrying the sync
+ * and sniffed fields together, so no consumer ever has to merge two records for one upload.
+ */
+describe("networkCollector – file part description (net.req.file)", () => {
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+  });
+
+  afterEach(() => {
+    cleanup?.();
+    events = [];
+  });
+
+  async function flushMicrotasks() {
+    // Lets the un-awaited sniff promise settle before assertions read the bus.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  }
+
+  it("emits exactly one net.req.file event per part, carrying both sync and sniffed fields", async () => {
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    // A minimal PNG header: signature + IHDR carrying width=10, height=5.
+    const png = new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
+      0, 0, 0, 10, 0, 0, 0, 5,
+    ]);
+    const form = new FormData();
+    form.append("avatar", new File([png], "pic.png", { type: "image/png" }));
+
+    await globalThis.fetch("https://api.example.com/upload", {
+      method: "POST",
+      body: form,
+    });
+    await flushMicrotasks();
+
+    bus.flush();
+    const fileEvents = events.filter((e) => e.k === "net.req.file");
+    expect(fileEvents).toHaveLength(1);
+
+    const [event] = fileEvents;
+    expect(event.d.field).toBe("avatar");
+    expect(event.d.index).toBe(0);
+    expect(event.d.declaredType).toBe("image/png");
+    expect((event.d.nameShape as { len: number }).len).toBe("pic.png".length);
+    expect(event.d.sniffedType).toBe("image/png");
+    expect(event.d.width).toBe(10);
+    expect(event.d.height).toBe(5);
+
+    // Sorts beside its net.req: same timestamp as the request, not whenever the sniff settled.
+    const reqEventRecord = events.find((e) => e.k === "net.req");
+    expect(event.t).toBe(reqEventRecord!.t);
+  });
+
+  it("drops a declaredType that fails the MIME grammar, still emitting one event", async () => {
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    const form = new FormData();
+    form.append(
+      "avatar",
+      new File(["x"], "pic.png", { type: "not a mime; at all" }),
+    );
+
+    await globalThis.fetch("https://api.example.com/upload", {
+      method: "POST",
+      body: form,
+    });
+    await flushMicrotasks();
+
+    bus.flush();
+    const fileEvents = events.filter(
+      (e) => e.k === "net.req.file" && e.d.field === "avatar",
+    );
+    expect(fileEvents).toHaveLength(1);
+    expect(fileEvents[0].d.declaredType).toBeUndefined();
+  });
+
+  it("emits one event per file, indexed, when two files share a field name", async () => {
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    const form = new FormData();
+    form.append("photos", new File(["a"], "one.jpg", { type: "image/jpeg" }));
+    form.append("photos", new File(["b"], "two.jpg", { type: "image/jpeg" }));
+
+    await globalThis.fetch("https://api.example.com/upload", {
+      method: "POST",
+      body: form,
+    });
+    await flushMicrotasks();
+
+    bus.flush();
+    const fileEvents = events.filter(
+      (e) => e.k === "net.req.file" && e.d.field === "photos",
+    );
+    expect(fileEvents).toHaveLength(2);
+    expect(fileEvents.map((e) => e.d.index).sort()).toEqual([0, 1]);
+  });
+
+  it("still emits the sync fields alone when the sniff itself rejects", async () => {
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    const file = new File(["hello"], "note.txt", { type: "text/plain" });
+    vi.spyOn(file, "slice").mockReturnValue({
+      arrayBuffer: () => Promise.reject(new Error("boom")),
+    } as unknown as Blob);
+
+    const form = new FormData();
+    form.append("doc", file);
+
+    await globalThis.fetch("https://api.example.com/upload", {
+      method: "POST",
+      body: form,
+    });
+    await flushMicrotasks();
+
+    bus.flush();
+    const fileEvents = events.filter((e) => e.k === "net.req.file");
+    expect(fileEvents).toHaveLength(1);
+    expect(fileEvents[0].d.declaredType).toBe("text/plain");
+    expect(fileEvents[0].d.sniffedType).toBeUndefined();
+  });
+
+  // The whole point of not awaiting the sniff: the real request goes out on its normal schedule,
+  // never waiting on a single byte of its own upload being read back.
+  it("dispatches the underlying fetch before the sniff's byte read resolves", async () => {
+    const realFetch = vi.fn().mockResolvedValue(new Response("{}"));
+    globalThis.fetch = realFetch;
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    let resolveArrayBuffer: (buf: ArrayBuffer) => void = () => {};
+    const arrayBufferPromise = new Promise<ArrayBuffer>((resolve) => {
+      resolveArrayBuffer = resolve;
+    });
+
+    const file = new File(["hello world"], "note.txt", { type: "text/plain" });
+    vi.spyOn(file, "slice").mockReturnValue({
+      arrayBuffer: () => arrayBufferPromise,
+    } as unknown as Blob);
+
+    const form = new FormData();
+    form.append("doc", file);
+
+    const fetchPromise = globalThis.fetch("https://api.example.com/upload", {
+      method: "POST",
+      body: form,
+    });
+
+    // No await between dispatch and this assertion: the sniff's arrayBuffer() is still
+    // pending (so no net.req.file event exists yet), but the real fetch has already been
+    // invoked synchronously.
+    expect(realFetch).toHaveBeenCalledTimes(1);
+    bus.flush();
+    expect(events.filter((e) => e.k === "net.req.file")).toHaveLength(0);
+
+    resolveArrayBuffer(new TextEncoder().encode("hello world").buffer);
+    await fetchPromise;
   });
 });
 
