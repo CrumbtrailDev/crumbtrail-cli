@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,11 +78,15 @@ type bodyReader struct {
 	io.ReadCloser
 	bytes     []byte
 	truncated bool
+	complete  bool
 }
 
 func (b *bodyReader) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.keep(p[:n])
+	if err == io.EOF {
+		b.complete = true
+	}
 	return n, err
 }
 func (b *bodyReader) keep(p []byte) {
@@ -94,7 +100,28 @@ func eligible(options Options, r *http.Request) (result bool) {
 			result = false
 		}
 	}()
-	return options.Sink != nil && options.ShouldCapture != nil && options.ShouldCapture(r) && r.Header.Get("Upgrade") == "" && validID.MatchString(r.Header.Get("x-crumbtrail-session-id")) && validID.MatchString(r.Header.Get("x-crumbtrail-request-id"))
+	return options.Sink != nil && options.ShouldCapture != nil && options.ShouldCapture(r) && r.Header.Get("Upgrade") == "" && singleIdentity(r.Header, "x-crumbtrail-session-id") && singleIdentity(r.Header, "x-crumbtrail-request-id")
+}
+
+func singleIdentity(headers http.Header, name string) bool {
+	values := headers.Values(name)
+	return len(values) == 1 && validID.MatchString(values[0])
+}
+func routeTemplate(r *http.Request) string {
+	pattern := r.Pattern
+	if len(pattern) > 512 {
+		return "/"
+	}
+	if space := strings.IndexByte(pattern, ' '); space >= 0 {
+		pattern = pattern[space+1:]
+	}
+	if slash := strings.IndexByte(pattern, '/'); slash >= 0 {
+		pattern = pattern[slash:]
+	}
+	if !strings.HasPrefix(pattern, "/") {
+		return "/"
+	}
+	return pattern
 }
 
 // Middleware observes only explicitly eligible requests with valid browser correlation.
@@ -118,7 +145,8 @@ func Middleware(options Options) func(http.Handler) http.Handler {
 			status := 200
 			wroteHeader := false
 			base := func() map[string]any {
-				return map[string]any{"method": r.Method, "url": r.URL.Path, "pathname": r.URL.Path, "route": r.URL.Path, "service": options.Service, "correlation": map[string]any{"status": "linked", "sessionIdSource": "header", "requestIdSource": "header"}}
+				route := routeTemplate(r)
+				return map[string]any{"method": r.Method, "url": route, "pathname": route, "route": route, "service": options.Service, "correlation": map[string]any{"status": "linked", "sessionIdSource": "header", "requestIdSource": "header"}}
 			}
 			wrapped := httpsnoop.Wrap(w, httpsnoop.Hooks{
 				WriteHeader: func(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
@@ -131,11 +159,19 @@ func Middleware(options Options) func(http.Handler) http.Handler {
 					}
 				},
 				Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
-					return func(p []byte) (int, error) { n, err := next(p); wroteHeader = true; output.keep(p[:n]); return n, err }
+					return func(p []byte) (int, error) {
+						n, err := next(p)
+						wroteHeader = true
+						output.keep(p[:n])
+						output.truncated = output.truncated || err != nil || n < len(p)
+						return n, err
+					}
 				},
 				ReadFrom: func(_ httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
 					return func(reader io.Reader) (int64, error) {
-						return io.Copy(writerOnly{writer: captureWriter{w, output, &wroteHeader}}, reader)
+						n, err := io.Copy(writerOnly{writer: captureWriter{w, output, &wroteHeader}}, reader)
+						output.truncated = output.truncated || err != nil
+						return n, err
 					}
 				},
 				Flush: func(next httpsnoop.FlushFunc) httpsnoop.FlushFunc { return func() { next(); wroteHeader = true } },
@@ -145,11 +181,22 @@ func Middleware(options Options) func(http.Handler) http.Handler {
 				func() {
 					defer func() { _ = recover() }()
 					request := capturedBody{nil, "missing"}
-					if input != nil {
-						request = captureBody(input.bytes, input.truncated)
+					if input != nil && len(input.bytes) > 0 {
+						complete := input.complete
+						if r.ContentLength >= 0 {
+							complete = int64(len(input.bytes)) == r.ContentLength
+						}
+						request = captureBody(input.bytes, input.truncated || !complete)
 					}
+					output.truncated = output.truncated || (failure != nil && len(output.bytes) > 0)
 					response := capturedBody{nil, "missing"}
-					if isJSON(w.Header().Get("Content-Type")) {
+					bodyAllowed := r.Method != "HEAD" && status >= 200 && status != 204 && status != 304
+					if bodyAllowed {
+						if length, err := strconv.ParseInt(w.Header().Get("Content-Length"), 10, 64); err == nil && length >= 0 {
+							output.truncated = output.truncated || int64(len(output.bytes)) != length
+						}
+					}
+					if bodyAllowed && isJSON(w.Header().Get("Content-Type")) {
 						response = captureBody(output.bytes, output.truncated)
 					}
 					data := base()
@@ -199,5 +246,6 @@ func (w captureWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	*w.wrote = true
 	w.output.keep(p[:n])
+	w.output.truncated = w.output.truncated || err != nil || n < len(p)
 	return n, err
 }

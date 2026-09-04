@@ -1,5 +1,7 @@
 require 'minitest/autorun'
 require 'rack/mock'
+require 'rack/lint'
+require 'socket'
 require 'active_record'
 require 'crumbtrail/active_record'
 require 'stringio'
@@ -98,7 +100,7 @@ class CaptureTest < Minitest::Test
     assert_raises(IOError) { consume(response) }
     response[2].close
     assert_equal 1, @sink.events.count { |e| e[:k] == 'backend.req.end' }
-    assert_equal 'invalid', @sink.events.last[:d][:responseBodyState]
+    assert_equal 'truncated', @sink.events.last[:d][:responseBodyState]
     assert_equal 200, @sink.events.last[:d][:statusCode]
   end
   def test_broken_sink_preserves_response
@@ -140,6 +142,96 @@ class CaptureTest < Minitest::Test
     assert @sink.events.any? { |e| e[:k] == 'backend.req.start' }
     assert @sink.events.any? { |e| e[:k] == 'backend.req.end' }
     assert_equal 50, @sink.events.find { |e| e[:k] == 'capture_gap' }[:d][:droppedEvents]
+  end
+  def test_hijack_capability_does_not_disable_ordinary_requests
+    request = env.merge('rack.hijack?' => true, 'rack.hijack' => -> { raise 'not hijacking' })
+    consume(middleware(->(_) { [200, {}, ['ok']] }).call(request))
+    assert @sink.events.any? { |e| e[:k] == 'backend.req.end' }
+  end
+  def test_actual_hijack_keeps_result_without_capture
+    sentinel = Object.new
+    hijack = -> { sentinel }
+    request = env.merge('rack.hijack?' => true, 'rack.hijack' => hijack)
+    app = middleware(lambda do |e|
+      assert_same sentinel, e['rack.hijack'].call
+      [-1, {}, []]
+    end)
+    assert_equal(-1, app.call(request)[0])
+    assert_same hijack, request['rack.hijack']
+    assert_empty @sink.events
+  end
+  def test_callable_only_body_preserves_stream_and_result
+    stream = StringIO.new
+    callback = lambda do |actual|
+      assert_same stream, actual
+      actual.write('complete response')
+      :original_result
+    end
+    result = middleware(->(_) { [200, { 'content-type' => 'application/json' }, callback] }).call(env)
+    refute result[2].respond_to?(:each)
+    assert_equal :original_result, result[2].call(stream)
+    result[2].close
+    assert_equal 'complete response', stream.string
+    assert_equal 'missing', @sink.events.last[:d][:responseBodyState]
+  end
+  def test_callable_body_passes_real_rack_lint
+    write_end, read_end = Socket.pair(:UNIX, :STREAM, 0)
+    callback = lambda do |stream|
+      stream.write('first')
+      stream << ' second'
+      stream.flush
+      :complete
+    end
+    app = Rack::Lint.new(middleware(->(_) { [201, {}, callback] }))
+    status, _, body = app.call(env)
+    assert_equal 201, status
+    refute body.respond_to?(:each)
+    assert_equal :complete, body.call(write_end)
+    body.close
+    assert_equal 'first second', read_end.read(12)
+    assert_equal 'missing', @sink.events.last[:d][:responseBodyState]
+  ensure
+    write_end&.close
+    read_end&.close
+  end
+  def test_partial_read_does_not_invent_numeric_operand
+    [nil, '4'].each do |length|
+      @sink = Sink.new
+      request = env('1234')
+      request['CONTENT_LENGTH'] = length
+      consume(middleware(->(e) { e['rack.input'].read(1); [200, {}, ['ok']] }).call(request))
+      start = @sink.events.find { |e| e[:k] == 'backend.req.start' }[:d]
+      assert_equal 'truncated', start[:requestBodyState]
+      assert_nil start[:body]
+    end
+  end
+  def test_path_values_withheld_and_template_opt_in
+    request = env.merge('PATH_INFO' => '/api/users/private@example.com')
+    consume(middleware(->(_) { [200, {}, ['ok']] }).call(request))
+    assert_equal '/', @sink.events.first[:d][:url]
+    refute_includes JSON.generate(@sink.events), 'private@example.com'
+    @sink = Sink.new
+    consume(middleware(->(_) { [200, {}, ['ok']] }, route: ->(_) { '/api/users/:email' }).call(request))
+    assert_equal '/api/users/:email', @sink.events.first[:d][:route]
+  end
+  def test_request_eof_does_not_override_declared_length
+    request = env('1').merge('CONTENT_LENGTH' => '4')
+    consume(middleware(->(e) { e['rack.input'].read; [200, {}, ['ok']] }).call(request))
+    start = @sink.events.find { |e| e[:k] == 'backend.req.start' }[:d]
+    assert_equal 'truncated', start[:requestBodyState]
+    assert_nil start[:body]
+  end
+  def test_short_declared_response_is_withheld
+    response = consume(middleware(->(_) { [200, { 'content-type' => 'application/json', 'content-length' => '4' }, ['1']] }).call(env))
+    assert_equal '1', response[2]
+    ending = @sink.events.last[:d]
+    assert_equal 'truncated', ending[:responseBodyState]
+    assert_nil ending[:responseBody]
+  end
+  def test_head_content_length_does_not_invent_truncation
+    consume(middleware(->(_) { [200, { 'content-type' => 'application/json', 'content-length' => '4' }, []] }).call(env.merge('REQUEST_METHOD' => 'HEAD')))
+    assert_equal 'missing', @sink.events.last[:d][:responseBodyState]
+    refute @sink.events.last[:d][:responseBodyTruncated]
   end
   def test_sender_rejects_unsafe_endpoints
     %w[http://localhost https://user:pass@example.com https://example.com/?key=x].each do |endpoint|

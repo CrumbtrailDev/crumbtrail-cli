@@ -363,3 +363,99 @@ func TestReaderFromPreservedAndCaptured(t *testing.T) {
 		t.Fatal("ReaderFrom bypassed capture")
 	}
 }
+
+func TestPartialRequestDoesNotInventOperand(t *testing.T) {
+	for _, length := range []int64{4, -1} {
+		sink := &memorySink{}
+		handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			one := make([]byte, 1)
+			r.Body.Read(one)
+			io.WriteString(w, "ok")
+		}))
+		r := request("1234")
+		r.ContentLength = length
+		handler.ServeHTTP(httptest.NewRecorder(), r)
+		body := find(t, sink, "backend.req.start")
+		if body["requestBodyState"] != "truncated" || body["body"] != nil {
+			t.Fatal(body)
+		}
+	}
+}
+func TestDuplicateCorrelationRejected(t *testing.T) {
+	for _, header := range []string{"x-crumbtrail-session-id", "x-crumbtrail-request-id"} {
+		sink := &memorySink{}
+		r := request("")
+		r.Header.Add(header, "second-valid-identity")
+		Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })).ServeHTTP(httptest.NewRecorder(), r)
+		if len(sink.events()) != 0 {
+			t.Fatal("ambiguous request captured")
+		}
+	}
+}
+func TestOnlyMatchedRouteTemplateCaptured(t *testing.T) {
+	sink := &memorySink{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/users/{email}", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
+	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(mux)
+	r := request("")
+	r.URL.Path = "/api/users/private@example.com"
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+	encoded, _ := json.Marshal(sink.events())
+	if strings.Contains(string(encoded), "private@example.com") {
+		t.Fatal("raw path leaked")
+	}
+	if find(t, sink, "backend.req.start")["route"] != "/api/users/{email}" {
+		t.Fatal("matched template missing")
+	}
+	sink = &memorySink{}
+	r = request("")
+	r.URL.Path = "/token/secret-path-value"
+	Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), r)
+	if find(t, sink, "backend.req.start")["url"] != "/" {
+		t.Fatal("unmatched raw path recorded")
+	}
+}
+
+func TestShortDeclaredResponseWithheld(t *testing.T) {
+	sink := &memorySink{}
+	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "4")
+		io.WriteString(w, "1")
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request(""))
+	if recorder.Body.String() != "1" {
+		t.Fatal("response changed")
+	}
+	end := find(t, sink, "backend.req.end")
+	if end["responseBodyState"] != "truncated" || end["responseBody"] != nil {
+		t.Fatal(end)
+	}
+}
+func TestHeadDeclaredLengthDoesNotInventTruncation(t *testing.T) {
+	sink := &memorySink{}
+	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "4")
+	}))
+	r := request("")
+	r.Method = "HEAD"
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+	end := find(t, sink, "backend.req.end")
+	if end["responseBodyState"] != "missing" || end["responseBodyTruncated"] != false {
+		t.Fatal(end)
+	}
+}
+
+func TestRequestEOFDoesNotOverrideDeclaredLength(t *testing.T) {
+	sink := &memorySink{}
+	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.ReadAll(r.Body) }))
+	r := request("1")
+	r.ContentLength = 4
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+	start := find(t, sink, "backend.req.start")
+	if start["requestBodyState"] != "truncated" || start["body"] != nil {
+		t.Fatal(start)
+	}
+}
