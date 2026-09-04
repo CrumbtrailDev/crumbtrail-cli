@@ -46,6 +46,7 @@ class Sender:
 
     def enqueue(self, batch):
         if os.getpid() != self._pid:
+            self.dropped += 1
             return
         with self._lock:
             if self._closed:
@@ -97,6 +98,8 @@ class Sender:
 
     def close(self, timeout=5):
         """Stop accepting evidence and wait at most timeout seconds for queued delivery."""
+        if os.getpid() != self._pid:
+            return False
         with self._lock:
             self._closed = True
         if self._worker:
@@ -116,6 +119,7 @@ class Capture:
         self.request_complete = False
         self.response_complete = False
         self.status = 500
+        self.response_started = False
         self.response_type = ""
         self.sequence = 0
 
@@ -139,7 +143,7 @@ class Capture:
             if error:
                 self.add("backend.req.error", dict(common, error={"name": type(error).__name__}))
             body, state = capture_body(self.response_bytes, not self.response_complete) if is_json(self.response_type) else (None, "missing")
-            end = {"t": now(), "k": "backend.req.end", "d": dict(common, statusCode=self.status if error is None else 500, durationMs=(time.monotonic() - self.clock) * 1000, responseBody=body, responseBodyState=state, responseBodyTruncated=state == "truncated", redaction=redaction("responseBody", state))}
+            end = {"t": now(), "k": "backend.req.end", "d": dict(common, statusCode=self.status if error is None or self.response_started else 500, durationMs=(time.monotonic() - self.clock) * 1000, responseBody=body, responseBodyState=state, responseBodyTruncated=state == "truncated", redaction=redaction("responseBody", state))}
             events = [start] + self.events + [end]
             if self.dropped:
                 events.append({"t": now(), "k": "capture_gap", "d": {"kind": "capture_gap", "surface": "backend_request", "reason": "scan_budget_exceeded", "requestId": self.request, "detail": "Event limit reached", "droppedEvents": self.dropped}})

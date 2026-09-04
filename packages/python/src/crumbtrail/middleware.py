@@ -80,12 +80,13 @@ class WSGIMiddleware:
         capture.request_complete = length == 0
 
         def wrapped_start(status, headers, exc_info=None):
+            write = start_response(status, headers, exc_info)
             capture.status = int(status.split(" ", 1)[0])
             capture.response_type = next((v for k, v in headers if k.lower() == "content-type"), "")
-            write = start_response(status, headers, exc_info)
 
             def wrapped_write(chunk):
                 result = write(chunk)
+                capture.response_started = True
                 capture.keep(capture.response_bytes, chunk)
                 return result
             return wrapped_write
@@ -118,6 +119,8 @@ class WSGIMiddleware:
                         self.iterator = iter(iterable)
                     chunk = next(self.iterator)
                     capture.keep(capture.response_bytes, chunk)
+                    if chunk:
+                        capture.response_started = True
                     return chunk
                 except StopIteration:
                     capture.response_complete = True
@@ -182,6 +185,7 @@ class ASGIMiddleware:
             await send(message)
             if message["type"] == "http.response.start":
                 capture.status = message["status"]
+                capture.response_started = True
                 capture.response_type = next((v.decode("latin1") for k, v in message.get("headers", []) if k.lower() == b"content-type"), "")
             elif message["type"] == "http.response.body":
                 capture.keep(capture.response_bytes, message.get("body", b""))

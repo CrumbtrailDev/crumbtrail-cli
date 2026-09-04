@@ -157,7 +157,8 @@ def test_asgi_preserves_messages_errors_and_context(capture):
     asyncio.run(run())
     assert len(sent) == 2
     assert sink.events[-1]['d']['responseBodyState'] == 'truncated'
-    assert sink.events[-1]['d']['statusCode'] == 500
+    assert sink.events[-1]['d']['statusCode'] == 200
+    assert any(e['k'] == 'backend.req.error' for e in sink.events)
     assert 'secret error text' not in json.dumps(sink.events)
 
 
@@ -258,3 +259,22 @@ def test_sqlalchemy_error_is_preserved_and_redacted(capture):
     captured.finish(sink, '')
     assert sink.events[1]['k'] == 'db.error'
     assert 'secret_' not in json.dumps(sink.events)
+
+
+@pytest.mark.parametrize('send_chunk,expected_status', [(True, 200), (False, 500)])
+def test_wsgi_stream_error_retains_emitted_status(capture, send_chunk, expected_status):
+    client, sink = capture
+    failure = RuntimeError('stream failure')
+    def app(environ, start_response):
+        start_response('200 OK', [('Content-Type', 'application/json')])
+        if send_chunk:
+            yield b'{'
+        raise failure
+    environ = {'PATH_INFO': '/api/a', 'wsgi.input': io.BytesIO(), 'HTTP_X_CRUMBTRAIL_SESSION_ID': 's', 'HTTP_X_CRUMBTRAIL_REQUEST_ID': 'r'}
+    response = WSGIMiddleware(app, client)(environ, lambda *args: None)
+    with pytest.raises(RuntimeError) as error:
+        list(response)
+    assert error.value is failure
+    assert sink.events[-1]['d']['statusCode'] == expected_status
+    assert sink.events[-1]['d']['responseBodyState'] == 'truncated'
+    assert sink.events[-2]['k'] == 'backend.req.error'

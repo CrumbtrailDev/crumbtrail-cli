@@ -91,3 +91,15 @@ def test_request_event_budget_has_explicit_gap():
     assert events[0]['k'] == 'backend.req.start'
     assert events[-2]['k'] == 'backend.req.end'
     assert events[-1]['d']['droppedEvents'] == 52
+
+
+def test_inherited_sender_does_not_use_forked_locks_or_claim_delivery():
+    sender = Sender('https://example.test', 'test-key')
+    with patch('crumbtrail.core.os.getpid', return_value=sender._pid + 1):
+        sender._lock.acquire()
+        try:
+            sender.enqueue({})
+            assert sender.dropped == 1
+            assert not sender.close(0)
+        finally:
+            sender._lock.release()
