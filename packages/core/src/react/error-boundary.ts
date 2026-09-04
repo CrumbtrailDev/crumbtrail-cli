@@ -1,6 +1,7 @@
 import { Component } from "react";
 import type { ReactNode, ErrorInfo } from "react";
-import { redactReactSnapshot } from "./use-bug-state";
+import { attachRedactionMetadata } from "../redaction";
+import { redactReactErrorText } from "./redact-snapshot";
 import type { BugStateLogger } from "./use-bug-state";
 
 export interface CrumbtrailErrorBoundaryProps {
@@ -14,6 +15,11 @@ export interface CrumbtrailErrorBoundaryProps {
 interface State {
   hasError: boolean;
 }
+
+// Same bounds the recorded-error path in `collectors/error.ts` applies, so a
+// boundary event and a window error event of the same size are stored alike.
+const BOUNDARY_MESSAGE_MAX_LENGTH = 2_000;
+const BOUNDARY_STACK_MAX_LENGTH = 8_000;
 
 export class CrumbtrailErrorBoundary extends Component<
   CrumbtrailErrorBoundaryProps,
@@ -39,15 +45,46 @@ export class CrumbtrailErrorBoundary extends Component<
     // still reaches the raw event log, but arrives at the agent as a bare
     // message with no stack and no file — which is the one thing a boundary was
     // installed to provide.
-    this.props.logger.addEvent({
-      type: "err",
-      data: {
-        msg: redactReactSnapshot(error.message),
-        stk: redactReactSnapshot(error.stack),
-        componentStk: redactReactSnapshot(errorInfo.componentStack),
-        source: "react-error-boundary",
-      },
-    });
+    //
+    // These three fields are free text, so they take the engine's free-text
+    // route, the same one `collectors/error.ts` uses for `msg` and `stk`: every
+    // frame survives and only the embedded URLs, `key=value` secrets and
+    // token-shaped substrings are scrubbed. The React plane previously ran them
+    // through a snapshot walker that returned a bare `[REDACTED]` for the whole
+    // string whenever it contained a bracket and any key-like token reading as
+    // sensitive — which deleted exactly the stack the boundary exists to supply.
+    const msg = redactReactErrorText(
+      error.message,
+      "msg",
+      BOUNDARY_MESSAGE_MAX_LENGTH,
+    );
+    const stk = redactReactErrorText(
+      error.stack,
+      "stk",
+      BOUNDARY_STACK_MAX_LENGTH,
+    );
+    const componentStk = redactReactErrorText(
+      errorInfo.componentStack ?? undefined,
+      "componentStk",
+      BOUNDARY_STACK_MAX_LENGTH,
+    );
+
+    const data: Record<string, unknown> = {
+      msg: msg.value,
+      stk: stk.value,
+      componentStk: componentStk.value,
+      source: "react-error-boundary",
+    };
+    // The plane declares its policy and its evidence, so a boundary capture is
+    // as auditable in the agent bundle as a network body is.
+    attachRedactionMetadata(
+      data,
+      msg.metadata,
+      stk.metadata,
+      componentStk.metadata,
+    );
+
+    this.props.logger.addEvent({ type: "err", data });
   }
 
   resetError(): void {
