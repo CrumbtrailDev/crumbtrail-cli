@@ -1,3 +1,4 @@
+import { nativeCaptureSetup } from "./native-owned";
 // The OTLP guide file written for non-JS services (rails/django/go/dotnet/…).
 //
 // The CLI cannot inject code into a Ruby or Python service, but it can still do
@@ -50,6 +51,7 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
   const mint = input.mintUrl
     ? `Mint one at ${input.mintUrl} and paste it in.`
     : "Mint one on the Setup page of your Crumbtrail dashboard and paste it in.";
+  const nativeSetup = nativeCaptureSetup(input.stack, input.endpoint, input.serviceName);
   return [
     `# Crumbtrail: ${input.serviceName}`,
     "",
@@ -111,6 +113,12 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
           "",
         ]
       : []),
+    ...(nativeSetup ? [
+      "## Capture native request and database evidence",
+      "",
+      nativeSetup,
+      "",
+    ] : []),
     "## Keep the key out of git",
     "",
     `Once you replace ${placeholder} with a real key, this file holds a live`,

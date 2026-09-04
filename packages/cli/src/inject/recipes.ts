@@ -1,3 +1,4 @@
+import { nativeCaptureSetup } from "../native-owned";
 // Pure injection plan-builders. Each recipe reads (never writes) via InjectIO and
 // returns a Plan describing exactly what should happen. The executor (executor.ts)
 // is the only module that mutates the filesystem.
@@ -2540,6 +2541,9 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
   }
   if (wrapped === 0) return null;
 
+  const nativeGuidePath = path.join(input.cwd, "CRUMBTRAIL_NATIVE_SETUP.md");
+  const nativeGuide = nativeCaptureSetup(stack!, endpoint, serviceName);
+  const existingNativeGuide = io.readFile(nativeGuidePath);
   const dirty = [procfilePath, requirementsPath, helperPath].some(
     (target) => io.gitStatus(input.cwd, target).dirty,
   );
@@ -2562,12 +2566,19 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
         content: helperContent,
         label: "added the Python OpenTelemetry launch helper",
       },
+      ...(nativeGuide && existingNativeGuide == null ? [{
+        path: nativeGuidePath,
+        mode: "create" as const,
+        content: `# Configure native backend evidence\n\n${nativeGuide}\n`,
+        label: "added native package setup instructions",
+      }] : []),
     ],
     sdkPackages: dependencyEdit.packages,
     keyEnvVar: "CRUMBTRAIL_KEY",
     warnings: [
       "Crumbtrail will add Python OpenTelemetry dependencies and wrap the Procfile web and worker commands with zero code instrumentation.",
       "Python automatic instrumentation currently exports traces. Metrics and logs remain off.",
+      "JSON body and database evidence require the maintained native package. Follow CRUMBTRAIL_NATIVE_SETUP.md or the package README. Trace delivery does not verify native capture.",
     ],
   };
 }

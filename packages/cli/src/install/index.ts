@@ -1,3 +1,4 @@
+import { nativeCaptureSetup } from "../native-owned";
 import { DOTNET_PACKAGE, DOTNET_VERSION } from "../dotnet-package";
 // Pure, framework-agnostic install-instruction routing for the /welcome wizard.
 //
@@ -381,6 +382,9 @@ export function buildAgentPrompt(
       "If the package cannot restore or eligible routes cannot be established, report the missing step and stop.",
     ].join("\n");
   }
+
+  const nativeSetup = nativeCaptureSetup(stack, endpoint, serviceName);
+  if (nativeSetup) return nativeSetup;
 
   if (kind === "otlp") {
     const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
