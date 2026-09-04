@@ -130,6 +130,34 @@ of the visit. A page that was already closed and then becomes visible again
 starts a new session. Set `endOnPageHide: false` only when your application
 owns session boundaries and will call `stop()` itself.
 
+### Limiting active session duration
+
+Set `maxSessionDurationMs: 300_000` to begin a new session every five minutes
+while the page remains active. The default is `0`, which disables rotation.
+For separate visits on reload, also use `sessionPersistence: "memory"`.
+
+```ts
+Crumbtrail.init({
+  httpEndpoint: "https://app.crumbtrail.ai",
+  maxSessionDurationMs: 300_000,
+  sessionPersistence: "memory",
+  endOnPageHide: true,
+});
+```
+
+New actions use the new session. Requests already in progress retain their
+original session identity, and their later responses are delivered as late
+evidence to that session. A session can therefore acquire additional evidence
+after its five minute interval closes. Finalization waits for admitted uploads,
+and server processing can add time before the updated evidence is visible.
+Browser timer suspension can delay the boundary until execution resumes.
+
+Rotation requires the HTTP transport or a custom transport implementing
+`sendSessionEvents`. It is not applied in flight recorder mode. Page exit and
+`stop()` retain their existing flush and close behavior. A browser can terminate
+before delivery completes, so page exit still depends on server recovery when
+its lifecycle request cannot be delivered.
+
 ### Capturing page-load failures before init
 
 For page-load fetches, XHRs, and browser-managed subresource failures, this

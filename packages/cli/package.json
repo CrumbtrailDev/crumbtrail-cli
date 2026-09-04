@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail",
-  "version": "0.50.0",
+  "version": "0.51.0",
   "description": "Set up Crumbtrail in one command: npx crumbtrail detects your framework, wires in the SDK and verifies the first event. Also the library the hosted product uses for detection and injection planning, on the crumbtrail/install and crumbtrail/testing subpaths. See https://crumbtrail.ai",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {

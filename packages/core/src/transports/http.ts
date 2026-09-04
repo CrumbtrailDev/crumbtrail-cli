@@ -306,19 +306,31 @@ export class HttpTransport implements CrumbtrailTransport {
       session?.refusedStatus,
     );
     if (standing) throw standing;
-    if (session && !session.admitted) throw new EventDeliveryError(0, events.length);
+    if (session && !session.admitted)
+      throw new EventDeliveryError(0, events.length);
     if (!session?.admitted || session.finalized) return;
     await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId);
   }
 
-  async sendSessionEvents(sessionId: string, events: BugEvent[]): Promise<void> {
+  async sendSessionEvents(
+    sessionId: string,
+    events: BugEvent[],
+  ): Promise<void> {
     if (events.length === 0) return;
     const session = this.sessions.get(sessionId);
     await session?.ready;
-    const standing = this.standingRefusal(events.length, session?.refusedStatus);
+    const standing = this.standingRefusal(
+      events.length,
+      session?.refusedStatus,
+    );
     if (standing) throw standing;
     if (!session?.admitted) throw new EventDeliveryError(0, events.length);
-    await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId, true);
+    await this.deliverAll(
+      this.splitToBudget(events, sessionId),
+      0,
+      sessionId,
+      true,
+    );
   }
 
   /**

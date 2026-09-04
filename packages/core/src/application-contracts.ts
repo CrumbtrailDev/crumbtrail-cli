@@ -767,7 +767,7 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 
 /** Shared browser/Node expectation state machine. It never exposes its internal id. */
 export class ApplicationExpectationManager {
-  private readonly sessionId?: string;
+  private sessionId?: string;
   private readonly now: () => number;
   private readonly defaultEmit: ApplicationExpectationEventEmitter;
   private readonly pending = new Map<number, PendingExpectation>();
@@ -791,6 +791,11 @@ export class ApplicationExpectationManager {
     this.sessionId = options.sessionId;
     this.defaultEmit = options.emit;
     this.now = options.now ?? Date.now;
+  }
+
+  rotateSession(sessionId: string): void {
+    this.sessionId = sessionId;
+    this.startedCount = 0;
   }
 
   get admittedCount(): number {
