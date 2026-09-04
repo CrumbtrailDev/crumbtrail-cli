@@ -1,6 +1,5 @@
 import {
   DB_DIFF_EVENT_KIND,
-  mergeRedactionMetadata,
   type BugEvent,
   type DbConnectionIdentity,
   type DbBeforeImageStatus,
@@ -9,6 +8,7 @@ import {
   type DbEngine,
 } from "crumbtrail-core";
 import type { DbCallsite } from "./callsite";
+import { backendRedactionMetadata } from "../redaction-plane";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import {
   buildRaceEvidence,
@@ -220,7 +220,7 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     }
   }
 
-  const redaction = mergeRedactionMetadata(
+  const redaction = backendRedactionMetadata(
     after.metadata,
     before.metadata,
     pk.metadata,

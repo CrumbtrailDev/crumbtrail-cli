@@ -1735,9 +1735,25 @@ describe("networkCollector structured redaction", () => {
     expect((req.d.redaction as { policy: string }).policy).toBe(
       BROWSER_REDACTION_POLICY,
     );
-    // v1 leaves a fully-clean body untouched with no redaction metadata.
+    // v1 leaves a fully-clean body untouched, and now says so: the capture is
+    // reported as inspected rather than as silence a reader cannot interpret.
     expect(res.d.body).toBe(JSON.stringify({ couponCode: "EXPIRED5" }));
-    expect(res.d.redaction).toBeUndefined();
+    const resRedaction = res.d.redaction as {
+      policy: string;
+      fields: unknown[];
+      summaries: Array<{ action: string; reason: string }>;
+    };
+    expect(resRedaction.policy).toBe(BROWSER_REDACTION_POLICY);
+    expect(resRedaction.fields).toEqual([]);
+    expect(resRedaction.summaries).toEqual([
+      {
+        kind: "json",
+        action: "inspected",
+        reason: "no_sensitive_fields",
+        originalLength: JSON.stringify({ couponCode: "EXPIRED5" }).length,
+        redactedFields: 0,
+      },
+    ]);
 
     cleanup();
   });
