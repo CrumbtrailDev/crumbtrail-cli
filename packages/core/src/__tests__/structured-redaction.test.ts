@@ -1305,6 +1305,17 @@ describe("the example letter floor", () => {
     );
   });
 
+  it("counts an astral letter twice, because its stand-in is doubled", () => {
+    // "\u{10400}" is two code units, so shapeExampleUnits writes "ə" twice to keep
+    // `len` comparable. Two dashes short of the floor either way pins which.
+    expect(
+      computeRedactedShape("\u{10400}-----", "free_text_value").example,
+    ).toBeUndefined();
+    expect(
+      computeRedactedShape("\u{10400}x----", "free_text_value").example,
+    ).toBe("\u0259\u0259x----");
+  });
+
   it("counts digits and non-Latin letters toward the floor", () => {
     expect(computeRedactedShape("(1-2-3).!", "free_text_value").example).toBe(
       "(0-0-0).!",

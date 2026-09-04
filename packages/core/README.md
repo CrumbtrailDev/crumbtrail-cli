@@ -459,18 +459,28 @@ true length. It is emitted only for free prose and for an upload's file name, so
 it never stands in for a password, an email, a token, a card number, an IBAN, a
 high entropy string, a sensitive field name, or a masked input.
 
-A stand in carrying fewer than three letters or digits is withheld, and the rest
-of the shape is emitted without it. On a value such as `<<>>--__..!!??` the
-alphabet does no work: whitespace and ASCII punctuation are kept as they were, so
-the field would be a verbatim copy of the value under a name that promises it is
-not. The capture server applies the same floor and drops an example below it.
+A stand in carrying fewer than three letter or digit stand in characters is
+withheld, and the rest of the shape is emitted without it. On a value such as
+`<<>>--__..!!??` the alphabet does no work: whitespace and ASCII punctuation are
+kept as they were, so the field would be a verbatim copy of the value under a
+name that promises it is not. The SDK is where that floor is enforced, so the
+field never leaves the page below it.
 
-The fixed alphabet is what makes the field checkable. Redaction runs twice, once
-in the SDK and again at the capture server, and the server never sees the
-original, so it validates `example` against the alphabet, against `len`, against
-the three letter floor, and against `charset`, `nonAscii` and `emoji`, and drops
-the field when they disagree. `isValidRedactedShapeExample` is exported if you want to run the same
-check yourself.
+The count is over the stand in's own characters rather than the original value's,
+which is what lets a receiving server apply the identical rule. Two consequences
+follow. A digit outside ASCII has no digit character in the alphabet and is
+written as `¤`, so a value of Arabic-Indic digits carries no stand in. An astral
+letter is written as its representative repeated to keep the code unit width, so
+it counts twice.
+
+The fixed alphabet is what makes the field checkable without the original value,
+which matters because a server receiving a session never sees one.
+`isValidRedactedShapeExample` is exported for that: given an `example` and the
+shape it claims to describe, it checks the alphabet, the length against `len`,
+the floor of three letter or digit stand in characters, and agreement with
+`charset`, `nonAscii` and `emoji`, and reports whether they disagree. Run it on
+ingest if you want a forged or hand edited `example` dropped rather than
+trusted.
 
 The query string form spells the same fields out in one marker:
 

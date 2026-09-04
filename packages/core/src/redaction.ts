@@ -3044,7 +3044,8 @@ const SHAPE_EXAMPLE_LETTER_ALPHABET = new Set<string>([
 ]);
 
 /**
- * How many letters or digits a stand-in must carry before it is worth emitting.
+ * How many letter or digit stand-in characters an example must carry before it
+ * is worth emitting.
  */
 export const REDACTED_SHAPE_EXAMPLE_MIN_LETTERS = 3;
 
@@ -3055,12 +3056,17 @@ export const REDACTED_SHAPE_EXAMPLE_MIN_LETTERS = 3;
  * ASCII punctuation are kept verbatim and are the one thing a lying client can
  * write freely. On `<<>>--__..!!??` the two cancel out: every character is
  * carried through unchanged, so the field is a verbatim copy of the value under
- * a name that promises it is not. Below three letters or digits the stand-in is
- * withheld and the rest of the shape still describes the value.
+ * a name that promises it is not. Below three letter or digit stand-in
+ * characters the stand-in is withheld and the rest of the shape still describes
+ * the value.
  *
- * Counted over the stand-in rather than over the original so that the client's
- * gate and {@link isValidRedactedShapeExample} can never disagree: the server
- * has only the stand-in, and a truncated one only its first 120 code units.
+ * The count is over the stand-in's own characters rather than over the original
+ * value's, so that this gate and {@link isValidRedactedShapeExample} can never
+ * disagree: a receiving server has only the stand-in, and for a long value only
+ * its first 120 code units. Two consequences follow from counting there. A digit
+ * outside ASCII has no representative in the alphabet and is written as `¤`, so
+ * it does not count. An astral letter is written as its representative repeated
+ * to preserve code unit width, so it counts twice.
  */
 export function redactedShapeExampleCarriesLetters(example: string): boolean {
   let letters = 0;
@@ -3152,7 +3158,7 @@ function isShapeExampleCharacter(codePoint: string): boolean {
  * The capture server regenerates nothing — it never sees the original — so this
  * is what stands between a lying client and a value smuggled through in a field
  * that reads as harmless. It checks the alphabet, the length against `len`, the
- * letter floor of {@link redactedShapeExampleCarriesLetters}, and agreement with
+ * floor of {@link redactedShapeExampleCarriesLetters}, and agreement with
  * `charset`, `nonAscii` and `emoji`. A truncated example is held
  * to the one-directional half of the flag checks, because the flags describe the
  * whole value and the example only its first 120 code units.
