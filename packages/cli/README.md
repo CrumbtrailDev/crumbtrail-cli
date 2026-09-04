@@ -469,3 +469,18 @@ string to Crumbtrail. Your named script owns all repair writes.
 During setup, `--reproduction` enables data reproduction and read capture together.
 `--no-reproduction` leaves both off. Interactive setup offers the same choice. Read
 capture is capped at 25 rows per statement and can be turned off in capture settings.
+
+## Install ASP.NET Core HTTP capture
+
+Requires .NET 9 and the `Crumbtrail.AspNetCore` version supported by this CLI in
+your NuGet source. Version `0.1.0` awaits publication.
+
+```sh
+crumbtrail dotnet install server/Your.Api/Your.Api.csproj
+```
+
+The command installs or updates the package reference. It does not edit startup
+code or mint credentials. Register `AddCrumbtrail` and `UseCrumbtrail`, configure
+the project key and select eligible routes using the [package guide](../dotnet/README.md).
+The package owns buffering, redaction and delivery. No routes are captured by default.
+For local package verification, append `--source /path/to/local/nuget`.

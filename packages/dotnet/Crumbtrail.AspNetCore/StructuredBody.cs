@@ -1,5 +1,4 @@
-// Shared source embedded in the manual .NET setup guide.
-export const DOTNET_STRUCTURED_BODY_SOURCE = String.raw`using System.Globalization;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -7,8 +6,8 @@ namespace Crumbtrail;
 
 public sealed record CapturedBody(string? Body, string State)
 {
-    public object Redaction => new { policy = StructuredBody.Policy, fields = State == "redacted"
-        ? new[] { new { path = "body", reason = "backend_structured_profile", action = "redacted" } }
+    public object RedactionFor(string field) => new { policy = StructuredBody.Policy, fields = State == "redacted"
+        ? new[] { new { path = field, reason = "backend_structured_profile", action = "redacted" } }
         : [] };
 }
 
@@ -17,7 +16,7 @@ public static class StructuredBody
     public const string Policy = "crumbtrail.backend-redaction.v1";
     public const int MaxBytes = 16384;
     private const string Redacted = "[REDACTED]";
-    private static readonly Regex DeniedName = new("password|passwd|passphrase|passcode|secret|token|auth|card|cvv|cvc|ssn|email|phone|address|iban|account|birth|credential|creds|cookie|session|privatekey|apikey|accesskey|securitycode|verificationcode|connection|name|postal|payload|beforejson|afterjson", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex DeniedName = new("password|passwd|passphrase|passcode|secret|token|auth|card|cvv|cvc|ssn|email|phone|address|iban|account|birth|credential|creds|cookie|session|privatekey|apikey|accesskey|securitycode|verificationcode|connection|routingnumber|taxid|nationalid|sortcode|name|postal|payload|beforejson|afterjson", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex DeniedWord = new("^(pwd|pin|pan|otp|pass|sid|dob|zip|jwt|mfa|csrf|xsrf)[0-9]*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static bool Sensitive(string key)
     {
@@ -92,4 +91,3 @@ public static class StructuredBody
         return Redacted;
     }
 }
-`;

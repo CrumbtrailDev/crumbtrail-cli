@@ -252,3 +252,10 @@ MySQL, SQLite, SQL Server, and MongoDB. The runner never boots the application, 
 the database, or sends the connection string to Crumbtrail. See the
 [CLI witness command](packages/cli/README.md#validate-a-data-repair) for credentials,
 dry run, CI use, output, and verdicts.
+
+### ASP.NET Core HTTP capture
+
+[Crumbtrail.AspNetCore](packages/dotnet/README.md) owns .NET 9 HTTP capture and
+redaction. The CLI installs or updates its package reference with
+`crumbtrail dotnet install <project.csproj>`. Version `0.1.0` requires NuGet
+publication before customers can restore it from the public feed.

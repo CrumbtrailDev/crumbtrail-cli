@@ -10,7 +10,7 @@
 // change to executor.ts is needed.
 
 import path from "node:path";
-import { DOTNET_STRUCTURED_BODY_SOURCE } from "./dotnet-body-capture";
+import { DOTNET_PACKAGE, DOTNET_VERSION } from "./dotnet-package";
 import type { Stack } from "crumbtrail-core";
 import { OTLP_GUIDE_FILENAME } from "./otlp";
 import type { Plan } from "./inject";
@@ -61,8 +61,10 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
     `${mint} One key covers the whole project, so the same value works for every`,
     `application in it.`,
     "",
-    `There is no SDK to install: ${input.stack} speaks OpenTelemetry, so Crumbtrail`,
-    `accepts its traces directly. Everything below is the one manual step.`,
+    `${input.stack} can send OpenTelemetry traces directly to Crumbtrail.`,
+    input.stack === "dotnet"
+      ? "For JSON request evidence, install the ASP.NET Core package described below."
+      : "Configure the exporter below to send traces.",
     "",
     "## 1. Configure the OTLP exporter",
     "",
@@ -78,31 +80,34 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
     "",
     ...(input.stack === "dotnet"
       ? [
-          "## Optional JSON request evidence",
+          "## Capture JSON request and response evidence",
           "",
-          "OTLP traces do not capture JSON operands. Native body capture remains a manual integration.",
-          "Save the following source as StructuredBody.cs in your API project. It requires .NET 9.",
-          "Call StructuredBody.Capture on at most 16385 UTF8 bytes before queuing evidence.",
-          "Pass truncated: true when the read limit was exceeded. Do not capture authentication routes.",
-          "Emit result.Body as body on backend.req.start or responseBody on backend.req.end,",
-          "result.State as requestBodyState or responseBodyState, and result.Redaction as redaction.",
-          "Send the native events envelope to /api/events with the project ingest key as a Bearer header.",
-          "Use the browser session and request correlation headers and the actual service name.",
-          "Buffer and rewind requests and tee responses without changing application bytes.",
-          "Queue delivery outside the request and bound retries. Missing correlation means no capture.",
-          "",
-          "The backend policy retains safe numbers, booleans, null, short lowercase enums,",
-          "three uppercase letter units and digit identifiers up to twelve digits.",
-          "It removes sensitive named fields, card shaped numbers, unsafe integers and other strings.",
-          "UUIDs, free text and dates are withheld by this narrower profile. Do not infer identity from names.",
-          "Duplicate keys and invalid JSON are invalid. Oversized bodies are truncated and omitted.",
-          "The cloud reclassifies every declared body using its canonical structured classifier.",
-          "A policy declaration never grants permission to store a value. Old missing operands require fresh capture.",
-          "Verify captured, redacted, missing, invalid and truncated states through ingest and the resulting bundle.",
-          "",
-          "```csharp",
-          DOTNET_STRUCTURED_BODY_SOURCE,
+          "Install the Crumbtrail maintained ASP.NET Core package. Requires .NET 9.",
+          "Version " +
+            DOTNET_VERSION +
+            " must be available in your NuGet source before installation.",
+          "```sh",
+          "crumbtrail dotnet install path/to/Your.Api.csproj",
           "```",
+          "The same command updates an existing package reference to the CLI supported version.",
+          `It installs ${DOTNET_PACKAGE} ${DOTNET_VERSION}. It does not edit application startup.`,
+          "Register the package in Program.cs:",
+          "```csharp",
+          "using Crumbtrail;",
+          `builder.Services.AddCrumbtrail(CaptureOptions.FromEnvironment(${JSON.stringify(input.serviceName)}) with`,
+          "{",
+          '    ShouldCapture = context => context.Request.Path.StartsWithSegments("/api/orders")',
+          "});",
+          "// After app.UseRouting(), before mapping endpoints:",
+          "app.UseCrumbtrail();",
+          "```",
+          "Replace the example route with eligible application routes. Exclude authentication routes.",
+          "Set CRUMBTRAIL_ENDPOINT to the capture HTTPS origin and CRUMBTRAIL_INGEST_KEY to the project key.",
+          "No routes are captured by default. Missing correlation headers means no capture.",
+          "The package handles bounded buffering, redaction, response capture and queued delivery.",
+          "Verify backend.req.start and backend.req.end in a browser session, including safe JSON values.",
+          "Oversized bodies are omitted. Unsupported values are withheld by a conservative profile.",
+          "Update the package to update capture behavior. Do not copy middleware or redaction source.",
           "",
         ]
       : []),
