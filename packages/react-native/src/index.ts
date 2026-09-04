@@ -80,7 +80,15 @@ export type {
   CrumbtrailReactNativeContextValue,
   CrumbtrailReactNativeProviderProps,
 } from "./provider";
-export { useBugState, redactReactNativeSnapshot } from "./use-bug-state";
+export { useBugState } from "./use-bug-state";
 export type { BugStateLogger, UseBugStateOptions } from "./use-bug-state";
 export { CrumbtrailReactNativeErrorBoundary } from "./error-boundary";
 export type { CrumbtrailReactNativeErrorBoundaryProps } from "./error-boundary";
+export {
+  MOBILE_ERROR_MESSAGE_MAX_LENGTH,
+  MOBILE_ERROR_STACK_MAX_LENGTH,
+  MOBILE_LABEL_MAX_LENGTH,
+  MOBILE_REDACTION_POLICY,
+  MOBILE_URL_MAX_LENGTH,
+} from "./redaction-plane";
+export type { MobileRedactedText } from "./redaction-plane";

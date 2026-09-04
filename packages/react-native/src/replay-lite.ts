@@ -1,4 +1,10 @@
-import type { TargetDescriptor } from "crumbtrail-core";
+import type { RedactionMetadata, TargetDescriptor } from "crumbtrail-core";
+import {
+  MOBILE_LABEL_MAX_LENGTH,
+  MOBILE_REDACTION_POLICY,
+  attachMobileRedaction,
+  redactMobileText,
+} from "./redaction-plane";
 import {
   createReactNativeTargetDescriptor,
   type ReactNativeTargetInput,
@@ -80,11 +86,14 @@ export function createReactNativeReplayLite(
 
   return {
     recordViewSnapshot(snapshot) {
-      emit("view-snapshot", {
+      const metadata: Array<RedactionMetadata | undefined> = [];
+      const d: Record<string, unknown> = {
         kind: "component-tree",
         routePath: snapshot.routePath,
-        root: sanitizeNode(snapshot.root),
-      });
+        root: sanitizeNode(snapshot.root, metadata, "root", 0),
+      };
+      attachMobileRedaction(d, ...metadata);
+      emit("view-snapshot", d);
     },
     recordTouch(overlay) {
       const target = overlay.target
@@ -125,17 +134,77 @@ export function createReactNativeReplayLite(
   };
 }
 
+/**
+ * How deep the view tree is walked.
+ *
+ * The tree is the host app's, so its depth is whatever that app renders, and a
+ * deeply nested list view recurses as far as it goes. Native screens flatten
+ * well before this; the bound exists so a pathological tree cannot take the
+ * app's own JS thread down inside the crash path.
+ */
+export const VIEW_SNAPSHOT_MAX_DEPTH = 32;
+
+/** How many children are kept per node. A screen has nothing like this many. */
+export const VIEW_SNAPSHOT_MAX_CHILDREN = 200;
+
+/**
+ * Select the reportable fields of one node, and redact the one that carries
+ * user data.
+ *
+ * `componentName`, `role`, `testID` and `accessibilityId` are written by the
+ * developer and identify a widget. `label` is the accessibility label: it is
+ * the text a screen reader speaks, so it is whatever is on screen — a name, a
+ * balance, an address — and it goes through the engine like any other captured
+ * text.
+ */
 function sanitizeNode(
   node: ReactNativeViewSnapshotNode,
+  metadata: Array<RedactionMetadata | undefined>,
+  path: string,
+  depth: number,
 ): ReactNativeViewSnapshotNode {
+  const label = redactMobileText(
+    node.label,
+    `${path}.label`,
+    MOBILE_LABEL_MAX_LENGTH,
+  );
+  if (label?.metadata) metadata.push(label.metadata);
+
+  const children = node.children ?? [];
+  // The subtree past the bound is dropped rather than replaced by a stand-in:
+  // a placeholder node in a list of real nodes is something every consumer of
+  // the tree would then have to know about. The field below carries the count.
+  const truncatedDepth = depth >= VIEW_SNAPSHOT_MAX_DEPTH && children.length > 0;
+  const overWide = children.length > VIEW_SNAPSHOT_MAX_CHILDREN;
+  if (truncatedDepth || overWide) {
+    metadata.push({
+      policy: MOBILE_REDACTION_POLICY,
+      fields: [
+        {
+          path,
+          reason: truncatedDepth
+            ? "view_tree_depth_exceeded"
+            : "view_tree_children_exceeded",
+          action: "summarized",
+        },
+      ],
+    });
+  }
+
   return {
     id: node.id,
     componentName: node.componentName,
     role: node.role,
-    label: node.label,
+    ...(label ? { label: label.value } : {}),
     testID: node.testID,
     accessibilityId: node.accessibilityId,
     bounds: node.bounds,
-    children: node.children?.map(sanitizeNode),
+    children: truncatedDepth
+      ? []
+      : children
+          .slice(0, VIEW_SNAPSHOT_MAX_CHILDREN)
+          .map((child, index) =>
+            sanitizeNode(child, metadata, `${path}[${index}]`, depth + 1),
+          ),
   };
 }
