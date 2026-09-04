@@ -3,6 +3,7 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   mergeRedactionMetadata,
   redactNetworkTextBody,
+  STRUCTURED_BODY_MAX_ARRAY_ENTRIES,
   type PayloadSummary,
   type RedactionField,
   type RedactionMetadata,
@@ -45,8 +46,18 @@ import {
  */
 export const REACT_SNAPSHOT_MAX_DEPTH = 24;
 
-/** How many array entries the normalizer keeps. Sized like the walker's. */
-export const REACT_SNAPSHOT_MAX_ARRAY_ENTRIES = 500;
+/**
+ * How many array entries the normalizer keeps.
+ *
+ * One below the shared walker's bound, and derived from it so the two cannot
+ * drift apart. The normalizer appends a stand-in saying how long the list
+ * really was, and at an equal bound the walker's own truncation ate exactly
+ * that element — leaving a shortened list that read as the whole list, which is
+ * the one reading that sends a debugger down the wrong path. Keeping one fewer
+ * entry puts the stand-in inside the window the walker preserves.
+ */
+export const REACT_SNAPSHOT_MAX_ARRAY_ENTRIES =
+  STRUCTURED_BODY_MAX_ARRAY_ENTRIES - 1;
 
 /** How many own keys the normalizer keeps on one object. */
 export const REACT_SNAPSHOT_MAX_OBJECT_KEYS = 500;
