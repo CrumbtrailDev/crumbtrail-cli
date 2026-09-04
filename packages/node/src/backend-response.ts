@@ -1,3 +1,4 @@
+import { BoundedBodyRecorder } from "./bounded-body-recorder";
 import { captureDbCallsite } from "./db/callsite";
 import type { DbCallsite } from "./db/callsite";
 
@@ -107,10 +108,7 @@ export function isCapturableContentTypeForTest(contentType: string): boolean {
   return isTextualContentType(contentType);
 }
 
-export interface ResponseRecorder {
-  chunks: string[];
-  bytes: number;
-  truncated: boolean;
+export interface ResponseRecorder extends BoundedBodyRecorder {
   /**
    * Where the application decided to fail, captured at the moment a 5xx body is
    * first written.
@@ -146,37 +144,23 @@ export function attachResponseRecorder(
   const cap = responseBodyCap(options);
   if (cap <= 0) return undefined;
 
-  const recorder: ResponseRecorder = { chunks: [], bytes: 0, truncated: false };
+  const recorder: ResponseRecorder = new BoundedBodyRecorder(cap);
   const captureFailureCallsite = (): void => {
     if (recorder.callsite) return;
     const status = safeStatusCode(res.statusCode);
     if (status === undefined || status < 500) return;
     recorder.callsite = captureDbCallsite(options.callsiteRoot);
   };
-  const record = (chunk: unknown): void => {
+  const record = (chunk: unknown, encoding?: unknown): void => {
     captureFailureCallsite();
-    if (recorder.bytes >= cap) return;
-    let text: string | undefined;
-    if (typeof chunk === "string") text = chunk;
-    else if (chunk instanceof Uint8Array)
-      text = Buffer.from(chunk).toString("utf8");
-    if (text === undefined || text === "") return;
-    const remaining = cap - recorder.bytes;
-    if (text.length > remaining) {
-      recorder.chunks.push(text.slice(0, remaining));
-      recorder.bytes = cap;
-      recorder.truncated = true;
-      return;
-    }
-    recorder.chunks.push(text);
-    recorder.bytes += text.length;
+    recorder.record(chunk, encoding);
   };
 
   const originalWrite = sink.write.bind(res) as (...args: never[]) => unknown;
   const originalEnd = sink.end.bind(res) as (...args: never[]) => unknown;
   sink.write = (...args: never[]) => {
     try {
-      record(args[0]);
+      record(args[0], args[1]);
     } catch {
       /* never break the response */
     }
@@ -185,7 +169,7 @@ export function attachResponseRecorder(
   sink.end = (...args: never[]) => {
     try {
       // A function first argument is the callback overload, not a body.
-      if (typeof args[0] !== "function") record(args[0]);
+      if (typeof args[0] !== "function") record(args[0], args[1]);
     } catch {
       /* never break the response */
     }
@@ -218,21 +202,24 @@ export function readResponseEvidence(
   // nothing to keep.
   if (mode === "error" && (status === undefined || status < 400))
     return Object.keys(headers).length > 0 ? { responseHeaders: headers } : {};
-  if (!recorder || recorder.chunks.length === 0)
+  if (!recorder || recorder.bytes === 0)
     return {
       ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
       ...(recorder?.callsite ? { responseCallsite: recorder.callsite } : {}),
     };
 
-  const contentType = headers["content-type"];
+  const contentType = readHeader(res, "content-type");
   // A binary payload contributes nothing a reader can use and everything a
   // capture budget cannot afford.
   if (contentType && !TEXTUAL_CONTENT_TYPE.test(contentType))
-    return { responseHeaders: headers };
+    return {
+      ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
+      ...(recorder.callsite ? { responseCallsite: recorder.callsite } : {}),
+    };
 
   return {
     ...(recorder.callsite ? { responseCallsite: recorder.callsite } : {}),
-    responseBody: recorder.chunks.join(""),
+    responseBody: recorder.read(),
     ...(options.keepFields && options.keepFields.length > 0
       ? { keepFields: options.keepFields }
       : {}),
@@ -241,25 +228,29 @@ export function readResponseEvidence(
   };
 }
 
+function readHeader(
+  res: BackendResponseLike,
+  name: string,
+): string | undefined {
+  const source = res as ResponseInternals;
+  try {
+    const raw = source.getHeader?.call(res, name);
+    if (raw === undefined || raw === null) return undefined;
+    return Array.isArray(raw) ? raw.join(", ") : String(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 function readAllowlistedHeaders(
   res: BackendResponseLike,
   options: BackendResponseCaptureOptions,
 ): Record<string, string> {
   const out: Record<string, string> = {};
-  const source = res as ResponseInternals;
-  const getHeader = source.getHeader;
-  if (typeof getHeader !== "function") return out;
   const allowlist =
     options.responseHeaderAllowlist ?? DEFAULT_RESPONSE_HEADER_ALLOWLIST;
   for (const name of allowlist) {
-    let raw: unknown;
-    try {
-      raw = getHeader.call(res, name);
-    } catch {
-      continue;
-    }
-    if (raw === undefined || raw === null) continue;
-    const value = Array.isArray(raw) ? raw.join(", ") : String(raw);
+    const value = readHeader(res, name);
     if (value) out[name.toLowerCase()] = value.slice(0, 300);
   }
   return out;
