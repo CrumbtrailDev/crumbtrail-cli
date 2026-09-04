@@ -233,7 +233,11 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         options: operationOptions,
         context: { connection, durationMs, transactionId: transaction?.id },
       });
-      if (operationOptions.captureReads && parsedRead) {
+      if (
+        (operationOptions.getCaptureReads?.() ??
+          operationOptions.captureReads) &&
+        parsedRead
+      ) {
         try {
           const rows = (result.rows ?? []).filter(isRecord);
           const rowCount =

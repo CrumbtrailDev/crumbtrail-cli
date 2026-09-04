@@ -243,3 +243,12 @@ The installer, `crumbtrail`, is **PolyForm Shield 1.0.0**. It runs on your
 machine and in CI rather than shipping inside your product. Free to use, read,
 modify and run; the one thing it stops is building a competing product out of
 it. See [packages/cli/LICENSE](packages/cli/LICENSE).
+
+## Validate a data repair
+
+`crumbtrail witness` runs a derived data witness before and after your named repair
+script and submits the observations for cloud validation. It supports Postgres,
+MySQL, SQLite, SQL Server, and MongoDB. The runner never boots the application, copies
+the database, or sends the connection string to Crumbtrail. See the
+[CLI witness command](packages/cli/README.md#validate-a-data-repair) for credentials,
+dry run, CI use, output, and verdicts.

@@ -207,7 +207,7 @@ function captureModelResult(input: {
   if (!mutation) {
     if (
       !MODEL_READ_OPERATIONS.has(input.operation) ||
-      !input.options.captureReads
+      !(input.options.getCaptureReads?.() ?? input.options.captureReads)
     )
       return;
     const rows = rowsFromResult(input.result);
@@ -328,7 +328,7 @@ function captureRawResult(input: {
   }
 
   if (
-    input.options.captureReads &&
+    (input.options.getCaptureReads?.() ?? input.options.captureReads) &&
     input.classification?.kind === "read" &&
     rows.length > 0
   ) {

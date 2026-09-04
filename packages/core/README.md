@@ -904,3 +904,19 @@ transport, are subpaths of this package rather than packages of their own — se
 ## License
 
 MIT
+
+## Data witness event
+
+`db.witness` records one before or after database observation from the CLI witness
+runner. Automatic SDK capture does not emit it. The event carries `witnessId`,
+`engine`, `runId`, `phase`, a migration fingerprint, and one to three statement results.
+Each result contains a value free shape, bound parameters, execution status, true row
+count, and up to 25 identifying rows. Identifying values and parameters pass through
+the existing database row redaction. The session view shows counts and identifying
+values after redaction.
+
+The `DataWitness` type is a restricted query document. `validateDataWitness` rejects
+unsupported instructions and unbound keys. `compileDataWitness` generates parameterized
+reads for Postgres, MySQL, SQLite, SQL Server, or MongoDB. It does not execute arbitrary
+SQL or aggregation stages. The witness runner never boots the application, copies the
+database, or sends the connection string to Crumbtrail.

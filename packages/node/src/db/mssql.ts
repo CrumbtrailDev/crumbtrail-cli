@@ -585,7 +585,11 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // Non-mutation (read) path.
     if (!parsed) {
       const { result, durationMs } = await timedQuery(request, sql);
-      if (operationOptions.captureReads && parsedRead) {
+      if (
+        (operationOptions.getCaptureReads?.() ??
+          operationOptions.captureReads) &&
+        parsedRead
+      ) {
         try {
           const rows = recordsetRows(result);
           emitDbReadEvents({

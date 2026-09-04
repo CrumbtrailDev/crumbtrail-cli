@@ -15,13 +15,14 @@ export default defineConfig({
     "src/testing.ts",
   ],
   format: ["esm", "cjs"],
+  removeNodeProtocol: false,
   // crumbtrail-core is bundled, not required at runtime: the CLI declares no
   // dependencies, and the only thing it needs from core is a handful of
   // constants that tree-shake down to inline values. Declaring it here rather
   // than leaning on tsup's bundle-devDependencies default is what lets the
   // release planner see that a core change alters this tarball — without it the
   // CLI silently drops out of the release set on a core-only change.
-  noExternal: ["crumbtrail-core"],
+  noExternal: ["crumbtrail-core", "crumbtrail-node"],
   dts: true,
   clean: true,
 });

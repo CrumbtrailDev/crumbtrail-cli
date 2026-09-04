@@ -343,3 +343,17 @@ export type {
   CapsuleV2,
   CompileCapsuleV2Input,
 } from "./capsule";
+
+export { DB_WITNESS_EVENT_KIND, DATA_WITNESS_ROW_CAP } from "./data-witness";
+export type {
+  DataWitness,
+  DbWitnessEventData,
+  WitnessEngine,
+  WitnessPredicate,
+  WitnessRunIdentity,
+  WitnessStatement,
+  WitnessStatementObservation,
+  WitnessValue,
+} from "./data-witness";
+export { compileDataWitness, validateDataWitness, WitnessValidationError } from "./data-witness";
+export type { CompiledWitnessStatement } from "./data-witness";

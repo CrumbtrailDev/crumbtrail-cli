@@ -193,6 +193,53 @@ afterEach(() => {
 });
 
 describe("auto-captured database client lifecycle", () => {
+  it.each([true, false])(
+    "uses the remote read capture opt in (%s) on installed clients",
+    async (captureReads) => {
+      class PrismaClient {
+        $extends(
+          extension: DuckTypedPrismaExtension,
+        ): FakeExtendedPrismaClient {
+          return makePrismaClient().$extends(extension);
+        }
+      }
+      const mod: Record<string, unknown> = { PrismaClient };
+      const transport = makeFetch();
+      const fetchImpl = (async (url, init) => {
+        if (String(url).includes("/api/capture-config"))
+          return new Response(
+            JSON.stringify({ captureDatabaseReads: captureReads }),
+          );
+        return transport.fetchImpl(url, init);
+      }) as typeof fetch;
+      const handle = await autoCapture(
+        captureOptions(
+          fetchImpl,
+          makeFakeProcess(),
+          ["@prisma/client"],
+          () => mod,
+          "read-policy",
+        ),
+      );
+      openHandles.push(handle);
+      await flushCapture();
+      const client = new (
+        mod.PrismaClient as new () => FakeExtendedPrismaClient
+      )();
+      await runInBackendRequestContext({ requestId: "read-opt-in" }, () =>
+        client.run(
+          { model: "Order", operation: "findMany", args: {} },
+          Array.from({ length: 40 }, (_, id) => ({ id, total: 10 })),
+        ),
+      );
+      await flushCapture();
+      const reads = eventsFrom(transport.calls).filter(
+        (event) => event.k === "db.read",
+      );
+      expect(reads).toHaveLength(captureReads ? 25 : 0);
+    },
+  );
+
   it("does not rebind a late Prisma completion to a restarted session", async () => {
     class PrismaClient {
       $extends(extension: DuckTypedPrismaExtension): FakeExtendedPrismaClient {

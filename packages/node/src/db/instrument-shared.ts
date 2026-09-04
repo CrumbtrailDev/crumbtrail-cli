@@ -106,6 +106,7 @@ export interface InstrumentDbClientOptions {
   captureBefore?: boolean;
   /** When true, capture capped/redacted SELECT result rows as pre-state read evidence. Default off. */
   captureReads?: boolean;
+  getCaptureReads?: () => boolean;
   /** Extra sensitive column names dropped on top of the defaults. */
   redactColumns?: readonly string[];
   /**
