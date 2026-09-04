@@ -124,8 +124,10 @@ export function describeElement(el: Element): ElementDescriptor {
  * File parts are described, never read. The form FIELD name survives as the JSON key, which is the
  * part that matters - a reader needs to know the upload was attached to `invoice`, not what the
  * document said. The file's own name and MIME type are free text and answer to the same value rules
- * as any other string in a body, which redact them; only the byte count is kept, because a size is
- * shape and not content.
+ * as any other string in a body, which redact them; only the byte count and the file extension are
+ * kept, because a size and a file type are shape, not content. The extension is the tail of the
+ * name after its last dot, never the stem, and only when it is short and alphanumeric enough to be
+ * a type rather than a fragment of free text.
  */
 export function readStructuredBody(body: unknown): string | undefined {
   try {
@@ -138,7 +140,7 @@ export function readStructuredBody(body: unknown): string | undefined {
         const described =
           typeof value === "string"
             ? value
-            : describeFilePart(value as { size?: number });
+            : describeFilePart(value as { name?: string; size?: number });
         const existing = fields[key];
         if (existing === undefined) fields[key] = described;
         else if (Array.isArray(existing)) existing.push(described);
@@ -152,11 +154,32 @@ export function readStructuredBody(body: unknown): string | undefined {
   return undefined;
 }
 
-function describeFilePart(file: { size?: number }): Record<string, unknown> {
+function describeFilePart(file: {
+  name?: string;
+  size?: number;
+}): Record<string, unknown> {
+  const ext = typeof file.name === "string" ? extractFileExtension(file.name) : undefined;
   return {
     file: true,
     ...(typeof file.size === "number" ? { bytes: file.size } : {}),
+    ...(ext ? { ext } : {}),
   };
+}
+
+/**
+ * The file type, never the name. Lowercased tail after the last dot, kept only
+ * when it is short and alphanumeric enough to be an extension rather than a
+ * fragment of the (free text, unredacted-in-this-function) stem: a dotfile
+ * with nothing before the dot (`.gitignore`), a name with no dot, and a tail
+ * longer than a real extension ever is all report no extension rather than
+ * guessing.
+ */
+export function extractFileExtension(name: string): string | undefined {
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex <= 0) return undefined;
+  const tail = name.slice(dotIndex + 1).toLowerCase();
+  if (tail.length === 0 || tail.length > 8) return undefined;
+  return /^[a-z0-9]+$/.test(tail) ? tail : undefined;
 }
 
 export function generateSessionId(): string {
