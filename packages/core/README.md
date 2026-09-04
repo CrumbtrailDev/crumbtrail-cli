@@ -677,10 +677,30 @@ because of the container it arrived in.
 
 Both are now read without consuming them, and the same body redaction runs over
 the result. A `FormData` is rendered as a JSON object keyed by field name, so a
-repeated field becomes an array. File parts are described, never read: the form
-field name survives as the key and the part reports `{ file: true, bytes }`. The
-file's own name and MIME type are free text and answer to the same value rules as
-any other string in a body.
+repeated field becomes an array. File parts are described, never read: the file's
+own bytes are never stored, only sniffed and discarded. The form field name
+survives as the key and the part reports `{ file: true, bytes, ext }` — `ext` is
+the lowercased tail of the file name after its last dot (never the stem), kept
+only when it is short and alphanumeric enough to be a type rather than free text.
+
+The rest of the file's description — `nameShape` (the same shape a redacted
+value gets, computed over the file name), `declaredType` (`file.type`, kept only
+when it matches a strict MIME grammar), and `sniffedType`/`width`/`height` (read
+from the file's own bytes: the first 32 bytes identify PNG, JPEG, GIF, WebP, PDF,
+ZIP, MP4, or plain text, and carry dimensions for PNG/GIF/WebP; a JPEG's
+dimensions come from scanning its marker segments in the first 64 KB) — arrives
+on a separate `net.req.file` event rather than inside the body's JSON text. A
+MIME type such as `application/pdf` would fail the enum-shaped rule that lets an
+ordinary short body value survive redaction untouched, so fields that are
+already shape-only or grammar-validated ride outside that redaction instead of
+through it. `net.req.file` carries `id` (joining it to its `net.req`), `field`
+(the FormData key), and `index` (position among files under that same key), and
+may arrive in two parts: the synchronous fields immediately, and the sniffed
+fields once the bounded byte read resolves — never delaying the request itself,
+which dispatches without waiting on either.
+
+Server-side multipart bodies are unaffected by any of this; describing a
+multipart part on the Node SDK needs a boundary parser it does not have yet.
 
 ### GraphQL operation identity (`net.req d.gql`)
 

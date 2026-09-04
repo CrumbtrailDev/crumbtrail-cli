@@ -1120,6 +1120,41 @@ describe("networkCollector — XHR", () => {
 
     cleanup();
   });
+
+  // Same policy as the fetch path: nameShape/declaredType ride net.req.file rather than the
+  // redacted body, and describing/sniffing an upload never delays MockXHR's synchronous send().
+  it("describes a FormData file part on net.req.file without delaying send()", () => {
+    const { events, bus, cleanup } = collect();
+
+    const form = new FormData();
+    form.append(
+      "invoice",
+      new File(["SECRET-DOCUMENT-BODY"], "invoice.pdf", {
+        type: "application/pdf",
+      }),
+    );
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "https://api.example.com/upload");
+    xhr.send(form);
+
+    // `MockXHR.send` is a synchronous no-op: reaching it at all proves description and
+    // sniffing did not block dispatch, since neither is awaited before `origSend.call` runs.
+    const mock = MockXHR.instances[MockXHR.instances.length - 1];
+    expect(mock).toBeDefined();
+
+    mock._respond(200, "ok");
+    bus.flush();
+
+    const fileEvent = events.find(
+      (e) => e.k === "net.req.file" && e.d.nameShape !== undefined,
+    );
+    expect(fileEvent).toBeDefined();
+    expect(fileEvent!.d.field).toBe("invoice");
+    expect(fileEvent!.d.declaredType).toBe("application/pdf");
+
+    cleanup();
+  });
 });
 
 /* ================================================================== */
