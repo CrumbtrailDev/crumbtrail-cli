@@ -13,7 +13,7 @@ function makeFetchMock(body: string, contentType = "application/json") {
   );
 }
 
-describe("networkCollector – body deduplication", () => {
+describe("networkCollector – independent response evidence", () => {
   let bus: EventBus;
   let events: BugEvent[];
   let cleanup: () => void;
@@ -45,7 +45,7 @@ describe("networkCollector – body deduplication", () => {
     expect(res.d.dedup).toBeUndefined();
   });
 
-  it("deduplicates identical response body for same URL on second call", async () => {
+  it("retains repeated bodies when earlier events fall outside the evidence window", async () => {
     globalThis.fetch = makeFetchMock('{"status":"ok"}');
     cleanup = networkCollector(bus, DEFAULT_CONFIG);
 
@@ -55,13 +55,23 @@ describe("networkCollector – body deduplication", () => {
     const res = resEvents();
     expect(res).toHaveLength(2);
 
-    // First: full body
     expect(typeof res[0].d.body).toBe("string");
     expect(res[0].d.dedup).toBeUndefined();
 
-    // Second: deduplicated reference
-    expect(res[1].d.dedup).toBe(true);
-    expect((res[1].d.body as Record<string, unknown>).ref).toBeDefined();
+    const retained = res.slice(1);
+    expect(retained[0].d.body).toBe('{"status":"ok"}');
+    expect(retained[0].d.dedup).toBeUndefined();
+  });
+
+  it("keeps repeated text evidence even without a parsed body summary", async () => {
+    globalThis.fetch = makeFetchMock("upstream unavailable", "text/plain");
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+    await globalThis.fetch("https://api.example.com/health");
+    await globalThis.fetch("https://api.example.com/health");
+    const res = resEvents();
+    expect(res[1].d.body).toBe(res[0].d.body);
+    expect(typeof res[1].d.body).toBe("string");
+    expect(res[1].d.dedup).toBeUndefined();
   });
 
   it("does NOT deduplicate when response bodies differ", async () => {
@@ -103,11 +113,11 @@ describe("networkCollector – body deduplication", () => {
     expect(res[1].d.dedup).toBeUndefined();
   });
 
-  it("clears dedup map on cleanup so subsequent collector instances start fresh", async () => {
+  it("retains response bodies across collector lifecycles", async () => {
     globalThis.fetch = makeFetchMock('{"ping":true}');
     const c1 = networkCollector(bus, DEFAULT_CONFIG);
     await globalThis.fetch("https://api.example.com/ping");
-    c1(); // cleanup — clears dedup map
+    c1();
 
     events = [];
     const c2 = networkCollector(bus, DEFAULT_CONFIG);
@@ -115,7 +125,6 @@ describe("networkCollector – body deduplication", () => {
     cleanup = c2;
 
     const res = resEvents();
-    // After reset the first call should be treated as new, not a dup
     expect(res[0].d.dedup).toBeUndefined();
     expect(res[0].d.body).toBe('{"ping":true}');
   });

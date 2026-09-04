@@ -106,53 +106,6 @@ export function __resetCorrelationHintsForTests(): void {
   correlationHintedOrigins.clear();
 }
 
-/* ------------------------------------------------------------------ */
-/* Body deduplication                                                  */
-/* ------------------------------------------------------------------ */
-
-const DEDUP_MAP_MAX = 1000;
-
-// key = url + ":" + hash(body), value = first-seen timestamp (string)
-const dedupMap = new Map<string, string>();
-
-function djb2(s: string): number {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
-  return h >>> 0; // unsigned 32-bit
-}
-
-function clearDedupMap(): void {
-  dedupMap.clear();
-}
-
-/**
- * Checks whether this url+body combo was seen before.
- * - If new: stores it and returns undefined (caller emits normally).
- * - If duplicate: returns { ref, dedup } to replace the body field.
- */
-function checkDedup(
-  url: string,
-  body: unknown,
-  timestamp: string,
-): { ref: string; dedup: true } | undefined {
-  if (body == null || typeof body !== "string") return undefined;
-
-  const key = url + ":" + djb2(url + body);
-
-  if (dedupMap.has(key)) {
-    return { ref: dedupMap.get(key)!, dedup: true };
-  }
-
-  // Evict oldest entry when cap is reached
-  if (dedupMap.size >= DEDUP_MAP_MAX) {
-    const oldest = dedupMap.keys().next().value;
-    if (oldest !== undefined) dedupMap.delete(oldest);
-  }
-
-  dedupMap.set(key, timestamp);
-  return undefined;
-}
-
 function isBinaryContentType(ct: string): boolean {
   const lower = ct.toLowerCase();
   return BINARY_CONTENT_TYPES.some((t) => lower.includes(t));
@@ -884,20 +837,7 @@ function wrapFetch(
             path: "body",
             ...bodyRedactionOptions(config),
           });
-          if (bodyResult.body !== undefined) {
-            const ts = String(now());
-            const dedupResult = checkDedup(
-              urlResult.value,
-              bodyResult.body,
-              ts,
-            );
-            if (dedupResult) {
-              resData.body = dedupResult;
-              resData.dedup = true;
-            } else {
-              resData.body = bodyResult.body;
-            }
-          }
+          if (bodyResult.body !== undefined) resData.body = bodyResult.body;
           if (bodyResult.bodySummary)
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
@@ -1419,20 +1359,7 @@ function wrapXHR(
             path: "body",
             ...bodyRedactionOptions(config),
           });
-          if (bodyResult.body !== undefined) {
-            const ts = String(now());
-            const dedupResult = checkDedup(
-              urlResult.value,
-              bodyResult.body,
-              ts,
-            );
-            if (dedupResult) {
-              resData.body = dedupResult;
-              resData.dedup = true;
-            } else {
-              resData.body = bodyResult.body;
-            }
-          }
+          if (bodyResult.body !== undefined) resData.body = bodyResult.body;
           if (bodyResult.bodySummary)
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
@@ -1602,19 +1529,7 @@ function emitEarlyRecord(
       path: "body",
       ...bodyRedactionOptions(config),
     });
-    if (bodyResult.body !== undefined) {
-      const dedupResult = checkDedup(
-        urlResult.value,
-        bodyResult.body,
-        String(settledAt),
-      );
-      if (dedupResult) {
-        resData.body = dedupResult;
-        resData.dedup = true;
-      } else {
-        resData.body = bodyResult.body;
-      }
-    }
+    if (bodyResult.body !== undefined) resData.body = bodyResult.body;
     if (bodyResult.bodySummary) resData.bodySummary = bodyResult.bodySummary;
     resMetadata.push(bodyResult.metadata);
     applyResponseBodyMeta(resData, {
@@ -1788,7 +1703,6 @@ export function networkCollector(
 
     restored = step(() => unregisterPendingProvider?.()) && restored;
     restored = step(() => pending.clear()) && restored;
-    restored = step(() => clearDedupMap()) && restored;
 
     // Reported, not swallowed: the caller's teardown handler is what stops a half-restored
     // collector from being installed over a second time.

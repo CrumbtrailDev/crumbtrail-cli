@@ -602,6 +602,12 @@ browser's own session. Status, duration, allowlisted response headers and the
 response body follow the same policy as the Express middleware, under the same
 redaction.
 
+Request and response body limits count UTF 8 bytes. Capture preserves characters
+split across stream chunks and marks omitted bytes, including overflow after a
+chunk exactly fills the limit. It leaves application request and response bytes
+unchanged. Response content type controls binary filtering even when the header
+allowlist omits `content-type`.
+
 A backend with no browser in front of it records its requests too. When a
 request carries no session id, the recorders file it under the session
 `autoCapture` opened for this process, and the event says

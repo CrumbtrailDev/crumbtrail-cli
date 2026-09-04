@@ -1,3 +1,4 @@
+import { BoundedBodyRecorder } from "./bounded-body-recorder";
 import {
   isTextualContentType,
   type BackendResponseLike,
@@ -95,10 +96,7 @@ export interface BackendRequestBodyCaptureOptions {
  */
 export const DEFAULT_REQUEST_BODY_MAX_BYTES = 4096;
 
-export interface RequestBodyRecorder {
-  chunks: string[];
-  bytes: number;
-  truncated: boolean;
+export interface RequestBodyRecorder extends BoundedBodyRecorder {
   /**
    * True when the inbound bytes are content-encoded. The stream carries the
    * compressed form, which is noise to a reader, so it is never used; a body
@@ -130,40 +128,25 @@ export function attachRequestBodyRecorder(
   if (contentType && !isTextualContentType(contentType)) return undefined;
 
   const encoding = requestHeaderValue(req, "content-encoding");
-  const recorder: RequestBodyRecorder = {
-    chunks: [],
-    bytes: 0,
-    truncated: false,
-    encoded: Boolean(encoding) && encoding?.trim().toLowerCase() !== "identity",
-  };
+  const recorder: RequestBodyRecorder = Object.assign(
+    new BoundedBodyRecorder(cap),
+    {
+      encoded:
+        Boolean(encoding) && encoding?.trim().toLowerCase() !== "identity",
+    },
+  );
 
   const source = req as RequestInternals;
   const originalPush = source.push;
   if (typeof originalPush !== "function" || recorder.encoded) return recorder;
 
   const bound = originalPush.bind(req) as (...args: never[]) => unknown;
-  const record = (chunk: unknown): void => {
-    if (recorder.bytes >= cap) return;
-    let text: string | undefined;
-    if (typeof chunk === "string") text = chunk;
-    else if (chunk instanceof Uint8Array)
-      text = Buffer.from(chunk).toString("utf8");
-    if (text === undefined || text === "") return;
-    const remaining = cap - recorder.bytes;
-    if (text.length > remaining) {
-      recorder.chunks.push(text.slice(0, remaining));
-      recorder.bytes = cap;
-      recorder.truncated = true;
-      return;
-    }
-    recorder.chunks.push(text);
-    recorder.bytes += text.length;
-  };
 
   source.push = (...args: never[]) => {
     try {
       // `push(null)` ends the stream and carries no data.
-      if (args[0] !== null && args[0] !== undefined) record(args[0]);
+      if (args[0] !== null && args[0] !== undefined)
+        recorder.record(args[0], args[1]);
     } catch {
       // Recording evidence can never be the reason a request fails to parse.
     }
@@ -204,10 +187,14 @@ export function readRequestBodyEvidence(
   if (mode === "error" && (status === undefined || status < 400)) return {};
 
   const cap = requestBodyCap(options);
-  const streamed = recorder.chunks.join("");
-  const parsed = streamed === "" ? parsedBodyText(req.body, cap) : undefined;
+  const streamed = recorder.read();
+  const parsed =
+    recorder.bytes === 0 ? parsedBodyText(req.body, cap) : undefined;
   const text = streamed !== "" ? streamed : parsed?.text;
-  if (text === undefined || text === "") return {};
+  if (text === undefined || text === "")
+    return recorder.truncated || parsed?.truncated
+      ? { requestBodyTruncated: true }
+      : {};
 
   const truncated = streamed !== "" ? recorder.truncated : parsed?.truncated;
 
@@ -242,8 +229,10 @@ function parsedBodyText(
     return undefined;
   }
   if (raw === undefined || raw === "" || raw === "{}") return undefined;
-  if (raw.length <= cap) return { text: raw, truncated: false };
-  return { text: raw.slice(0, cap), truncated: true };
+  const recorder = new BoundedBodyRecorder(cap);
+  recorder.record(raw);
+  const text = recorder.read();
+  return { text, truncated: recorder.truncated };
 }
 
 function requestHeaderValue(
