@@ -117,16 +117,53 @@ class Capture:
         self.request_bytes = bytearray()
         self.response_bytes = bytearray()
         self.request_complete = False
+        self.request_count = 0
+        self.request_length = None
         self.response_complete = False
         self.status = 500
         self.response_started = False
         self.response_type = ""
+        self.response_count = 0
+        self.response_length = None
         self.sequence = 0
 
     def keep(self, target, chunk):
         remaining = MAX_BYTES + 1 - len(target)
         if remaining > 0:
             target.extend(chunk[:remaining])
+
+    @staticmethod
+    def content_length(headers):
+        lengths = [v for k, v in headers if k.lower() == "content-length"]
+        if not lengths:
+            return None
+        value = lengths[0].strip()
+        return int(value) if len(lengths) == 1 and re.fullmatch(r"[0-9]{1,20}", value) else -1
+
+    def keep_request(self, chunk):
+        self.request_count += len(chunk)
+        self.keep(self.request_bytes, chunk)
+
+    def request_body(self, content_type):
+        if not is_json(content_type):
+            return None, "missing"
+        complete = self.request_complete and (self.request_length is None or self.request_count == self.request_length)
+        return capture_body(self.request_bytes, not complete)
+
+    def response_headers(self, headers):
+        self.response_type = next((v for k, v in headers if k.lower() == "content-type"), "")
+        self.response_length = self.content_length(headers)
+
+    def keep_response(self, chunk):
+        self.response_count += len(chunk)
+        self.keep(self.response_bytes, chunk)
+
+    def response_body(self):
+        no_body = self.method.upper() == "HEAD" or 100 <= self.status < 200 or self.status in (204, 205, 304) or (self.method.upper() == "CONNECT" and 200 <= self.status < 300)
+        if no_body or not is_json(self.response_type):
+            return None, "missing"
+        complete = self.response_complete and (self.response_length is None or self.response_count == self.response_length)
+        return capture_body(self.response_bytes, not complete)
 
     def add(self, kind, data):
         if len(self.events) < 198:
@@ -138,11 +175,11 @@ class Capture:
         try:
             correlation = {"status": "linked", "sessionIdSource": "header", "requestIdSource": "header"}
             common = {"requestId": self.request, "sessionId": self.session, "method": self.method, "url": route, "pathname": route, "route": route, "service": self.service, "correlation": correlation}
-            body, state = capture_body(self.request_bytes, not self.request_complete) if is_json(request_type) else (None, "missing")
+            body, state = self.request_body(request_type)
             start = {"t": self.started, "k": "backend.req.start", "d": dict(common, body=body, requestBodyState=state, redaction=redaction("body", state))}
             if error:
                 self.add("backend.req.error", dict(common, error={"name": type(error).__name__}))
-            body, state = capture_body(self.response_bytes, not self.response_complete) if is_json(self.response_type) else (None, "missing")
+            body, state = self.response_body()
             end = {"t": now(), "k": "backend.req.end", "d": dict(common, statusCode=self.status if error is None or self.response_started else 500, durationMs=(time.monotonic() - self.clock) * 1000, responseBody=body, responseBodyState=state, responseBodyTruncated=state == "truncated", redaction=redaction("responseBody", state))}
             events = [start] + self.events + [end]
             if self.dropped:

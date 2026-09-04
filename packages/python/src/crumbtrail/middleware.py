@@ -8,7 +8,7 @@ class _Input:
         self._count = 0
 
     def _keep(self, data, eof=False):
-        self._capture.keep(self._capture.request_bytes, data)
+        self._capture.keep_request(data)
         self._count += len(data)
         if eof or (self._length is not None and self._count >= self._length):
             self._capture.request_complete = True
@@ -62,12 +62,9 @@ class WSGIMiddleware:
         capture = self.client.begin(environ.get("PATH_INFO", "/"), environ.get("REQUEST_METHOD", "GET"), environ.get("HTTP_X_CRUMBTRAIL_SESSION_ID", ""), environ.get("HTTP_X_CRUMBTRAIL_REQUEST_ID", ""))
         if capture is None:
             return self.app(environ, start_response)
-        try:
-            length = int(environ["CONTENT_LENGTH"]) if environ.get("CONTENT_LENGTH") else None
-            if environ.get("wsgi.input_terminated"):
-                length = None
-        except ValueError:
-            length = None
+        declared = environ.get("CONTENT_LENGTH")
+        capture.request_length = capture.content_length([("content-length", declared)] if declared not in (None, "") else [])
+        length = capture.request_length
         def safe_route():
             try:
                 value = self.route(environ)
@@ -82,12 +79,12 @@ class WSGIMiddleware:
         def wrapped_start(status, headers, exc_info=None):
             write = start_response(status, headers, exc_info)
             capture.status = int(status.split(" ", 1)[0])
-            capture.response_type = next((v for k, v in headers if k.lower() == "content-type"), "")
+            capture.response_headers(headers)
 
             def wrapped_write(chunk):
                 result = write(chunk)
                 capture.response_started = True
-                capture.keep(capture.response_bytes, chunk)
+                capture.keep_response(chunk)
                 return result
             return wrapped_write
 
@@ -118,7 +115,7 @@ class WSGIMiddleware:
                     if self.iterator is None:
                         self.iterator = iter(iterable)
                     chunk = next(self.iterator)
-                    capture.keep(capture.response_bytes, chunk)
+                    capture.keep_response(chunk)
                     if chunk:
                         capture.response_started = True
                     return chunk
@@ -173,10 +170,13 @@ class ASGIMiddleware:
         if capture is None:
             return await self.app(scope, receive, send)
 
+        capture.request_length = capture.content_length([(k.decode("latin1"), v.decode("latin1")) for k, v in scope.get("headers", [])])
+        capture.request_complete = capture.request_length == 0
+
         async def wrapped_receive():
             message = await receive()
             if message["type"] == "http.request":
-                capture.keep(capture.request_bytes, message.get("body", b""))
+                capture.keep_request(message.get("body", b""))
                 if not message.get("more_body", False):
                     capture.request_complete = True
             return message
@@ -186,9 +186,9 @@ class ASGIMiddleware:
             if message["type"] == "http.response.start":
                 capture.status = message["status"]
                 capture.response_started = True
-                capture.response_type = next((v.decode("latin1") for k, v in message.get("headers", []) if k.lower() == b"content-type"), "")
+                capture.response_headers([(k.decode("latin1"), v.decode("latin1")) for k, v in message.get("headers", [])])
             elif message["type"] == "http.response.body":
-                capture.keep(capture.response_bytes, message.get("body", b""))
+                capture.keep_response(message.get("body", b""))
                 if not message.get("more_body", False):
                     capture.response_complete = True
 
