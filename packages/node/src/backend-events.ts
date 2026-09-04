@@ -1,10 +1,11 @@
 import type { BugEvent, RedactionMetadata } from "crumbtrail-core";
 import { appFramesFromStack, type DbCallsite } from "./db/callsite";
+import { attachBackendRedactionMetadata } from "./redaction-plane";
 import {
   CRUMBTRAIL_REQUEST_HEADER_LOWER as CORE_CRUMBTRAIL_REQUEST_HEADER,
   CRUMBTRAIL_SESSION_HEADER_LOWER as CORE_CRUMBTRAIL_SESSION_HEADER,
+  BACKEND_REDACTION_POLICY,
   W3C_TRACEPARENT_HEADER,
-  attachRedactionMetadata,
   buildCaptureGapEvent,
   mergeRedactionMetadata,
   parseTraceparent,
@@ -244,7 +245,7 @@ function attachResponseEvidence(
   if (result.body !== undefined) payload.responseBody = result.body;
   if (result.bodySummary) payload.responseBodySummary = result.bodySummary;
   if (input.responseBodyTruncated) payload.responseBodyTruncated = true;
-  attachRedactionMetadata(payload, result.metadata);
+  attachBackendRedactionMetadata(payload, result.metadata);
 }
 
 function headerValueOf(
@@ -270,7 +271,7 @@ export function buildBackendRequestErrorEvent(
 
   const error = sanitizeError(input.error);
   payload.error = omitMetadata(error);
-  attachRedactionMetadata(payload, error.metadata);
+  attachBackendRedactionMetadata(payload, error.metadata);
 
   return buildEvent(
     BACKEND_REQUEST_ERROR_EVENT,
@@ -381,7 +382,7 @@ export function buildBackendJobErrorEvent(
 
   const error = sanitizeError(input.error);
   payload.error = omitMetadata(error);
-  attachRedactionMetadata(payload, error.metadata);
+  attachBackendRedactionMetadata(payload, error.metadata);
 
   return buildEvent(
     BACKEND_JOB_ERROR_EVENT,
@@ -410,7 +411,7 @@ function buildJobPayload(
   if (Number.isFinite(input.attempt))
     payload.attempt = Math.max(1, Math.round(input.attempt as number));
 
-  attachRedactionMetadata(payload, name.metadata, queue.metadata);
+  attachBackendRedactionMetadata(payload, name.metadata, queue.metadata);
   return payload;
 }
 
@@ -430,7 +431,7 @@ function attachJobResult(
   if (redacted.body !== undefined) payload.result = redacted.body;
   if (redacted.bodySummary) payload.resultSummary = redacted.bodySummary;
   if (input.resultTruncated) payload.resultTruncated = true;
-  attachRedactionMetadata(payload, redacted.metadata);
+  attachBackendRedactionMetadata(payload, redacted.metadata);
 }
 
 function buildEvent(
@@ -479,7 +480,7 @@ function buildBasePayload(
     if (route.truncated) payload.routeTruncated = true;
   }
 
-  attachRedactionMetadata(payload, sanitizedUrl.metadata, route.metadata);
+  attachBackendRedactionMetadata(payload, sanitizedUrl.metadata, route.metadata);
 
   return payload;
 }
@@ -649,7 +650,7 @@ function sanitizeRoute(rawRoute: string | undefined): SanitizedRoute {
 
   const metadata = truncated
     ? mergeRedactionMetadata(tokenResult.metadata, {
-        policy: "crumbtrail.browser-redaction.v1",
+        policy: BACKEND_REDACTION_POLICY,
         fields: [
           { path: "route", reason: "route_too_long", action: "summarized" },
         ],
@@ -731,7 +732,7 @@ function sanitizeErrorText(
 
   const truncated = `${tokenResult.value.slice(0, maxLength)}…`;
   const metadata = mergeRedactionMetadata(tokenResult.metadata, {
-    policy: "crumbtrail.browser-redaction.v1",
+    policy: BACKEND_REDACTION_POLICY,
     fields: [{ path, reason: "error_field_too_long", action: "summarized" }],
   });
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CAPTURE_GAP_EVENT_KIND,
-  BROWSER_REDACTION_POLICY,
+  BACKEND_REDACTION_POLICY,
   REDACTED_VALUE,
   createCrumbtrailRequestHeaders,
   type BugEvent,
@@ -183,7 +183,7 @@ describe("backend event contract helpers", () => {
     });
   });
 
-  it("redacts query values and attaches browser redaction metadata", () => {
+  it("redacts query values and attaches backend redaction metadata", () => {
     const event = buildBackendRequestStartEvent({
       now: 1000,
       sessionId: "ses_redact",
@@ -197,7 +197,7 @@ describe("backend event contract helpers", () => {
     );
     expect(event.d.pathname).toBe("/api/search");
     expect(event.d.redaction).toMatchObject({
-      policy: BROWSER_REDACTION_POLICY,
+      policy: BACKEND_REDACTION_POLICY,
       fields: expect.arrayContaining([
         expect.objectContaining({
           path: "url.query.q",
@@ -231,7 +231,7 @@ describe("backend event contract helpers", () => {
     expect(String(event.d.route).length).toBeLessThanOrEqual(257);
     expect(event.d.routeTruncated).toBe(true);
     expect(event.d.redaction).toMatchObject({
-      policy: BROWSER_REDACTION_POLICY,
+      policy: BACKEND_REDACTION_POLICY,
       fields: expect.arrayContaining([
         expect.objectContaining({ path: "route", action: "redacted" }),
         expect.objectContaining({
@@ -358,7 +358,7 @@ describe("backend event contract helpers", () => {
     });
     expect(JSON.stringify(event.d)).not.toContain(secret);
     expect(event.d.redaction).toMatchObject({
-      policy: BROWSER_REDACTION_POLICY,
+      policy: BACKEND_REDACTION_POLICY,
       fields: expect.arrayContaining([
         expect.objectContaining({
           path: "error.message",

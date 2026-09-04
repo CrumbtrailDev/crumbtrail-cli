@@ -1,12 +1,12 @@
 import {
-  BROWSER_REDACTION_POLICY,
-  mergeRedactionMetadata,
+  BACKEND_REDACTION_POLICY,
   redactNetworkTextBody,
   redactProbeStorageKey,
   type BugEvent,
   type PayloadSummary,
   type RedactionMetadata,
 } from "crumbtrail-core";
+import { backendRedactionMetadata } from "../redaction-plane";
 import {
   buildRaceEvidence,
   readRaceServiceCompatibility,
@@ -82,7 +82,7 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
   );
   const redactedValue =
     input.value === undefined ? undefined : redactCacheValue(input.value);
-  const redaction = mergeRedactionMetadata(
+  const redaction = backendRedactionMetadata(
     ...redactedKeys.map((result) => result.metadata),
     redactedValue?.metadata,
   );
@@ -108,7 +108,7 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
     d.errorName = error.name;
     if (error.message !== undefined) d.error = error.message;
     if (error.metadata) {
-      d.redaction = mergeRedactionMetadata(
+      d.redaction = backendRedactionMetadata(
         ...(redaction ? [redaction] : []),
         error.metadata,
       );
@@ -231,7 +231,7 @@ function redactCacheValue(value: unknown): {
     return {
       summary,
       metadata: {
-        policy: BROWSER_REDACTION_POLICY,
+        policy: BACKEND_REDACTION_POLICY,
         fields: [
           {
             path: "cache",
