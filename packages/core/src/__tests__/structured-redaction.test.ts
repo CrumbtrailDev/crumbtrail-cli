@@ -8,6 +8,11 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   classifyStructuredValue,
   computeRedactedShape,
+  isValidRedactedShapeExample,
+  redactedShapeDetailAllowed,
+  redactedShapeExample,
+  redactedShapeExampleAllowed,
+  REDACTED_SHAPE_EXAMPLE_MAX_LENGTH,
   DIAGNOSTIC_FIELD_MAX_PATHS,
   DIAGNOSTIC_INDEX_MAX,
   redactDiagnosticFields,
@@ -15,6 +20,7 @@ import {
   resetStructuredShapeSaltForTests,
   redactUrl,
   setRedactionKeepFields,
+  unescapeRedactionMarker,
 } from "../redaction";
 
 const JWT =
@@ -1037,6 +1043,243 @@ describe("computeRedactedShape", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Richer shape fields                                                 */
+/* ------------------------------------------------------------------ */
+
+describe("computeRedactedShape structural fields", () => {
+  // The richer shape is opt in by reason, so every case here states one.
+  const shapeOf = (value: string) =>
+    computeRedactedShape(value, "free_text_value");
+
+  it("counts whitespace separated runs, only above one", () => {
+    expect(shapeOf("the quick brown fox").words).toBe(4);
+    // `words=1` is on the great majority of markers and adds nothing to `len`.
+    expect(shapeOf("singleword").words).toBeUndefined();
+  });
+
+  it("counts lines only above one", () => {
+    expect(shapeOf("one line only here").lines).toBeUndefined();
+    expect(shapeOf("first line\nsecond line").lines).toBe(2);
+    expect(shapeOf("a line\r\nb line\rc line").lines).toBe(3);
+  });
+
+  it("reports which end carried whitespace", () => {
+    expect(shapeOf("no edges here").edges).toBeUndefined();
+    expect(shapeOf("  leading space").edges).toBe("leading");
+    expect(shapeOf("trailing space  ").edges).toBe("trailing");
+    expect(shapeOf("  both ends  ").edges).toBe("both");
+  });
+
+  it("flags non-ASCII and emoji separately", () => {
+    expect(shapeOf("plain ascii text").nonAscii).toBeUndefined();
+    expect(shapeOf("plain ascii text").emoji).toBeUndefined();
+    expect(shapeOf("café au lait").nonAscii).toBe(true);
+    expect(shapeOf("café au lait").emoji).toBeUndefined();
+    const emoji = shapeOf("thanks 🙂 lots");
+    expect(emoji.emoji).toBe(true);
+    expect(emoji.nonAscii).toBe(true);
+  });
+
+  it.each([
+    ["2026-09-04T10:15:00Z", "datetime"],
+    ["2026-09-04 10:15", "datetime"],
+    ["2026-09-04", "date"],
+    ["04/09/2026", "date"],
+    ["10:15:30", "time"],
+    ["9:05 pm", "time"],
+    ["https://example.com/orders/42", "url"],
+    ["3f2504e0-4f89-11d3-9a0c-0305e82c3301", "uuid"],
+    ["1234.56", "decimal"],
+    ["1,234,567.89", "grouped_number"],
+  ])("reports the structural pattern of %s as %s", (value, pattern) => {
+    expect(shapeOf(value).pattern).toBe(pattern);
+  });
+
+  it("names no sensitive class as a pattern", () => {
+    for (const value of [
+      "person@example.com",
+      "+1 415 555 0132",
+      "4242 4242 4242 4242",
+      "GB29NWBK60161331926819",
+      JWT,
+    ]) {
+      expect(shapeOf(value).pattern).not.toBe("email");
+      expect(shapeOf(value).pattern).not.toBe("phone");
+      expect(shapeOf(value).pattern).not.toBe("card");
+      expect(shapeOf(value).pattern).not.toBe("iban");
+      expect(shapeOf(value).pattern).not.toBe("token");
+    }
+  });
+
+  it("keeps the short-value floor: no words, lines or example without hash8", () => {
+    // Numeric under 12, and anything under 6, withhold the hash today.
+    for (const value of ["123", "078051120", "5551234567", "ab1", "a b"]) {
+      const shape = computeRedactedShape(value, "free_text_value");
+      expect(shape.hash8).toBeUndefined();
+      expect(shape.words).toBeUndefined();
+      expect(shape.lines).toBeUndefined();
+      expect(shape.example).toBeUndefined();
+    }
+    // The one-bit fields still describe a short value.
+    expect(shapeOf(" a b ").edges).toBe("both");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Fake example                                                        */
+/* ------------------------------------------------------------------ */
+
+describe("redactedShapeExample", () => {
+  it("maps each class of code point to its fixed stand-in", () => {
+    expect(redactedShapeExample("Hello World 42!")).toBe("Xxxxx Xxxxx 00!");
+    expect(redactedShapeExample("café")).toBe("xxxé");
+    expect(redactedShapeExample("Москва")).toBe("дддддд");
+    expect(redactedShapeExample("東京")).toBe("漢漢");
+    expect(redactedShapeExample("αβγ")).toBe("ααα");
+    expect(redactedShapeExample("nice 😍")).toBe("xxxx 🙂");
+    // Whitespace and ASCII punctuation are kept verbatim; a control character
+    // and a non-ASCII non-letter are not.
+    expect(redactedShapeExample("a-b_c.d\te")).toBe("x-x_x.x\tx");
+    expect(redactedShapeExample("5 €")).toBe("0 ¤");
+  });
+
+  it("carries no letter of the original value", () => {
+    const secret = "my landlord rejected the deposit refund";
+    const example = redactedShapeExample(secret);
+    for (const word of secret.split(" ")) {
+      expect(example).not.toContain(word);
+    }
+  });
+
+  it("preserves code unit length so len stays comparable", () => {
+    for (const value of [
+      "Hello World",
+      "café au lait",
+      "東京の天気",
+      "nice 😍😍",
+      "5 € and — a dash",
+    ]) {
+      expect(redactedShapeExample(value).length).toBe(value.length);
+    }
+  });
+
+  it("caps at 120 code units and marks the cut", () => {
+    const long = "a".repeat(400);
+    const example = redactedShapeExample(long);
+    expect(example.endsWith("…")).toBe(true);
+    expect(example.length - 1).toBe(REDACTED_SHAPE_EXAMPLE_MAX_LENGTH);
+    // len still reports the true length.
+    expect(computeRedactedShape(long, "free_text_value").len).toBe(400);
+  });
+});
+
+describe("redactedShapeExampleAllowed", () => {
+  const withHash = computeRedactedShape(
+    "a long enough free text value",
+    "free_text_value",
+  );
+
+  it("allows only the free prose reason", () => {
+    expect(redactedShapeExampleAllowed("free_text_value", withHash)).toBe(true);
+  });
+
+  it.each([
+    "email_value",
+    "jwt_value",
+    "luhn_value",
+    "iban_value",
+    "token_like_value",
+    "high_entropy_value",
+    "masked_input_type",
+    "sensitive_input_value",
+    "deny_field",
+    "sensitive_container_number",
+    "sensitive_short_numeric_field",
+    "input_value",
+    "url_query_value",
+    "unknown_value",
+  ])("withholds an example for %s", (reason) => {
+    expect(redactedShapeExampleAllowed(reason, withHash)).toBe(false);
+    expect(
+      computeRedactedShape("a long free text value", reason).example,
+    ).toBeUndefined();
+  });
+
+  it("withholds an example when hash8 is omitted", () => {
+    expect(
+      redactedShapeExampleAllowed(
+        "free_text_value",
+        computeRedactedShape("abc"),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("isValidRedactedShapeExample", () => {
+  const shapeOf = (value: string) =>
+    computeRedactedShape(value, "free_text_value");
+
+  it("accepts every example this module produces", () => {
+    for (const value of [
+      "the quick brown fox jumped",
+      "café au lait, please",
+      "Москва и другие",
+      "thanks 🙂 so much",
+      "a".repeat(400),
+      "line one\nline two here",
+    ]) {
+      const shape = shapeOf(value);
+      expect(shape.example).toBeDefined();
+      expect(isValidRedactedShapeExample(shape.example, shape)).toBe(true);
+    }
+  });
+
+  it("rejects a character outside the alphabet", () => {
+    const shape = shapeOf("the quick brown fox");
+    expect(isValidRedactedShapeExample("the quick brown fox", shape)).toBe(
+      false,
+    );
+    expect(isValidRedactedShapeExample("Xxxгxxxx brown fox", shape)).toBe(
+      false,
+    );
+  });
+
+  it("rejects a length that disagrees with len", () => {
+    const shape = shapeOf("the quick brown fox");
+    expect(isValidRedactedShapeExample("xxx", shape)).toBe(false);
+    expect(isValidRedactedShapeExample(shape.example + "x", shape)).toBe(false);
+  });
+
+  it("rejects an example that disagrees with charset", () => {
+    const alpha = shapeOf("abcdefghij");
+    expect(alpha.charset).toBe("alpha");
+    expect(isValidRedactedShapeExample("Xxxxx-xxxx", alpha)).toBe(false);
+    const num = shapeOf("123456789012");
+    expect(num.charset).toBe("num");
+    expect(isValidRedactedShapeExample("00000000000x", num)).toBe(false);
+  });
+
+  it("rejects an example that disagrees with nonAscii or emoji", () => {
+    const ascii = shapeOf("the quick brown fox");
+    expect(ascii.nonAscii).toBeUndefined();
+    expect(isValidRedactedShapeExample("xxx éxxxx xxxxx xxx", ascii)).toBe(
+      false,
+    );
+    const emoji = shapeOf("thanks 🙂 so much");
+    expect(emoji.emoji).toBe(true);
+    // Same length, no emoji stand-in: the flag says one was there.
+    expect(isValidRedactedShapeExample("xxxxxx éé xx xxxx", emoji)).toBe(false);
+  });
+
+  it("rejects a non-string and an empty string", () => {
+    const shape = shapeOf("the quick brown fox");
+    expect(isValidRedactedShapeExample(undefined, shape)).toBe(false);
+    expect(isValidRedactedShapeExample(42, shape)).toBe(false);
+    expect(isValidRedactedShapeExample("", shape)).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* redactNetworkTextBody — structured mode                             */
 /* ------------------------------------------------------------------ */
 
@@ -1945,5 +2188,296 @@ describe("query parameters answer to the same keep list", () => {
     // form-encodes the space as `+`, which decodeURIComponent does not undo.
     const parsed = new URLSearchParams(value.split("?")[1]);
     expect(parsed.get("q")).toBe(`O'Brien "x"`);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Shape and example on the wire                                       */
+/* ------------------------------------------------------------------ */
+
+describe("placeholder shape and example end to end", () => {
+  const structured = {
+    contentType: "application/json",
+    mode: "structured" as const,
+  };
+  const redactBody = (value: unknown) =>
+    redactNetworkTextBody(JSON.stringify(value), structured);
+
+  it("carries the shape and a stand-in for free prose", () => {
+    const note = "the landlord rejected my deposit refund 🙂";
+    const result = redactBody({ note });
+    const parsed = JSON.parse(result.body!) as {
+      note: Record<string, unknown>;
+    };
+
+    expect(parsed.note).toMatchObject({
+      $redacted: "[REDACTED]",
+      len: note.length,
+      charset: "mixed",
+      words: 7,
+      nonAscii: true,
+      emoji: true,
+    });
+    expect(parsed.note.example).toBe(
+      "xxx xxxxxxxx xxxxxxxx xx xxxxxxx xxxxxx 🙂",
+    );
+    // The stand-in holds no word of the original.
+    for (const word of note.split(" ").filter((w) => /[a-z]/.test(w))) {
+      expect(result.body).not.toContain(word);
+    }
+  });
+
+  it("withholds the stand-in for values caught by a sensitive reason", () => {
+    const parsed = JSON.parse(
+      redactBody({
+        contact: "person@example.com",
+        session: JWT,
+        card: "4242 4242 4242 4242",
+        iban: "GB29 NWBK 6016 1331 9268 19",
+        password: "hunter2secret",
+        secretNote: "a-".repeat(30),
+      }).body!,
+    ) as Record<string, Record<string, unknown>>;
+
+    for (const key of Object.keys(parsed)) {
+      expect(parsed[key].$redacted).toBe("[REDACTED]");
+      expect(parsed[key].example).toBeUndefined();
+    }
+  });
+
+  it("is idempotent across a second redaction pass", () => {
+    const first = redactBody({
+      note: "the landlord rejected my deposit refund 🙂",
+      amount: "1.234,56",
+      when: "2026-09-04T10:15:00Z was the date they replied",
+    });
+    const second = redactNetworkTextBody(first.body!, structured);
+
+    expect(second.body).toBe(first.body);
+  });
+
+  it("drops a forged example and keeps the shape beside it", () => {
+    const forged = {
+      $redacted: "[REDACTED]",
+      len: 19,
+      charset: "mixed",
+      hash8: "0123abcd",
+      words: 4,
+      example: "the quick brown fox",
+    };
+    const parsed = JSON.parse(
+      redactNetworkTextBody(JSON.stringify({ note: forged }), structured).body!,
+    ) as { note: Record<string, unknown> };
+
+    expect(parsed.note.example).toBeUndefined();
+    expect(parsed.note).toMatchObject({
+      $redacted: "[REDACTED]",
+      len: 19,
+      charset: "mixed",
+      hash8: "0123abcd",
+      words: 4,
+    });
+    // Not re-wrapped: the shape still describes the original value.
+    expect(parsed.note.$redacted).toBe("[REDACTED]");
+  });
+
+  it.each([
+    // A stand-in whose length disagrees with len.
+    { len: 19, example: "xxx" },
+    // A stand-in claiming no emoji under an emoji flag.
+    { len: 19, emoji: true, example: "xxx xxxxx xxxxx xxx" },
+    // A stand-in carrying non-ASCII with no nonAscii flag.
+    { len: 19, example: "xxx éxxxx xxxxx xxx" },
+  ])("drops a stand-in that disagrees with the shape (%o)", (overrides) => {
+    const parsed = JSON.parse(
+      redactNetworkTextBody(
+        JSON.stringify({
+          note: {
+            $redacted: "[REDACTED]",
+            charset: "mixed",
+            hash8: "0123abcd",
+            ...overrides,
+          },
+        }),
+        structured,
+      ).body!,
+    ) as { note: Record<string, unknown> };
+
+    expect(parsed.note.example).toBeUndefined();
+    expect(parsed.note.hash8).toBe("0123abcd");
+  });
+
+  it("never re-wraps a placeholder that carries separators", () => {
+    const first = redactBody({ amount: "1.234,56" });
+    const second = redactNetworkTextBody(first.body!, structured);
+    const parsed = JSON.parse(second.body!) as {
+      amount: Record<string, unknown>;
+    };
+
+    expect(parsed.amount.separators).toEqual([
+      { index: 1, char: "." },
+      { index: 5, char: "," },
+    ]);
+    expect(parsed.amount.len).toBe(8);
+  });
+});
+
+describe("shape string form", () => {
+  it("writes every field in grammar order", () => {
+    setRedactionKeepFields([]);
+    expect(
+      redactUrl(
+        `/s?q=${encodeURIComponent("  hello there\nsecond line 🙂 café  ")}`,
+      ).value,
+    ).toBe(
+      "/s?q=[REDACTED;len=35;charset=mixed;words=6;lines=2;edges=both;nonAscii;emoji]",
+    );
+    expect(redactUrl("/s?d=2026-09-04").value).toBe(
+      "/s?d=[REDACTED;len=10;charset=mixed;pattern=date]",
+    );
+  });
+
+  it("round trips: a marker is recognised and left alone on a second pass", () => {
+    setRedactionKeepFields([]);
+    const once = redactUrl(
+      `/s?q=${encodeURIComponent("  hello there\nsecond line 🙂 café  ")}&d=2026-09-04`,
+    ).value;
+
+    expect(redactUrl(once).value).toBe(once);
+  });
+
+  it("round trips through a percent-encoding serializer", () => {
+    const marker =
+      "[REDACTED;len=30;charset=mixed;words=5;edges=trailing;nonAscii;emoji;pattern=date]";
+    const encoded = new URLSearchParams({ q: marker }).toString();
+
+    expect(encoded).not.toContain(marker);
+    expect(unescapeRedactionMarker(encoded)).toBe(`q=${marker}`);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The floor is the default: only a classifier prose reason widens it   */
+/* ------------------------------------------------------------------ */
+
+const FLOOR_KEYS = [
+  "$redacted",
+  "len",
+  "charset",
+  "separators",
+  "hash8",
+  "casefoldHash8",
+];
+const DETAIL_KEYS = [
+  "words",
+  "lines",
+  "edges",
+  "nonAscii",
+  "emoji",
+  "pattern",
+  "example",
+];
+
+describe("richer shape is opt in by reason", () => {
+  const structured = {
+    contentType: "application/json",
+    mode: "structured" as const,
+  };
+  // Prose that would light up every field if the reason allowed it: multiple
+  // words, a trailing space, a non-ASCII letter, an emoji, and a date.
+  const LOUD = "2026-09-04 rejected my café refund 🙂 ";
+
+  const expectFloorOnly = (placeholder: Record<string, unknown>) => {
+    for (const key of DETAIL_KEYS) expect(placeholder[key]).toBeUndefined();
+    for (const key of Object.keys(placeholder))
+      expect(FLOOR_KEYS).toContain(key);
+    // The floor itself is still there.
+    expect(placeholder.$redacted).toBe("[REDACTED]");
+    expect(typeof placeholder.len).toBe("number");
+    expect(placeholder.charset).toBe("mixed");
+  };
+
+  it("gives no reason at all the floor", () => {
+    expect(redactedShapeDetailAllowed(undefined)).toBe(false);
+    const shape = computeRedactedShape(LOUD);
+    for (const key of DETAIL_KEYS)
+      expect(shape[key as keyof typeof shape]).toBeUndefined();
+    expect(shape.hash8).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it.each([
+    "input_value",
+    "sensitive_input_value",
+    "masked_input_type",
+    "deny_field",
+    "sensitive_container_number",
+    "sensitive_short_numeric_field",
+    "email_value",
+    "jwt_value",
+    "luhn_value",
+    "iban_value",
+    "token_like_value",
+    "high_entropy_value",
+    "unknown_value",
+  ])("gives %s the floor and nothing more", (reason) => {
+    expect(redactedShapeDetailAllowed(reason)).toBe(false);
+    const shape = computeRedactedShape(LOUD, reason);
+    for (const key of DETAIL_KEYS)
+      expect(shape[key as keyof typeof shape]).toBeUndefined();
+  });
+
+  it("a password JSON key gets the floor", () => {
+    const parsed = JSON.parse(
+      redactNetworkTextBody(
+        JSON.stringify({ password: LOUD, ssn: LOUD, dateOfBirth: LOUD }),
+        structured,
+      ).body!,
+    ) as Record<string, Record<string, unknown>>;
+
+    for (const key of Object.keys(parsed)) expectFloorOnly(parsed[key]);
+    // The narrowing this rule exists to stop.
+    expect(parsed.dateOfBirth.pattern).toBeUndefined();
+  });
+
+  it("a sensitive query name gets the floor", () => {
+    setRedactionKeepFields([]);
+    const value = redactUrl(
+      `/api?token=${encodeURIComponent(LOUD)}&ssn=${encodeURIComponent(LOUD)}`,
+    ).value;
+
+    expect(value).toContain("token=[REDACTED;len=38;charset=mixed]");
+    expect(value).toContain("ssn=[REDACTED;len=38;charset=mixed]");
+    for (const marker of [
+      ";words=",
+      ";lines=",
+      ";edges=",
+      ";nonAscii",
+      ";emoji",
+      ";pattern=",
+    ])
+      expect(value).not.toContain(marker);
+  });
+
+  it("a query value under an ordinary name still gets the richer shape", () => {
+    setRedactionKeepFields([]);
+    const value = redactUrl(`/api?note=${encodeURIComponent(LOUD)}`).value;
+
+    expect(value).toBe(
+      "/api?note=[REDACTED;len=38;charset=mixed;words=6;edges=trailing;nonAscii;emoji]",
+    );
+  });
+
+  it("free text in a body still gets every field", () => {
+    const parsed = JSON.parse(
+      redactNetworkTextBody(JSON.stringify({ note: LOUD }), structured).body!,
+    ) as { note: Record<string, unknown> };
+
+    expect(parsed.note).toMatchObject({
+      words: 6,
+      edges: "trailing",
+      nonAscii: true,
+      emoji: true,
+    });
+    expect(parsed.note.example).toBeDefined();
   });
 });

@@ -402,6 +402,87 @@ are redacted before an event enters the browser buffer. See
 `BROWSER_REDACTION_POLICY` and the `redact*` helpers if you want to inspect or
 tighten the policy.
 
+### What a shape placeholder says
+
+A redacted value in a JSON body is replaced by an object, and a redacted query
+value by a string. Both carry the same facts: enough structure to tell a one
+word entry from a pasted paragraph, and nothing recoverable.
+
+```json
+{
+  "$redacted": "[REDACTED]",
+  "len": 42,
+  "charset": "mixed",
+  "hash8": "527676bd",
+  "words": 7,
+  "nonAscii": true,
+  "emoji": true,
+  "example": "xxx xxxxxxxx xxxxxxxx xx xxxxxxx xxxxxx 🙂"
+}
+```
+
+| Field                    | Meaning                                                                  |
+| ------------------------ | ------------------------------------------------------------------------ |
+| `len`                    | length in UTF-16 code units                                              |
+| `charset`                | `alpha`, `num`, `alnum` or `mixed`                                       |
+| `separators`             | positions of `.`, `,` and spaces in numeric looking text                 |
+| `hash8`, `casefoldHash8` | session salted fingerprints, for equality only                           |
+| `words`                  | whitespace separated runs                                                |
+| `lines`                  | line breaks plus one, present only above one                             |
+| `edges`                  | `leading`, `trailing` or `both` when whitespace sits at an end           |
+| `nonAscii`               | any code point above 0x7F                                                |
+| `emoji`                  | any Extended_Pictographic code point                                     |
+| `pattern`                | `date`, `time`, `datetime`, `url`, `uuid`, `decimal` or `grouped_number` |
+| `example`                | a stand in, not the real value                                           |
+
+`hash8` is withheld when the candidate space is small enough to enumerate
+(numeric under 12 characters, or anything under 6), and `words`, `lines` and
+`example` are withheld with it.
+
+The last seven rows of that table are emitted only when the classifier redacted
+the value as ordinary prose, or for a query value whose parameter name is not
+sensitive. A value redacted for its **name** (`password`, `ssn`, a `denyFields`
+entry), for its input **type** (password, email, tel), by the `maskInputTypes`
+**policy**, or by the `captureInputValues` opt out reports `len`, `charset`,
+`separators` and the hashes, and nothing else. Those fields are safe on prose
+and are a narrowing on a credential: `pattern: "date"` under a `dob` name hands
+back most of what the redaction removed, and `edges`, `words` and `nonAscii`
+each cut a password's candidate space. The floor is the default, so a value
+whose reason is unknown gets the floor.
+
+`example` is built from a fixed alphabet: `X` for an uppercase ASCII letter,
+`x` for a lowercase one, `0` for a digit, `é` for a Latin letter with a
+diacritic, one fixed letter per other script, `🙂` for an emoji, whitespace and
+ASCII punctuation kept as they were, and `?` or `¤` for anything else. It is
+capped at 120 code units followed by an ellipsis, while `len` still reports the
+true length. It is emitted only for free prose, so it never stands in for a
+password, an email, a token, a card number, an IBAN, a high entropy string, a
+sensitive field name, or a masked input.
+
+The fixed alphabet is what makes the field checkable. Redaction runs twice, once
+in the SDK and again at the capture server, and the server never sees the
+original, so it validates `example` against the alphabet, against `len`, and
+against `charset`, `nonAscii` and `emoji`, and drops the field when they
+disagree. `isValidRedactedShapeExample` is exported if you want to run the same
+check yourself.
+
+The query string form spells the same fields out in one marker:
+
+```
+?note=[REDACTED;len=35;charset=mixed;words=6;lines=2;edges=both;nonAscii;emoji]
+?ssn=[REDACTED;len=35;charset=mixed]
+```
+
+A sensitive parameter name gets the floor, as it does everywhere else.
+
+`example` is deliberately absent from that form. A query string is the plane
+most likely to be re-serialized and pasted, and the stand in is the one field
+that keeps the original's punctuation positions.
+
+Input values keep the bare `[REDACTED]` token so every consumer that reads them
+as text still works. Their shape rides in the event's redaction metadata, on the
+`fields[]` entry for that input.
+
 ### Keeping a field the classifier would otherwise drop
 
 JSON request bodies go through a deny biased per value classifier: numbers and

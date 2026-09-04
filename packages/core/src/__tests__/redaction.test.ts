@@ -1216,3 +1216,123 @@ describe("captureInputValues opt-out", () => {
     expect(redactInputValue("250", { name: "maxPrice" }).value).toBe("250");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Input shape metadata                                                */
+/* ------------------------------------------------------------------ */
+
+describe("a redacted input carries its shape in metadata", () => {
+  afterEach(() => {
+    setRedactionKeepFields([]);
+    setCaptureInputValues(undefined);
+  });
+
+  const fieldOf = (...args: Parameters<typeof redactInputValue>) => {
+    const result = redactInputValue(...args);
+    expect(result.value).toBe(REDACTED_VALUE);
+    return result.metadata!.fields[0];
+  };
+
+  it("keeps the bare token in the value and puts the shape beside it", () => {
+    const value = "the landlord rejected my deposit refund";
+    const field = fieldOf(value, { name: "note" });
+
+    expect(field.reason).toBe("free_text_value");
+    expect(field.shape).toMatchObject({
+      len: value.length,
+      charset: "mixed",
+      words: 6,
+    });
+    expect(field.shape?.hash8).toMatch(/^[0-9a-f]{8}$/);
+    expect(field.shape?.example).toBe(
+      "xxx xxxxxxxx xxxxxxxx xx xxxxxxx xxxxxx",
+    );
+  });
+
+  it("reports lines, edges and emoji for a pasted block", () => {
+    const field = fieldOf("first line  \nsecond line 🙂 ", { name: "note" });
+
+    expect(field.shape).toMatchObject({
+      lines: 2,
+      edges: "trailing",
+      emoji: true,
+      nonAscii: true,
+    });
+  });
+
+  // The richer shape is a real narrowing on a credential: `pattern: "date"` on
+  // a value redacted under a `dob` name hands back most of what the redaction
+  // removed, and each of the others cuts a password's candidate space. So every
+  // name based, type based, policy based and opted out redaction keeps exactly
+  // the floor it had before these fields existed.
+  const expectFloorOnly = (field: ReturnType<typeof fieldOf>) => {
+    expect(field.shape?.words).toBeUndefined();
+    expect(field.shape?.lines).toBeUndefined();
+    expect(field.shape?.edges).toBeUndefined();
+    expect(field.shape?.nonAscii).toBeUndefined();
+    expect(field.shape?.emoji).toBeUndefined();
+    expect(field.shape?.pattern).toBeUndefined();
+    expect(field.shape?.example).toBeUndefined();
+    // The floor is still reported.
+    expect(field.shape?.len).toBeGreaterThan(0);
+    expect(field.shape?.charset).toBeDefined();
+  };
+
+  // Would light up every field if the reason allowed it.
+  const LOUD = "2026-09-04 rejected my café refund 🙂 ";
+
+  it("gives a password input the floor and nothing more", () => {
+    expectFloorOnly(fieldOf(LOUD, { name: "token", type: "password" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "contact", type: "email" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "contact", type: "tel" }));
+  });
+
+  it("gives a sensitive field name the floor and nothing more", () => {
+    expectFloorOnly(fieldOf(LOUD, { name: "ssn" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "dateOfBirth" }));
+  });
+
+  it("gives a masked input type the floor and nothing more", () => {
+    expectFloorOnly(fieldOf(LOUD, { name: "note", maskedByPolicy: true }));
+  });
+
+  // captureInputValues: false only ever removes. A new field on an opted out
+  // input would be the opt out handing back something it did not before.
+  it("gives an opted out input the floor and nothing more", () => {
+    setCaptureInputValues(false);
+    expectFloorOnly(fieldOf(LOUD, { name: "note" }));
+    expectFloorOnly(fieldOf(LOUD, { name: "anything" }));
+  });
+
+  it("withholds the stand-in for a value caught on its content", () => {
+    expect(
+      fieldOf("person@example.com", { name: "note" }).shape?.example,
+    ).toBeUndefined();
+    expect(
+      fieldOf("4111111111111111", { name: "note" }).shape?.example,
+    ).toBeUndefined();
+  });
+
+  it("still gives free prose every field", () => {
+    const field = fieldOf(LOUD, { name: "note" });
+
+    expect(field.reason).toBe("free_text_value");
+    expect(field.shape).toMatchObject({
+      words: 6,
+      edges: "trailing",
+      nonAscii: true,
+      emoji: true,
+    });
+    expect(field.shape?.example).toBeDefined();
+  });
+
+  it("withholds words, lines and the stand-in below the hash floor", () => {
+    const field = fieldOf("a b", { name: "note" });
+
+    expect(field.shape?.hash8).toBeUndefined();
+    expect(field.shape?.words).toBeUndefined();
+    expect(field.shape?.lines).toBeUndefined();
+    expect(field.shape?.example).toBeUndefined();
+    expect(field.shape?.len).toBe(3);
+  });
+});
