@@ -136,6 +136,29 @@ describe("environment collector", () => {
     expect(env[0].data.locale).toBe("en-GB");
   });
 
+  // Build.MODEL and its siblings are platform build properties: a rooted or
+  // emulated device can set them to anything. They are bounded, not redacted --
+  // naming the device is the whole point of the snapshot.
+  it("bounds device identifier strings without redacting them", async () => {
+    const { events, controller } = start({
+      Device: {
+        getInfo: async () => ({
+          model: "M".repeat(5000),
+          manufacturer: "Google",
+          operatingSystem: "android",
+          osVersion: "15",
+          webViewVersion: "129.0.6668.70",
+        }),
+      },
+    });
+    await controller.ready;
+
+    const device = events[0].data.device as Record<string, unknown>;
+    expect((device.model as string).length).toBe(128);
+    expect(device.manufacturer).toBe("Google");
+    expect(device.webViewVersion).toBe("129.0.6668.70");
+  });
+
   it("still emits a snapshot when every device call rejects", async () => {
     const { events, controller } = start({
       Device: {
@@ -225,6 +248,11 @@ describe("network collector", () => {
 });
 
 describe("deep link collector", () => {
+  // These two cases assert that a credential-free link survives redaction
+  // intact. They used to read as "the URL arrives verbatim", but their
+  // fixtures carry no query string, fragment or credentials, so `redactUrl`
+  // was always a no-op on them and they never covered the leak. They are kept
+  // as the no-op side of the contract; the cases below cover the other side.
   it("captures the cold-start launch URL, which no listener can see", async () => {
     const hub = listenerHub();
     const { events, controller } = start({
@@ -241,6 +269,7 @@ describe("deep link collector", () => {
       url: "demo://orders/42",
       kind: "cold-start",
     });
+    expect(nav[0].data.redaction).toBeUndefined();
   });
 
   it("captures links opened while the app is already running", async () => {
@@ -257,6 +286,107 @@ describe("deep link collector", () => {
       url: "demo://settings",
       source: "appUrlOpen",
     });
+  });
+
+  // A deep link is where OAuth callback codes, magic link tokens, password
+  // reset tokens, invite codes and session ids reach a mobile app. Redaction
+  // is delegated to core's shared `redactUrl`, so these assert that the
+  // collector calls it and reports what it did, not the engine's own rules.
+  it("redacts credentials out of a cold-start OAuth callback", async () => {
+    const hub = listenerHub();
+    const { events, controller } = start({
+      App: {
+        addListener: hub.addListener,
+        getLaunchUrl: async () => ({
+          url: "demo://auth/callback?code=4/0AY0e-g7abcdef&state=xyz",
+        }),
+      },
+    });
+    await controller.ready;
+
+    const nav = events.filter((e) => e.type === "navigation")[0];
+    const url = nav.data.url as string;
+    expect(url).not.toContain("4/0AY0e-g7abcdef");
+    expect(url).toContain("demo://auth/callback");
+    expect(nav.data.redaction).toMatchObject({
+      fields: expect.arrayContaining([
+        expect.objectContaining({ path: "url.query.code" }),
+      ]),
+    });
+  });
+
+  it("drops the fragment, where implicit-flow tokens ride", async () => {
+    const hub = listenerHub();
+    const { events, controller } = start({
+      App: { addListener: hub.addListener },
+    });
+    await controller.ready;
+
+    hub.fire("appUrlOpen", {
+      url: "https://app.example.com/magic#access_token=ya29.secret",
+    });
+
+    const nav = events.filter((e) => e.type === "navigation")[0];
+    expect(nav.data.url).toBe("https://app.example.com/magic");
+    expect(nav.data.redaction).toMatchObject({
+      fields: expect.arrayContaining([
+        expect.objectContaining({ path: "url.hash", action: "dropped" }),
+      ]),
+    });
+  });
+
+  it("strips credentials embedded in the deep link authority", async () => {
+    const hub = listenerHub();
+    const { events, controller } = start({
+      App: { addListener: hub.addListener },
+    });
+    await controller.ready;
+
+    hub.fire("appUrlOpen", { url: "demo://user:pass@host/path" });
+
+    const nav = events.filter((e) => e.type === "navigation")[0];
+    expect(nav.data.url).not.toContain("pass");
+    expect(nav.data.redaction).toMatchObject({
+      fields: expect.arrayContaining([
+        expect.objectContaining({ path: "url.credentials" }),
+      ]),
+    });
+  });
+
+  // The URL is handed to the app by the OS, so its length is chosen by whoever
+  // crafted the link. Without the bound one hostile link dominates the payload.
+  it("bounds an oversized link and says that it did", async () => {
+    const hub = listenerHub();
+    const { events, controller } = start({
+      App: { addListener: hub.addListener },
+    });
+    await controller.ready;
+
+    hub.fire("appUrlOpen", { url: `demo://x/${"a".repeat(9000)}` });
+
+    const nav = events.filter((e) => e.type === "navigation")[0];
+    expect((nav.data.url as string).length).toBeLessThanOrEqual(2048);
+    expect(nav.data.redaction).toMatchObject({
+      fields: expect.arrayContaining([
+        expect.objectContaining({
+          reason: "url_truncated",
+          action: "summarized",
+        }),
+      ]),
+    });
+  });
+
+  it("still records that a link opened when the OS supplies no URL", async () => {
+    const hub = listenerHub();
+    const { events, controller } = start({
+      App: { addListener: hub.addListener },
+    });
+    await controller.ready;
+
+    hub.fire("appUrlOpen", {});
+
+    const nav = events.filter((e) => e.type === "navigation")[0];
+    expect(nav.data).toMatchObject({ url: undefined, source: "appUrlOpen" });
   });
 
   it("records an OS-restored plugin result as a lifecycle event", async () => {

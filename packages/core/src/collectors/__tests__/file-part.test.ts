@@ -11,6 +11,7 @@ import {
   validateDeclaredMimeType,
 } from "../file-part";
 import { extractFileExtension } from "../../utils";
+import { isValidRedactedShapeExample } from "../../redaction";
 
 /** Builds a `File`-like object backed by real bytes, for `slice().arrayBuffer()` sniffing. */
 function fileFromBytes(
@@ -327,6 +328,35 @@ describe("describeFilePartSync", () => {
       type: "not a mime",
     });
     expect(description.declaredType).toBeUndefined();
+  });
+
+  it("describes a name with a stand-in that carries none of the stem", () => {
+    const name = "J\u00f6hn's r\u00e9sum\u00e9 (final).PDF";
+    const description = describeFilePartSync({ name, type: "application/pdf" });
+    expect(description.ext).toBe("pdf");
+    const shape = description.nameShape;
+    expect(shape).toBeDefined();
+    expect(shape?.len).toBe(name.length);
+    expect(shape?.nonAscii).toBe(true);
+    expect(shape?.words).toBe(3);
+    // The stand-in is the alphabet plus the name's own whitespace and ASCII
+    // punctuation, and it is the only field the stem reaches at all.
+    expect(shape?.example).toBe("X\u00e9xx'x x\u00e9xxx\u00e9 (xxxxx).XXX");
+    expect(isValidRedactedShapeExample(shape?.example, shape!)).toBe(true);
+    for (const stem of ["hn", "sum", "final", "John", "resume"]) {
+      expect(JSON.stringify(shape)).not.toContain(stem);
+    }
+  });
+
+  it("withholds the stand-in for a name too short to carry a hash", () => {
+    // computeRedactedShape omits hash8 below six characters, and words, lines
+    // and example are withheld with it.
+    const description = describeFilePartSync({ name: "a.txt" });
+    expect(description.ext).toBe("txt");
+    expect(description.nameShape?.len).toBe(5);
+    expect(description.nameShape?.hash8).toBeUndefined();
+    expect(description.nameShape?.example).toBeUndefined();
+    expect(description.nameShape?.words).toBeUndefined();
   });
 
   it("omits every field for a nameless, typeless file", () => {

@@ -440,8 +440,8 @@ word entry from a pasted paragraph, and nothing recoverable.
 `example` are withheld with it.
 
 The last seven rows of that table are emitted only when the classifier redacted
-the value as ordinary prose, or for a query value whose parameter name is not
-sensitive. A value redacted for its **name** (`password`, `ssn`, a `denyFields`
+the value as ordinary prose, for a query value whose parameter name is not
+sensitive, or for an upload's file name. A value redacted for its **name** (`password`, `ssn`, a `denyFields`
 entry), for its input **type** (password, email, tel), by the `maskInputTypes`
 **policy**, or by the `captureInputValues` opt out reports `len`, `charset`,
 `separators` and the hashes, and nothing else. Those fields are safe on prose
@@ -455,16 +455,32 @@ whose reason is unknown gets the floor.
 diacritic, one fixed letter per other script, `🙂` for an emoji, whitespace and
 ASCII punctuation kept as they were, and `?` or `¤` for anything else. It is
 capped at 120 code units followed by an ellipsis, while `len` still reports the
-true length. It is emitted only for free prose, so it never stands in for a
-password, an email, a token, a card number, an IBAN, a high entropy string, a
-sensitive field name, or a masked input.
+true length. It is emitted only for free prose and for an upload's file name, so
+it never stands in for a password, an email, a token, a card number, an IBAN, a
+high entropy string, a sensitive field name, or a masked input.
 
-The fixed alphabet is what makes the field checkable. Redaction runs twice, once
-in the SDK and again at the capture server, and the server never sees the
-original, so it validates `example` against the alphabet, against `len`, and
-against `charset`, `nonAscii` and `emoji`, and drops the field when they
-disagree. `isValidRedactedShapeExample` is exported if you want to run the same
-check yourself.
+A stand in carrying fewer than three letter or digit stand in characters is
+withheld, and the rest of the shape is emitted without it. On a value such as
+`<<>>--__..!!??` the alphabet does no work: whitespace and ASCII punctuation are
+kept as they were, so the field would be a verbatim copy of the value under a
+name that promises it is not. The SDK is where that floor is enforced, so the
+field never leaves the page below it.
+
+The count is over the stand in's own characters rather than the original value's,
+which is what lets a receiving server apply the identical rule. Two consequences
+follow. A digit outside ASCII has no digit character in the alphabet and is
+written as `¤`, so a value of Arabic-Indic digits carries no stand in. An astral
+letter is written as its representative repeated to keep the code unit width, so
+it counts twice.
+
+The fixed alphabet is what makes the field checkable without the original value,
+which matters because a server receiving a session never sees one.
+`isValidRedactedShapeExample` is exported for that: given an `example` and the
+shape it claims to describe, it checks the alphabet, the length against `len`,
+the floor of three letter or digit stand in characters, and agreement with
+`charset`, `nonAscii` and `emoji`, and reports whether they disagree. Run it on
+ingest if you want a forged or hand edited `example` dropped rather than
+trusted.
 
 The query string form spells the same fields out in one marker:
 
@@ -765,7 +781,9 @@ the lowercased tail of the file name after its last dot (never the stem), kept
 only when it is short and alphanumeric enough to be a type rather than free text.
 
 The rest of the file's description — `nameShape` (the same shape a redacted
-value gets, computed over the file name), `declaredType` (`file.type`, kept only
+value gets, computed over the file name, including the `example` stand in so a
+reader can tell `IMG_0042.jpg` from `Q3 board deck (final).pdf` without seeing
+either), `declaredType` (`file.type`, kept only
 when it matches a strict MIME grammar), and `sniffedType`/`width`/`height` (read
 from the file's own bytes: the first 32 bytes identify PNG, JPEG, GIF, WebP, PDF,
 ZIP, MP4, or plain text, and carry dimensions for PNG/GIF/WebP; a JPEG's
@@ -956,10 +974,23 @@ function Checkout({ crumbtrail }) {
 }
 ```
 
-Values are **redacted by default** using the same policy as the rest of the SDK,
+Values are **redacted by default** by the same engine the rest of the SDK uses,
 so a state field called `token` or `password` never leaves the browser in the
-clear. Pass `{ captureRawState: true }` as the fourth argument only when you are
+clear. The engine also classifies on the value, so an email address, a card
+number, a JWT or a high entropy secret is redacted even under a field name that
+reads as ordinary. A redacted value is replaced by a shape record carrying its
+length, character classes and a stable hash, so two different secrets stay
+distinguishable without either one leaving the browser. Snapshots are bounded:
+a cycle, a very deep graph, a very long list or a very wide object is replaced
+only where it broke the bound, and the rest of the snapshot is delivered.
+
+Pass `{ captureRawState: true }` as the fourth argument only when you are
 certain the value is safe.
+
+`CrumbtrailErrorBoundary` redacts the error message, the stack and the component
+stack as free text, which keeps every stack frame and substitutes only embedded
+secrets. Both the boundary and `useBugState` report what they removed as
+redaction metadata on the captured event.
 
 React 18 or newer. For React Native and Expo, use
 [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native)

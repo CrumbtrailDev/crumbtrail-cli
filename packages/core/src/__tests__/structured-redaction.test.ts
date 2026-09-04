@@ -1179,8 +1179,9 @@ describe("redactedShapeExampleAllowed", () => {
     "free_text_value",
   );
 
-  it("allows only the free prose reason", () => {
+  it("allows the free prose and file name reasons", () => {
     expect(redactedShapeExampleAllowed("free_text_value", withHash)).toBe(true);
+    expect(redactedShapeExampleAllowed("file_name_value", withHash)).toBe(true);
   });
 
   it.each([
@@ -1276,6 +1277,79 @@ describe("isValidRedactedShapeExample", () => {
     expect(isValidRedactedShapeExample(undefined, shape)).toBe(false);
     expect(isValidRedactedShapeExample(42, shape)).toBe(false);
     expect(isValidRedactedShapeExample("", shape)).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Punctuation-only stand-ins                                          */
+/* ------------------------------------------------------------------ */
+
+describe("the example letter floor", () => {
+  it("withholds the example from a value with no letters or digits", () => {
+    const shape = computeRedactedShape("<<>>--__..!!??", "free_text_value");
+    expect(shape.example).toBeUndefined();
+    // The rest of the shape still describes the value.
+    expect(shape.len).toBe("<<>>--__..!!??".length);
+    expect(shape.charset).toBe("mixed");
+    expect(shape.hash8).toBeDefined();
+    expect(shape.pattern).toBeUndefined();
+  });
+
+  it("holds the boundary at three letters or digits", () => {
+    // Same length either side, so only the letter count differs.
+    expect(
+      computeRedactedShape("ab-...-!!!", "free_text_value").example,
+    ).toBeUndefined();
+    expect(computeRedactedShape("abc...-!!!", "free_text_value").example).toBe(
+      "xxx...-!!!",
+    );
+  });
+
+  it("counts an astral letter twice, because its stand-in is doubled", () => {
+    // "\u{10400}" is two code units, so shapeExampleUnits writes "ə" twice to keep
+    // `len` comparable. Two dashes short of the floor either way pins which.
+    expect(
+      computeRedactedShape("\u{10400}-----", "free_text_value").example,
+    ).toBeUndefined();
+    expect(
+      computeRedactedShape("\u{10400}x----", "free_text_value").example,
+    ).toBe("\u0259\u0259x----");
+  });
+
+  it("counts digits and non-Latin letters toward the floor", () => {
+    expect(computeRedactedShape("(1-2-3).!", "free_text_value").example).toBe(
+      "(0-0-0).!",
+    );
+    expect(computeRedactedShape("(Мос-к).!!", "free_text_value").example).toBe(
+      "(ддд-д).!!",
+    );
+  });
+
+  it("does not count a non-ASCII digit, which has no digit stand-in", () => {
+    // Arabic-Indic digits are \p{N} but the alphabet writes them as ¤, so the
+    // stand-in shows nothing and is withheld rather than emitted unverifiable.
+    const shape = computeRedactedShape("٤٤٤-٤٤٤", "free_text_value");
+    expect(shape.example).toBeUndefined();
+    expect(shape.nonAscii).toBe(true);
+  });
+
+  it("rejects a server-side example below the floor", () => {
+    const value = "<<>>--__..!!??";
+    const shape = computeRedactedShape(value, "free_text_value");
+    expect(isValidRedactedShapeExample(value, shape)).toBe(false);
+    expect(isValidRedactedShapeExample("xx>>--__..!!??", shape)).toBe(false);
+    expect(isValidRedactedShapeExample("xxx>--__..!!??", shape)).toBe(true);
+  });
+
+  it("rejects a truncated example whose first 120 units are punctuation", () => {
+    const shape = computeRedactedShape("-".repeat(400), "free_text_value");
+    expect(shape.example).toBeUndefined();
+    expect(
+      isValidRedactedShapeExample(
+        "-".repeat(REDACTED_SHAPE_EXAMPLE_MAX_LENGTH) + "…",
+        shape,
+      ),
+    ).toBe(false);
   });
 });
 
@@ -1735,9 +1809,25 @@ describe("networkCollector structured redaction", () => {
     expect((req.d.redaction as { policy: string }).policy).toBe(
       BROWSER_REDACTION_POLICY,
     );
-    // v1 leaves a fully-clean body untouched with no redaction metadata.
+    // v1 leaves a fully-clean body untouched, and now says so: the capture is
+    // reported as inspected rather than as silence a reader cannot interpret.
     expect(res.d.body).toBe(JSON.stringify({ couponCode: "EXPIRED5" }));
-    expect(res.d.redaction).toBeUndefined();
+    const resRedaction = res.d.redaction as {
+      policy: string;
+      fields: unknown[];
+      summaries: Array<{ action: string; reason: string }>;
+    };
+    expect(resRedaction.policy).toBe(BROWSER_REDACTION_POLICY);
+    expect(resRedaction.fields).toEqual([]);
+    expect(resRedaction.summaries).toEqual([
+      {
+        kind: "json",
+        action: "inspected",
+        reason: "no_sensitive_fields",
+        originalLength: JSON.stringify({ couponCode: "EXPIRED5" }).length,
+        redactedFields: 0,
+      },
+    ]);
 
     cleanup();
   });

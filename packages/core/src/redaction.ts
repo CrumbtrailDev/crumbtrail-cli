@@ -9,6 +9,20 @@ export type BrowserRedactionPolicy =
   typeof BROWSER_REDACTION_POLICY | typeof BROWSER_REDACTION_POLICY_V2;
 
 /**
+ * The plane tag every server-side capture carries.
+ *
+ * The engine is shared, so a backend response body, a job result, a cache value
+ * and a sanitized route all ran through the same rules a browser body runs
+ * through. What differs is who produced the event, and that is what the tag
+ * states: a reader deciding whether a body may be retained needs to know it
+ * came off a server, and a policy id saying `browser` on a payload no browser
+ * ever saw is simply wrong. There is no `.v2` here because every backend body
+ * goes through the structured walker already.
+ */
+export const BACKEND_REDACTION_POLICY = "crumbtrail.backend-redaction.v1";
+export type BackendRedactionPolicy = typeof BACKEND_REDACTION_POLICY;
+
+/**
  * The plane tag every capture taken on a phone or tablet carries.
  *
  * The engine is shared, so a React Native fetch URL, an `ErrorUtils` stack and
@@ -27,7 +41,10 @@ export const MOBILE_REDACTION_POLICY = "crumbtrail.mobile-redaction.v1";
 export type MobileRedactionPolicy = typeof MOBILE_REDACTION_POLICY;
 
 /** Every policy tag {@link RedactionMetadata.policy} may carry, across planes. */
-export type RedactionPolicy = BrowserRedactionPolicy | MobileRedactionPolicy;
+export type RedactionPolicy =
+  | BrowserRedactionPolicy
+  | BackendRedactionPolicy
+  | MobileRedactionPolicy;
 export const REDACTED_VALUE = "[REDACTED]";
 export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
 
@@ -166,12 +183,44 @@ export function unescapeRedactionMarker(serialized: string): string {
   return withShapes.replace(ENCODED_REDACTED_VALUE_RE, REDACTED_VALUE);
 }
 
-export type RedactionAction = "redacted" | "dropped" | "summarized";
+/**
+ * What happened to a captured value or payload.
+ *
+ * `redacted`, `dropped` and `summarized` describe a change the engine made.
+ * The last two describe outcomes that were previously written as silence, and
+ * silence read as "nobody looked":
+ *
+ * - `inspected` — the engine walked the payload and removed nothing. A clean
+ *   capture is a fact worth stating, not a downgrade; without it a body that
+ *   passed every rule is indistinguishable from one no rule ever ran on.
+ * - `absent` — there was no payload to capture, as distinct from one we chose
+ *   not to capture (`dropped`) or failed to read (`dropped`, with a reason
+ *   naming the failure).
+ *
+ * Both are payload-level outcomes. A {@link RedactionField} carries them only
+ * on the synthetic entry that stands for the payload as a whole.
+ */
+export type RedactionAction =
+  | "redacted"
+  | "dropped"
+  | "summarized"
+  | "inspected"
+  | "absent";
 
 export interface RedactionField {
   path: string;
   reason: string;
   action: RedactionAction;
+  /**
+   * The bound that fired, for a field written by a structural limit.
+   *
+   * Present only alongside {@link RedactionField.observed}. Without the pair a
+   * reader knows a list was shortened but not by how much, which is the one
+   * question a shortened list raises.
+   */
+  limit?: number;
+  /** How many entries, keys or characters were actually there. */
+  observed?: number;
   /**
    * Shape facts about the value this field replaced.
    *
@@ -728,11 +777,18 @@ export function mergeRedactionMetadata(
   const fields: RedactionField[] = [];
   const summaries: PayloadSummary[] = [];
 
-  let policy: BrowserRedactionPolicy = BROWSER_REDACTION_POLICY;
+  // The plane wins over the browser version: a merge that mixes a backend body
+  // with a backend route sanitizer must not report itself as browser output.
+  let policy: RedactionPolicy = BROWSER_REDACTION_POLICY;
   const keep = new Set<string>();
   for (const item of items) {
     if (!item) continue;
-    if (item.policy === BROWSER_REDACTION_POLICY_V2)
+    if (item.policy === BACKEND_REDACTION_POLICY)
+      policy = BACKEND_REDACTION_POLICY;
+    else if (
+      item.policy === BROWSER_REDACTION_POLICY_V2 &&
+      policy !== BACKEND_REDACTION_POLICY
+    )
       policy = BROWSER_REDACTION_POLICY_V2;
     fields.push(...item.fields);
     if (item.summaries) summaries.push(...item.summaries);
@@ -756,6 +812,22 @@ export function attachRedactionMetadata(
 ): void {
   const metadata = mergeRedactionMetadata(...items);
   if (metadata) target.redaction = metadata;
+}
+
+/**
+ * Restamp already-produced metadata with the plane that produced it.
+ *
+ * The engine has no idea which runtime called it, so every helper stamps the
+ * browser tag and the caller that knows better corrects it here. Cheaper and
+ * far less error prone than threading a policy argument through every one of
+ * the module's redaction entry points.
+ */
+export function withRedactionPolicy(
+  metadata: RedactionMetadata | undefined,
+  policy: RedactionPolicy,
+): RedactionMetadata | undefined {
+  if (!metadata || metadata.policy === policy) return metadata;
+  return { ...metadata, policy };
 }
 
 function withMetadata<T>(
@@ -2876,14 +2948,20 @@ function redactedShapeEdges(text: string): RedactedShapeEdges | undefined {
  * validated credential and personal pattern was tested first and failed.
  * `url_query_value` is the query catch-all, and its call site passes it only
  * when the parameter name is not sensitive, because that path does not classify
- * the value itself.
+ * the value itself. `file_name_value` is an upload's file name, which a person
+ * typed or a program generated and which the reader needs the structure of to
+ * tell `IMG_0042.jpg` from `Q3 board deck (final).pdf`.
  *
  * The value-based credential reasons are deliberately absent. `email_value`,
  * `jwt_value`, `luhn_value`, `iban_value`, `token_like_value` and
  * `high_entropy_value` each name a format, so anything further narrows a value
  * the classifier already judged secret.
  */
-const SHAPE_DETAIL_REASONS = new Set(["free_text_value", "url_query_value"]);
+const SHAPE_DETAIL_REASONS = new Set([
+  "free_text_value",
+  "url_query_value",
+  "file_name_value",
+]);
 
 /** May a value redacted for this reason carry more than the floor? */
 export function redactedShapeDetailAllowed(
@@ -2903,10 +2981,21 @@ export function redactedShapeDetailAllowed(
  * asking for nothing at all. A punctuation-preserving stand-in for a value of
  * any of those kinds narrows it further, and the whole point of the field is
  * that it must not.
+ *
+ * `file_name_value` is here and `url_query_value` is not, because a file name
+ * is the one place where the stand-in is the whole point: the name's stem never
+ * reaches any other field, so `Xxxxx xxxx xxxx (xxxxx).xxx` is all a reader
+ * ever gets of it. A query value already spells its shape into a marker string
+ * that carries no example.
  */
-const SHAPE_EXAMPLE_REASONS = new Set(["free_text_value"]);
+const SHAPE_EXAMPLE_REASONS = new Set(["free_text_value", "file_name_value"]);
 
-/** May a value redacted for this reason carry an `example`? */
+/**
+ * May a value redacted for this reason carry an `example`?
+ *
+ * The reason and the hash are the whole of this gate. The second gate is on the
+ * stand-in itself: see {@link redactedShapeExampleCarriesLetters}.
+ */
 export function redactedShapeExampleAllowed(
   reason: string | undefined,
   shape: RedactedValueShape,
@@ -2977,8 +3066,10 @@ export function computeRedactedShape(
   if (hasNonAscii(text)) shape.nonAscii = true;
   if (SHAPE_EMOJI_RE.test(text)) shape.emoji = true;
   if (pattern !== undefined) shape.pattern = pattern;
-  if (redactedShapeExampleAllowed(reason, shape))
-    shape.example = redactedShapeExample(text);
+  if (redactedShapeExampleAllowed(reason, shape)) {
+    const example = redactedShapeExample(text);
+    if (redactedShapeExampleCarriesLetters(example)) shape.example = example;
+  }
   return shape;
 }
 
@@ -3029,6 +3120,56 @@ const SHAPE_EXAMPLE_ALPHABET = new Set<string>([
   SHAPE_EXAMPLE_OTHER_LETTER,
   ...SHAPE_EXAMPLE_SCRIPT_LETTERS.map(([, letter]) => letter),
 ]);
+
+/**
+ * The subset of the alphabet that stands for a letter or a digit, as opposed to
+ * whitespace, punctuation, an emoji, or the two catch-alls. Every `\p{L}` code
+ * point and every ASCII digit maps into this set; a non-ASCII digit does not,
+ * because the alphabet has no digit representative outside ASCII and writes it
+ * as `¤`.
+ */
+const SHAPE_EXAMPLE_LETTER_ALPHABET = new Set<string>([
+  "X",
+  "x",
+  "0",
+  SHAPE_EXAMPLE_OTHER_LETTER,
+  ...SHAPE_EXAMPLE_SCRIPT_LETTERS.map(([, letter]) => letter),
+]);
+
+/**
+ * How many letter or digit stand-in characters an example must carry before it
+ * is worth emitting.
+ */
+export const REDACTED_SHAPE_EXAMPLE_MIN_LETTERS = 3;
+
+/**
+ * Does this stand-in show enough of a value to be worth its residual?
+ *
+ * The stand-in's letters and digits are what make it a shape; its whitespace and
+ * ASCII punctuation are kept verbatim and are the one thing a lying client can
+ * write freely. On `<<>>--__..!!??` the two cancel out: every character is
+ * carried through unchanged, so the field is a verbatim copy of the value under
+ * a name that promises it is not. Below three letter or digit stand-in
+ * characters the stand-in is withheld and the rest of the shape still describes
+ * the value.
+ *
+ * The count is over the stand-in's own characters rather than over the original
+ * value's, so that this gate and {@link isValidRedactedShapeExample} can never
+ * disagree: a receiving server has only the stand-in, and for a long value only
+ * its first 120 code units. Two consequences follow from counting there. A digit
+ * outside ASCII has no representative in the alphabet and is written as `¤`, so
+ * it does not count. An astral letter is written as its representative repeated
+ * to preserve code unit width, so it counts twice.
+ */
+export function redactedShapeExampleCarriesLetters(example: string): boolean {
+  let letters = 0;
+  for (const codePoint of example) {
+    if (!SHAPE_EXAMPLE_LETTER_ALPHABET.has(codePoint)) continue;
+    letters += 1;
+    if (letters >= REDACTED_SHAPE_EXAMPLE_MIN_LETTERS) return true;
+  }
+  return false;
+}
 
 function shapeExampleReplacement(codePoint: string): string {
   if (codePoint.length === 1 && codePoint.charCodeAt(0) < 0x80) {
@@ -3109,8 +3250,9 @@ function isShapeExampleCharacter(codePoint: string): boolean {
  *
  * The capture server regenerates nothing — it never sees the original — so this
  * is what stands between a lying client and a value smuggled through in a field
- * that reads as harmless. It checks the alphabet, the length against `len`, and
- * agreement with `charset`, `nonAscii` and `emoji`. A truncated example is held
+ * that reads as harmless. It checks the alphabet, the length against `len`, the
+ * floor of {@link redactedShapeExampleCarriesLetters}, and agreement with
+ * `charset`, `nonAscii` and `emoji`. A truncated example is held
  * to the one-directional half of the flag checks, because the flags describe the
  * whole value and the example only its first 120 code units.
  */
@@ -3150,6 +3292,7 @@ export function isValidRedactedShapeExample(
     if (!sawEmoji && shape.emoji === true) return false;
     if (!sawNonAscii && shape.nonAscii === true) return false;
   }
+  if (!redactedShapeExampleCarriesLetters(body)) return false;
   if (shape.charset === "alpha") return /^[Xx]*$/.test(body);
   if (shape.charset === "num") return /^0*$/.test(body);
   if (shape.charset === "alnum") return /^[Xx0]*$/.test(body);
@@ -3278,6 +3421,16 @@ export function classifyStructuredValue(
   if (value === null || typeof value === "boolean") return { action: "keep" };
   if (typeof value !== "string")
     return { action: "redact", reason: "unknown_value" };
+  // An engine marker, not a captured value. The bounded walker writes
+  // `[OMITTED:depth]` where it stopped descending, so the string names an
+  // ABSENCE: nothing was ever read at that position, and nothing was judged
+  // sensitive there. Classifying it as free text made the second pass — the
+  // capture server's re-classification, or any consumer calling this directly —
+  // wrap it in a value shape, so the stored payload reported a 15 character
+  // mixed-charset string with a hash and an example for a value that never
+  // existed. Placed after the deny-name check above, so a hostile client that
+  // posts the literal under `ssn` is still refused the exemption.
+  if (value === OMITTED_DEPTH_VALUE) return { action: "keep" };
   if (STRUCTURED_EMAIL_RE.test(value))
     return { action: "redact", reason: "email_value" };
   if (STRUCTURED_JWT_RE.test(value))
@@ -4115,6 +4268,11 @@ function redactStructuredStringValue(
   policy: StructuredFieldPolicy,
   fields: RedactionField[],
 ): unknown {
+  // The walker's own marker, returned verbatim. It has to be recognised here as
+  // well as in the classifier because `OMITTED:depth` reads as a scheme to the
+  // URL pass below, which rewrote the marker to `[REDACTED]` before any
+  // classification ran.
+  if (value === OMITTED_DEPTH_VALUE) return value;
   const urlOptions: UrlRedactionOptions = {
     ignoreKeepFields: true,
     allowOnlyHttpSchemes: true,
@@ -4150,6 +4308,57 @@ function maskUrlsForClassification(value: string): string {
   return masked;
 }
 
+/* ------------------------------------------------------------------ */
+/* Structural bounds on the structured body walker                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How deep the structured walker descends before it stops.
+ *
+ * The value it walks arrived off the network, so its shape is chosen by
+ * whoever sent it. Fifty kilobytes of `[[[[…]]]]` is twenty five thousand
+ * levels, and the walker recursed with nothing to stop it. Every bound below
+ * replaces or shortens only the part that broke it: a body is never rejected
+ * whole for one long array, because a debugger that discards a safe payload
+ * over one oversized field is worse than one that shows nothing at all.
+ *
+ * Hand written API shapes bottom out around ten levels; the deepest structure
+ * in this repository's own fixtures is well under that. Twenty four leaves
+ * generous headroom for a nested GraphQL response while keeping the walker's
+ * stack shallow.
+ */
+export const STRUCTURED_BODY_MAX_DEPTH = 24;
+
+/**
+ * How many array entries the walker keeps.
+ *
+ * Sized above any table that fits in a captured body: at the 50 KiB default
+ * body cap, five hundred entries carrying real fields is already past the cap,
+ * so this fires on synthetic breadth rather than on a customer's result set.
+ * The reported page of forty one rows that motivated this work is nowhere near
+ * it.
+ */
+export const STRUCTURED_BODY_MAX_ARRAY_ENTRIES = 500;
+
+/** How many own keys the walker keeps on one object. Sized like the array cap. */
+export const STRUCTURED_BODY_MAX_OBJECT_KEYS = 500;
+
+/**
+ * Longest JSON key kept verbatim.
+ *
+ * `sanitizeKeyName` only replaces a key that reads as a credential, so a
+ * kilobyte of key name passed through untouched and was carried by every
+ * field path built from it. Matches the probe key bound.
+ */
+export const STRUCTURED_BODY_MAX_KEY_LENGTH = 128;
+
+/** Stands in for a subtree the walker stopped at. Not a redaction: nothing here was judged sensitive. */
+export const OMITTED_DEPTH_VALUE = "[OMITTED:depth]";
+
+function isStructuredContainer(value: unknown): boolean {
+  return Array.isArray(value) || (value !== null && typeof value === "object");
+}
+
 function redactStructuredJsonValue(
   value: unknown,
   path: string,
@@ -4157,7 +4366,21 @@ function redactStructuredJsonValue(
   fields: RedactionField[],
   keyName?: string,
   inheritedContainer?: StructuredContainerContext,
+  depth = 0,
 ): unknown {
+  // Structural bound, checked before anything else so a hostile shape cannot
+  // reach the classifier at all. Only containers are replaced: a scalar sitting
+  // at the limit is a safe operand and keeping it costs nothing.
+  if (depth >= STRUCTURED_BODY_MAX_DEPTH && isStructuredContainer(value)) {
+    fields.push({
+      path,
+      reason: "structure_depth_exceeded",
+      action: "summarized",
+      limit: STRUCTURED_BODY_MAX_DEPTH,
+      observed: depth,
+    });
+    return OMITTED_DEPTH_VALUE;
+  }
   // Already redacted by an earlier pass. Re-wrapping it would replace the
   // original value's shape facts with the placeholder's own. An `example` that
   // does not match the shape beside it is dropped here: this pass is the one
@@ -4199,7 +4422,23 @@ function redactStructuredJsonValue(
   if (Array.isArray(value)) {
     // The array's own name carries through to its entries: a kept `tags` is a
     // kept list of tags, not a kept container of anonymous free text.
-    return value.map((entry, index) =>
+    const overLength = value.length > STRUCTURED_BODY_MAX_ARRAY_ENTRIES;
+    if (overLength) {
+      fields.push({
+        path,
+        reason: "array_length_exceeded",
+        action: "summarized",
+        limit: STRUCTURED_BODY_MAX_ARRAY_ENTRIES,
+        observed: value.length,
+      });
+    }
+    const kept = overLength
+      ? value.slice(0, STRUCTURED_BODY_MAX_ARRAY_ENTRIES)
+      : value;
+    // The tail is dropped rather than marked: appending a stand-in would put a
+    // string in a list of rows, and every reader that maps over the list would
+    // then have to know about it. The field above carries the count instead.
+    return kept.map((entry, index) =>
       redactStructuredJsonValue(
         entry,
         `${path}[${index}]`,
@@ -4207,15 +4446,44 @@ function redactStructuredJsonValue(
         fields,
         keyName,
         container,
+        depth + 1,
       ),
     );
   }
 
   if (value !== null && typeof value === "object") {
     const output: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(
-      value as Record<string, unknown>,
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length > STRUCTURED_BODY_MAX_OBJECT_KEYS) {
+      fields.push({
+        path,
+        reason: "object_keys_exceeded",
+        action: "summarized",
+        limit: STRUCTURED_BODY_MAX_OBJECT_KEYS,
+        observed: entries.length,
+      });
+    }
+    for (const [rawKey, entry] of entries.slice(
+      0,
+      STRUCTURED_BODY_MAX_OBJECT_KEYS,
     )) {
+      let key = rawKey;
+      if (key.length > STRUCTURED_BODY_MAX_KEY_LENGTH) {
+        // A key this long is a value wearing a key's clothes. Truncating can
+        // collide with a sibling, so the output name is disambiguated the same
+        // way a redacted storage key is.
+        key = uniqueOutputKey(
+          `${key.slice(0, STRUCTURED_BODY_MAX_KEY_LENGTH)}…`,
+          output,
+        );
+        fields.push({
+          path: `${path}.${key}`,
+          reason: "json_key_too_long",
+          action: "summarized",
+          limit: STRUCTURED_BODY_MAX_KEY_LENGTH,
+          observed: rawKey.length,
+        });
+      }
       const safeKey = sanitizeKeyName(key);
       if (safeKey !== key) {
         fields.push({
@@ -4241,6 +4509,7 @@ function redactStructuredJsonValue(
           fields,
           normalizeFieldName(key),
           container,
+          depth + 1,
         ),
         writable: true,
       });
@@ -4270,10 +4539,13 @@ function redactStructuredJsonBody(
   const parsed = JSON.parse(body) as unknown;
   const fields: RedactionField[] = [];
   const value = redactStructuredJsonValue(parsed, path, policy, fields);
+  // A clean walk says so. `summarized` used to stand in for "nothing was
+  // removed", which reads as a downgrade and is indistinguishable from a body
+  // that was shortened.
   const summary = buildSummary(
     "json",
-    fields.length > 0 ? "redacted" : "summarized",
-    "structured_redaction",
+    fields.length > 0 ? "redacted" : "inspected",
+    fields.length > 0 ? "structured_redaction" : "no_sensitive_fields",
     body.length,
     undefined,
     fields.length,
@@ -4339,7 +4611,27 @@ export function redactNetworkTextBody(
     try {
       const parsed = JSON.parse(body) as unknown;
       const result = redactJsonValue(parsed, path);
-      if (result.fields.length === 0) return { body };
+      if (result.fields.length === 0) {
+        // Inspected and clean. Returning a bare body here left the capture
+        // indistinguishable from one nothing ever looked at.
+        const cleanSummary = buildSummary(
+          "json",
+          "inspected",
+          "no_sensitive_fields",
+          body.length,
+          undefined,
+          0,
+        );
+        return {
+          body,
+          bodySummary: cleanSummary,
+          metadata: {
+            policy: BROWSER_REDACTION_POLICY,
+            fields: [],
+            summaries: [cleanSummary],
+          },
+        };
+      }
 
       const summary = buildSummary(
         "json",
@@ -4457,17 +4749,26 @@ export function summarizeBinaryPayload(
   };
 }
 
+/**
+ * Say why a payload is not in the capture.
+ *
+ * `no_body` is the one case that is not a loss: the exchange carried no body at
+ * all. It is reported as `absent` rather than `dropped` so a reader can tell
+ * "there was nothing here" from "there was something and we did not keep it".
+ */
 export function summarizeOmittedPayload(
-  reason: "stream_payload" | "body_read_failed" | "non_text_request_body",
+  reason:
+    | "stream_payload"
+    | "body_read_failed"
+    | "non_text_request_body"
+    | "no_body",
   path = "body",
 ): BodyRedactionResult {
   const kind: PayloadSummary["kind"] =
     reason === "stream_payload" ? "stream" : "unknown";
-  const summary = buildSummary(kind, "dropped", reason);
-  const metadata = metadataFromField(
-    { path, reason, action: "dropped" },
-    summary,
-  );
+  const action: RedactionAction = reason === "no_body" ? "absent" : "dropped";
+  const summary = buildSummary(kind, action, reason);
+  const metadata = metadataFromField({ path, reason, action }, summary);
   return { bodySummary: summary, metadata };
 }
 

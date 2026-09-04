@@ -5,6 +5,11 @@ import {
   safeStatusCode,
   type ResponseRecorder,
 } from "./backend-response";
+import {
+  attachRequestBodyRecorder,
+  readRequestBodyEvidence,
+  type RequestBodyRecorder,
+} from "./backend-request-body";
 import { claimBackendRequest } from "./backend-request-claim";
 import { getProcessSessionId } from "./process-session";
 import {
@@ -52,6 +57,8 @@ export interface CrumbtrailExpressRequest {
   path?: string;
   route?: string | { path?: unknown };
   headers?: BackendRequestHeaders;
+  /** A body parser's output, when one ran. Read only, and only as a fallback. */
+  body?: unknown;
 }
 
 export interface CrumbtrailExpressResponse {
@@ -152,6 +159,23 @@ export interface CrumbtrailExpressOptions {
   callsiteRoot?: string;
   /** Cap on captured response bytes. Beyond it the body is truncated and marked. */
   responseBodyMaxBytes?: number;
+  /**
+   * Whether to record the request body on `backend.req.end`.
+   *
+   * **Defaults to `"off"`**, unlike `captureResponseBody`. A request body is
+   * written by whoever called the endpoint, and on the endpoints most worth
+   * debugging it carries the credential itself, so turning it on is the
+   * operator's decision rather than a default. `"error"` records it for 4xx and
+   * 5xx, `"all"` for every request.
+   *
+   * Mount the middleware BEFORE the body parser to record what actually
+   * arrived. Mounted after one, the stream is already consumed and the parser's
+   * own `req.body` is read instead, which is the same content seen through the
+   * parser. Neither path reads the application's stream.
+   */
+  captureRequestBody?: "off" | "error" | "all";
+  /** Cap on captured request bytes. Beyond it the body is truncated and marked. */
+  requestBodyMaxBytes?: number;
   /**
    * Response headers to record, lowercase. Replaces the default allowlist
    * rather than extending it, so a caller can never widen it by accident.
@@ -374,18 +398,22 @@ function attachFinishListener(
   if (typeof res.once !== "function") return;
 
   const recorder = attachResponseRecorder(res, options);
+  // Attached here, before `next()` hands the request to the rest of the chain,
+  // so a body parser mounted after this middleware pushes through the shadowed
+  // `push` and the raw bytes are observed. Nothing is read off the stream.
+  const requestRecorder = attachRequestBodyRecorder(req, options);
 
   res.once("finish", () => {
     if (state.settled) return;
     state.settled = true;
-    emitRequestEnd(req, res, options, state, recorder);
+    emitRequestEnd(req, res, options, state, recorder, requestRecorder);
   });
 
   res.once("close", () => {
     if (state.settled) return;
     state.settled = true;
     if (res.writableEnded) {
-      emitRequestEnd(req, res, options, state, recorder);
+      emitRequestEnd(req, res, options, state, recorder, requestRecorder);
       return;
     }
     emitRequestGap(options, state, "request_unterminated");
@@ -398,6 +426,7 @@ function emitRequestEnd(
   options: CrumbtrailExpressOptions,
   state: RequestState,
   recorder: ResponseRecorder | undefined,
+  requestRecorder: RequestBodyRecorder | undefined,
 ): void {
   const now = readNow(options);
   const endEvent = buildBackendRequestEndEvent({
@@ -406,6 +435,7 @@ function emitRequestEnd(
     statusCode: safeStatusCode(res.statusCode),
     durationMs: now - state.startedAtMs,
     ...readResponseEvidence(res, recorder, options),
+    ...readRequestBodyEvidence(req, res, requestRecorder, options),
   });
 
   attemptSend(endEvent, options, state.sessionId, (delivered) => {

@@ -14,6 +14,12 @@ import {
   type BackendResponseLike,
   type ResponseRecorder,
 } from "./backend-response";
+import {
+  attachRequestBodyRecorder,
+  readRequestBodyEvidence,
+  type BackendRequestBodyCaptureOptions,
+  type RequestBodyRecorder,
+} from "./backend-request-body";
 import { isBackendRequestClaimed } from "./backend-request-claim";
 import { getProcessSessionId } from "./process-session";
 import {
@@ -72,6 +78,8 @@ type ServerRequestLike = {
   method?: string;
   url?: string;
   headers?: BackendRequestHeaders;
+  /** Present only when a framework parsed the body onto the request. */
+  body?: unknown;
 };
 
 export interface HttpRequestCaptureOptions {
@@ -91,6 +99,14 @@ export interface HttpRequestCaptureOptions {
   maxRequests?: number;
   /** Response body/header capture policy, identical to the Express middleware's. */
   response?: BackendResponseCaptureOptions;
+  /**
+   * Request body capture policy, identical to the Express middleware's and off
+   * by default. There is no body parser on this path, so the raw stream is the
+   * only source: the request's `push` is shadowed to observe the bytes the HTTP
+   * parser delivers, and nothing is ever read off the stream the application
+   * owns.
+   */
+  request?: BackendRequestBodyCaptureOptions;
 }
 
 export interface HttpRequestCaptureHandle {
@@ -189,6 +205,7 @@ export function installHttpRequestCapture(
   const now = options.now ?? Date.now;
   const budget = options.maxRequests ?? DEFAULT_MAX_REQUESTS;
   const responseOptions = options.response ?? {};
+  const requestOptions = options.request ?? {};
 
   const prototypes: object[] = [];
   // `https.Server` does NOT inherit from `http.Server` (it descends from
@@ -250,6 +267,10 @@ export function installHttpRequestCapture(
 
     captured += 1;
     const recorder = attachResponseRecorder(res, responseOptions);
+    // Attached inside the "request" emit, before the host's own listeners run,
+    // so the shadowed `push` is in place before the first byte of the body is
+    // delivered to the readable.
+    const requestRecorder = attachRequestBodyRecorder(req, requestOptions);
     if (typeof res.once !== "function") return;
 
     let settled = false;
@@ -261,7 +282,7 @@ export function installHttpRequestCapture(
       // would duplicate the whole request.
       if (isBackendRequestClaimed(req)) return;
       if (completed) {
-        emitPair(req, res, recorder);
+        emitPair(req, res, recorder, requestRecorder);
         return;
       }
       // The peer cut the response short, so there is no status to report. The
@@ -288,6 +309,7 @@ export function installHttpRequestCapture(
       request: ServerRequestLike,
       response: BackendResponseLike,
       responseRecorder: ResponseRecorder | undefined,
+      bodyRecorder: RequestBodyRecorder | undefined,
     ): void => {
       const endedAtMs = readNow(now);
       const endEvent = buildBackendRequestEndEvent({
@@ -305,6 +327,12 @@ export function installHttpRequestCapture(
         statusCode: safeStatusCode(response.statusCode),
         durationMs: endedAtMs - startedAtMs,
         ...readResponseEvidence(response, responseRecorder, responseOptions),
+        ...readRequestBodyEvidence(
+          request,
+          response,
+          bodyRecorder,
+          requestOptions,
+        ),
       });
       safeEmit(options.emit, startEvent);
       safeEmit(options.emit, endEvent);

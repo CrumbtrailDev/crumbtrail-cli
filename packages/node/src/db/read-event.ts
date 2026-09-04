@@ -1,7 +1,6 @@
 import {
   DB_READ_BULK_EVENT_KIND,
   DB_READ_EVENT_KIND,
-  mergeRedactionMetadata,
   type BugEvent,
   type DbConnectionIdentity,
   type DbEngine,
@@ -9,6 +8,7 @@ import {
   type DbReadEventData,
 } from "crumbtrail-core";
 import type { DbCallsite } from "./callsite";
+import { backendRedactionMetadata } from "../redaction-plane";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { boundColumnRow, type DbValueBounds } from "./diff-event";
 import {
@@ -136,7 +136,7 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
       d.serviceCompatibility = readRaceServiceCompatibility(input.raceEvidence);
     }
   }
-  const redaction = mergeRedactionMetadata(row.metadata, pk.metadata);
+  const redaction = backendRedactionMetadata(row.metadata, pk.metadata);
   if (redaction) d.redaction = redaction;
 
   const event: BugEvent = {

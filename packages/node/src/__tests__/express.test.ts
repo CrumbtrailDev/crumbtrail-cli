@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { BugEvent } from "crumbtrail-core";
 import {
-  BROWSER_REDACTION_POLICY,
+  BACKEND_REDACTION_POLICY,
   CAPTURE_GAP_EVENT_KIND,
 } from "crumbtrail-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -524,7 +524,7 @@ describe("Crumbtrail Express-compatible middleware", () => {
         "&access_token=[REDACTED;len=12;charset=mixed]",
     );
     expect(start.d.redaction).toMatchObject({
-      policy: BROWSER_REDACTION_POLICY,
+      policy: BACKEND_REDACTION_POLICY,
       fields: expect.arrayContaining([
         expect.objectContaining({ path: "url.query.q", action: "redacted" }),
         expect.objectContaining({
