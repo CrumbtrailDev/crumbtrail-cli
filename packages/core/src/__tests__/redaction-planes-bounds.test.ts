@@ -13,6 +13,7 @@ import {
   summarizeOmittedPayload,
   withRedactionPolicy,
   type RedactionField,
+  type RedactionMetadata,
 } from "../index";
 
 function structured(body: string) {
@@ -48,10 +49,10 @@ describe("backend redaction plane (D1)", () => {
   });
 
   it("returns the same object when the policy already matches", () => {
-    const metadata = {
+    const metadata: RedactionMetadata = {
       policy: BACKEND_REDACTION_POLICY,
       fields: [],
-    } as const;
+    };
     expect(withRedactionPolicy(metadata, BACKEND_REDACTION_POLICY)).toBe(
       metadata,
     );
