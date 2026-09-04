@@ -1,4 +1,14 @@
-import type { Crumbtrail, CrumbtrailPlatform } from "crumbtrail-core";
+import {
+  BROWSER_REDACTION_POLICY,
+  attachRedactionMetadata,
+  mergeRedactionMetadata,
+  redactUrl,
+} from "crumbtrail-core";
+import type {
+  Crumbtrail,
+  CrumbtrailPlatform,
+  RedactionMetadata,
+} from "crumbtrail-core";
 import type { CapacitorCapabilities } from "./capabilities";
 import type {
   CapacitorAppPluginLike,
@@ -54,7 +64,77 @@ const DEFAULT_COLLECTORS: Record<CapacitorCollectorName, boolean> = {
 
 const SDK_NAME = "crumbtrail-capacitor";
 
+/**
+ * Longest deep link kept before redaction.
+ *
+ * The URL is handed to the app by the OS, so its length is chosen by whoever
+ * crafted the link, not by the app or by this SDK. Without a bound, one hostile
+ * `myapp://` link dominates the session payload and pays unbounded parse cost on
+ * the device. 2048 holds a real OAuth callback, which is the longest link this
+ * collector is expected to see, with room to spare.
+ */
+const MAX_DEEP_LINK_LENGTH = 2048;
+
+/**
+ * Longest device-reported identifier kept.
+ *
+ * `model`, `manufacturer`, `operatingSystem`, `osVersion` and `webViewVersion`
+ * come from the platform build properties (`Build.MODEL` and friends on
+ * Android), which a rooted or emulated device can set to anything. They carry no
+ * personal data, so they are kept in full up to the bound rather than redacted --
+ * the whole point of the environment snapshot is to say which device this was.
+ */
+const MAX_DEVICE_STRING_LENGTH = 128;
+
 type Cleanup = () => void;
+
+function boundedString(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.length > max ? value.slice(0, max) : value;
+}
+
+interface RedactedDeepLink {
+  url: string | undefined;
+  metadata: RedactionMetadata | undefined;
+}
+
+/**
+ * Bound and redact a deep link before it leaves the device.
+ *
+ * A mobile deep link is where OAuth callback codes, magic link tokens, password
+ * reset tokens, invite codes and session ids arrive, so the raw URL is the single
+ * most credential-dense value this package touches. `redactUrl` is core's shared
+ * engine -- the same one core's own navigation collector uses -- and it already
+ * understands custom app schemes: it drops URL credentials and the whole
+ * fragment, and replaces sensitive query values with a shape token. A local deny
+ * list here would drift away from it, which is exactly the failure this avoids.
+ *
+ * The length bound is applied to the raw URL, before parsing, so the parse cost
+ * is bounded too. Truncation can only make the result more conservative: a
+ * sliced URL that no longer parses falls through to core's stricter relative and
+ * malformed handling.
+ */
+function redactDeepLink(raw: unknown): RedactedDeepLink {
+  if (typeof raw !== "string" || raw.length === 0)
+    return { url: undefined, metadata: undefined };
+
+  const truncated = raw.length > MAX_DEEP_LINK_LENGTH;
+  const result = redactUrl(
+    truncated ? raw.slice(0, MAX_DEEP_LINK_LENGTH) : raw,
+    "url",
+  );
+  const truncation: RedactionMetadata | undefined = truncated
+    ? {
+        policy: BROWSER_REDACTION_POLICY,
+        fields: [{ path: "url", reason: "url_truncated", action: "summarized" }],
+      }
+    : undefined;
+
+  return {
+    url: result.value,
+    metadata: mergeRedactionMetadata(truncation, result.metadata),
+  };
+}
 
 /**
  * Map `Capacitor.getPlatform()` onto the shared platform tag.
@@ -179,14 +259,20 @@ async function collectEnvironment(
     },
     device: info
       ? {
-          model: info.model,
-          manufacturer: info.manufacturer,
-          os: info.operatingSystem,
-          osVersion: info.osVersion,
+          model: boundedString(info.model, MAX_DEVICE_STRING_LENGTH),
+          manufacturer: boundedString(
+            info.manufacturer,
+            MAX_DEVICE_STRING_LENGTH,
+          ),
+          os: boundedString(info.operatingSystem, MAX_DEVICE_STRING_LENGTH),
+          osVersion: boundedString(info.osVersion, MAX_DEVICE_STRING_LENGTH),
           // A hybrid bug is very often a WebView-engine bug, and the WebView
           // version moves independently of the OS version on Android. Without
           // it, "works on my Android 14 device" is unfalsifiable.
-          webViewVersion: info.webViewVersion,
+          webViewVersion: boundedString(
+            info.webViewVersion,
+            MAX_DEVICE_STRING_LENGTH,
+          ),
           virtual: info.isVirtual,
           memUsed: info.memUsed,
           diskFree: info.realDiskFree,
@@ -295,20 +381,26 @@ async function collectDeepLinks(
   if (!app) return;
 
   const launch = await safeCall(() => app.getLaunchUrl?.());
-  if (launch?.url) {
-    emit(context, "navigation", {
-      url: launch.url,
+  const launchLink = redactDeepLink(launch?.url);
+  if (launchLink.url !== undefined) {
+    const data: Record<string, unknown> = {
+      url: launchLink.url,
       source: "launch-url",
       kind: "cold-start",
-    });
+    };
+    attachRedactionMetadata(data, launchLink.metadata);
+    emit(context, "navigation", data);
   }
 
   if (!app.addListener) return;
   await attach(context, app.addListener, "appUrlOpen", (event) => {
-    emit(context, "navigation", {
-      url: typeof event.url === "string" ? event.url : undefined,
+    const link = redactDeepLink(event.url);
+    const data: Record<string, unknown> = {
+      url: link.url,
       source: "appUrlOpen",
-    });
+    };
+    attachRedactionMetadata(data, link.metadata);
+    emit(context, "navigation", data);
   });
 
   // Android can restore a plugin result after the OS killed the app mid-flow
