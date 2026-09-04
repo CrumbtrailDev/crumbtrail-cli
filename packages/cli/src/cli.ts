@@ -748,16 +748,54 @@ function gitValue(cwd: string, args: string[]): string | null {
  * become `github.com/acme/api`.
  */
 export function normalizeRepoUrl(url: string): string {
-  let s = url.trim();
-  s = s.replace(/\.git$/i, "");
-  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-  s = s.replace(/^[^@/]+@/, "");
+  const trimmed = url.trim().replace(/\.git$/i, "");
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
+
+  if (hasScheme) {
+    try {
+      const parsed = new URL(trimmed);
+      // Dropping the parsed components is what removes the credential. A
+      // regex over the raw string cannot: a password may hold `/`, `:` or
+      // `@`, and any anchor tight enough to be safe stops matching on one of
+      // them, leaving the credential in the string the CLI then sends to the
+      // cloud and prints to the terminal.
+      parsed.username = "";
+      parsed.password = "";
+      const withoutTrailing = parsed.pathname.replace(/\/+$/, "");
+      return `${parsed.host}${withoutTrailing}`.toLowerCase();
+    } catch {
+      // A scheme that will not parse is malformed, and the usual reason is a
+      // credential the URL grammar does not allow. The delimiter is the last
+      // `@`, because everything before it is userinfo however odd it looks.
+      return finishNonUrlRepo(dropAfterLastAt(stripScheme(trimmed)));
+    }
+  }
+
+  // scp syntax (`git@github.com:acme/api`) and bare `acme/api` are not URLs.
+  // Userinfo, when present, runs up to the last `@` before the path.
+  const firstSlash = trimmed.indexOf("/");
+  const authority = firstSlash === -1 ? trimmed : trimmed.slice(0, firstSlash);
+  const rest = firstSlash === -1 ? "" : trimmed.slice(firstSlash);
+  return finishNonUrlRepo(`${dropAfterLastAt(authority)}${rest}`);
+}
+
+function stripScheme(s: string): string {
+  return s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+}
+
+function dropAfterLastAt(s: string): string {
+  const at = s.lastIndexOf("@");
+  return at === -1 ? s : s.slice(at + 1);
+}
+
+function finishNonUrlRepo(s: string): string {
   // scp style `host:path`, but not `host:port/path`: rewriting a port would
   // report one self hosted repository under two names depending on the URL the
   // reader happened to clone with.
-  s = s.replace(/^([^/:]+):(?!\d+\/)/, "$1/");
-  s = s.replace(/\/+$/, "");
-  return s.toLowerCase();
+  return s
+    .replace(/^([^/:]+):(?!\d+\/)/, "$1/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
 }
 
 /**
