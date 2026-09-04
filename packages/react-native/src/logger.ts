@@ -2,7 +2,10 @@ import { Crumbtrail } from "crumbtrail-core";
 import type { CrumbtrailConfig } from "crumbtrail-core";
 import { createReactNativeSessionStore } from "./session-store";
 import { detectReactNativeCapabilities } from "./capabilities";
-import { startReactNativeCollectors } from "./collectors";
+import {
+  resolveReactNativeCollectorConfig,
+  startReactNativeCollectors,
+} from "./collectors";
 import type { AsyncStorageLike } from "./session-store";
 import type {
   DetectReactNativeCapabilitiesOptions,
@@ -41,6 +44,15 @@ export interface ReactNativeCrumbtrailResult {
  * is enough to pass a `typeof window` check while carrying no
  * `addEventListener`, and it never defines a `document` instance at all.
  *
+ * `console` is deliberately absent: core's console collector patches
+ * `globalThis.console` and binds nothing, so it works on React Native as it
+ * stands, and it is the one that runs every captured line through the redaction
+ * engine. This package used to patch `console` a second time and store the raw
+ * arguments beside core's redacted copy, which put an unredacted transcript of
+ * every log line in the session. The `collectors.console` switch now maps onto
+ * core's `console` config below, so one collector runs and the knob still turns
+ * it off.
+ *
  * `errors` is on the list for the same reason as the rest, and is easy to
  * misread because RN has an `errors` collector of its own. They are different
  * things: core's reads `window`'s `error` / `unhandledrejection` events, which
@@ -76,8 +88,13 @@ export function createReactNativeCrumbtrail(
   const sessionStore = options.asyncStorage
     ? createReactNativeSessionStore(options.asyncStorage)
     : userConfig?.sessionStore;
+  const collectorConfig = resolveReactNativeCollectorConfig(options.collectors);
   const config = {
     ...REACT_NATIVE_DEFAULT_CONFIG,
+    // Core owns console capture on React Native, so the RN switch has to reach
+    // core's config to mean anything. An explicit `config.console` still wins:
+    // it is the more specific statement of the two.
+    console: collectorConfig.console,
     ...userConfig,
     ...(sessionStore ? { sessionStore } : {}),
   };

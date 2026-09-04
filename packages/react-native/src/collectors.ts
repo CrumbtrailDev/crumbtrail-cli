@@ -1,4 +1,16 @@
-import type { Crumbtrail, TargetDescriptor } from "crumbtrail-core";
+import type {
+  Crumbtrail,
+  RedactionMetadata,
+  TargetDescriptor,
+} from "crumbtrail-core";
+import {
+  MOBILE_ERROR_MESSAGE_MAX_LENGTH,
+  MOBILE_ERROR_STACK_MAX_LENGTH,
+  attachMobileRedaction,
+  redactMobileText,
+  redactMobileUrl,
+} from "./redaction-plane";
+import type { MobileRedactedText } from "./redaction-plane";
 import {
   createReactNativeReplayLite,
   type ReactNativeReplayLiteController,
@@ -125,7 +137,7 @@ export function startReactNativeCollectors(
   logger: Crumbtrail,
   options: StartReactNativeCollectorsOptions,
 ): ReactNativeCollectorController {
-  const enabled = resolveCollectorConfig(options.config);
+  const enabled = resolveReactNativeCollectorConfig(options.config);
   const globalObject =
     options.globalObject ??
     (globalThis as typeof globalThis & Record<string, unknown>);
@@ -143,10 +155,10 @@ export function startReactNativeCollectors(
       })
     : undefined;
 
-  if (enabled.console)
-    cleanup.push(
-      startConsoleCollector(logger, options.capabilities, globalObject),
-    );
+  // No console collector here. `crumbtrail-core`'s own patches `globalThis.console`
+  // and needs no DOM, so it runs on React Native already; a second one captured
+  // every line twice, and its copy was the unredacted one. `logger.ts` maps the
+  // `console` collector switch onto core's config so the knob still works.
   if (enabled.errors)
     cleanup.push(
       startErrorCollector(
@@ -215,7 +227,7 @@ export function startReactNativeCollectors(
   };
 }
 
-function resolveCollectorConfig(
+export function resolveReactNativeCollectorConfig(
   config: ReactNativeCollectorConfig | undefined,
 ): Record<ReactNativeCollectorName, boolean> {
   if (config === false) {
@@ -244,47 +256,6 @@ function emit(
   });
 }
 
-function startConsoleCollector(
-  logger: Crumbtrail,
-  capabilities: ReactNativeCapabilities,
-  globalObject: typeof globalThis & Record<string, unknown>,
-): Cleanup {
-  const consoleObject = globalObject.console;
-  if (!consoleObject) return () => {};
-  const mutableConsole = consoleObject as unknown as Record<
-    string,
-    (...args: unknown[]) => void
-  >;
-  const methods = ["log", "warn", "error", "debug", "info"] as const;
-  const originals = new Map<string, (...args: unknown[]) => void>();
-  const level: Record<string, string> = {
-    log: "log",
-    warn: "warn",
-    error: "err",
-    debug: "dbg",
-    info: "info",
-  };
-
-  for (const method of methods) {
-    if (typeof mutableConsole[method] !== "function") continue;
-    const original = mutableConsole[method].bind(consoleObject);
-    originals.set(method, original);
-    mutableConsole[method] = (...args: unknown[]) => {
-      emit(logger, capabilities, "con", {
-        lv: level[method],
-        args: args.map((arg) => safeStringify(arg)),
-      });
-      original(...args);
-    };
-  }
-
-  return () => {
-    for (const [method, original] of originals) {
-      mutableConsole[method] = original;
-    }
-  };
-}
-
 function startErrorCollector(
   logger: Crumbtrail,
   capabilities: ReactNativeCapabilities,
@@ -299,12 +270,15 @@ function startErrorCollector(
     const previous = errorUtils.getGlobalHandler();
     if (typeof previous !== "function") return () => {};
     errorUtils.setGlobalHandler((error, isFatal) => {
-      emit(logger, capabilities, "err", {
-        msg: error instanceof Error ? error.message : String(error),
-        stk: error instanceof Error ? error.stack : undefined,
-        fatal: Boolean(isFatal),
-        source: "react-native-global-handler",
-      });
+      emit(
+        logger,
+        capabilities,
+        "err",
+        redactedErrorData(error, {
+          fatal: Boolean(isFatal),
+          source: "react-native-global-handler",
+        }),
+      );
       previous?.(error, isFatal);
     });
     cleanup.push(() => {
@@ -320,12 +294,14 @@ function startErrorCollector(
     | ((type: string, listener: (event: { reason?: unknown }) => void) => void);
   if (addEventListener && removeEventListener) {
     const onUnhandledRejection = (event: { reason?: unknown }) => {
-      const reason = event.reason;
-      emit(logger, capabilities, "rej", {
-        msg: reason instanceof Error ? reason.message : String(reason),
-        stk: reason instanceof Error ? reason.stack : undefined,
-        source: "react-native-unhandled-rejection",
-      });
+      emit(
+        logger,
+        capabilities,
+        "rej",
+        redactedErrorData(event.reason, {
+          source: "react-native-unhandled-rejection",
+        }),
+      );
     };
     addEventListener.call(
       globalObject,
@@ -360,26 +336,43 @@ function startNetworkCollector(
     ) => {
       const startedAt = monotonicNow(globalObject);
       const method = init?.method?.toUpperCase() ?? "GET";
-      const url = extractUrl(input);
+      const url = redactMobileUrl(extractUrl(input));
       try {
         const response = await originalFetch(input, init);
-        emit(logger, capabilities, "net", {
-          url,
-          method,
-          status: response.status,
-          ok: response.ok,
-          dur: Math.max(0, monotonicNow(globalObject) - startedAt),
-          source: "fetch",
-        });
+        emit(
+          logger,
+          capabilities,
+          "net",
+          networkData(url, {
+            method,
+            status: response.status,
+            ok: response.ok,
+            dur: Math.max(0, monotonicNow(globalObject) - startedAt),
+            source: "fetch",
+          }),
+        );
         return response;
       } catch (error) {
-        emit(logger, capabilities, "net", {
-          url,
-          method,
-          error: error instanceof Error ? error.message : String(error),
-          dur: Math.max(0, monotonicNow(globalObject) - startedAt),
-          source: "fetch",
-        });
+        const message = redactMobileText(
+          error instanceof Error ? error.message : String(error),
+          "error",
+          MOBILE_ERROR_MESSAGE_MAX_LENGTH,
+        );
+        emit(
+          logger,
+          capabilities,
+          "net",
+          networkData(
+            url,
+            {
+              method,
+              error: message?.value,
+              dur: Math.max(0, monotonicNow(globalObject) - startedAt),
+              source: "fetch",
+            },
+            message?.metadata,
+          ),
+        );
         throw error;
       }
     }) as typeof fetch;
@@ -406,7 +399,9 @@ function startNetworkCollector(
         url: string,
         ...rest: unknown[]
       ) {
-        this.__crumbtrailNetwork = { method, url };
+        // Redacted at `open` rather than at `send`: the raw URL is never held
+        // on the request object, so nothing else that reads it can leak it.
+        this.__crumbtrailNetwork = { method, url: redactMobileUrl(url) };
         return originalOpen.call(this, method, url, ...rest);
       };
       Xhr.prototype.send = function send(
@@ -415,17 +410,22 @@ function startNetworkCollector(
       ) {
         const startedAt = monotonicNow(globalObject);
         const info = this.__crumbtrailNetwork as
-          { method?: string; url?: string } | undefined;
+          | { method?: string; url?: MobileRedactedText }
+          | undefined;
         const previous = this.onreadystatechange as undefined | (() => void);
         this.onreadystatechange = () => {
           if (this.readyState === 4) {
-            emit(logger, capabilities, "net", {
-              url: info?.url,
-              method: info?.method?.toUpperCase(),
-              status: this.status,
-              dur: Math.max(0, monotonicNow(globalObject) - startedAt),
-              source: "xmlhttprequest",
-            });
+            emit(
+              logger,
+              capabilities,
+              "net",
+              networkData(info?.url, {
+                method: info?.method?.toUpperCase(),
+                status: this.status,
+                dur: Math.max(0, monotonicNow(globalObject) - startedAt),
+                source: "xmlhttprequest",
+              }),
+            );
           }
           previous?.call(this);
         };
@@ -466,7 +466,7 @@ function startAppStateCollector(
 function enabledJsWatchdog(
   options: StartReactNativeCollectorsOptions,
 ): boolean {
-  const config = resolveCollectorConfig(options.config);
+  const config = resolveReactNativeCollectorConfig(options.config);
   return config.jsWatchdog && options.jsWatchdogEnabled !== false;
 }
 
@@ -528,21 +528,54 @@ function resolveModule<T>(
   }
 }
 
+/**
+ * Assemble a `net` payload around an already redacted URL.
+ *
+ * The URL is passed in redacted rather than raw so there is no branch here that
+ * can forget to call the engine.
+ */
+function networkData(
+  url: MobileRedactedText | undefined,
+  rest: Record<string, unknown>,
+  ...extra: Array<RedactionMetadata | undefined>
+): Record<string, unknown> {
+  const d: Record<string, unknown> = { url: url?.value, ...rest };
+  attachMobileRedaction(d, url?.metadata, ...extra);
+  return d;
+}
+
+/** Redact a thrown value into the `err` / `rej` payload shape. */
+function redactedErrorData(
+  error: unknown,
+  rest: Record<string, unknown>,
+): Record<string, unknown> {
+  const msg = redactMobileText(
+    error instanceof Error ? error.message : String(error),
+    "msg",
+    MOBILE_ERROR_MESSAGE_MAX_LENGTH,
+  );
+  const stk = redactMobileText(
+    error instanceof Error ? error.stack : undefined,
+    "stk",
+    MOBILE_ERROR_STACK_MAX_LENGTH,
+  );
+  const d: Record<string, unknown> = {
+    msg: msg?.value ?? "",
+    // Only when there is one: an empty `stk` slot reads downstream as
+    // "captured, and it was blank".
+    ...(stk ? { stk: stk.value } : {}),
+    ...rest,
+  };
+  attachMobileRedaction(d, msg?.metadata, stk?.metadata);
+  return d;
+}
+
 function extractUrl(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
   if (input instanceof URL) return input.toString();
   if (typeof Request !== "undefined" && input instanceof Request)
     return input.url;
   return String(input);
-}
-
-function safeStringify(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 
 function monotonicNow(

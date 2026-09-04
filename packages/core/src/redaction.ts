@@ -22,8 +22,29 @@ export type BrowserRedactionPolicy =
 export const BACKEND_REDACTION_POLICY = "crumbtrail.backend-redaction.v1";
 export type BackendRedactionPolicy = typeof BACKEND_REDACTION_POLICY;
 
-/** Every policy tag `RedactionMetadata.policy` may carry, across both planes. */
-export type RedactionPolicy = BrowserRedactionPolicy | BackendRedactionPolicy;
+/**
+ * The plane tag every capture taken on a phone or tablet carries.
+ *
+ * The engine is shared, so a React Native fetch URL, an `ErrorUtils` stack and
+ * an accessibility label all ran through the rules a browser body runs through.
+ * What differs is who produced the event, and that is what the tag states. A
+ * reader deciding whether a payload may be retained needs to know it came off a
+ * device, and `browser` on an event no browser ever saw is simply false: there
+ * was no origin, no same-origin policy and no DOM anywhere near it.
+ *
+ * One tag covers every mobile SDK — React Native today, the Swift, Kotlin,
+ * Flutter and Capacitor packages as they adopt it — because the distinction a
+ * retention reader acts on is the device, not the framework wrapping it. The
+ * SDK name already on the event says which framework.
+ */
+export const MOBILE_REDACTION_POLICY = "crumbtrail.mobile-redaction.v1";
+export type MobileRedactionPolicy = typeof MOBILE_REDACTION_POLICY;
+
+/** Every policy tag {@link RedactionMetadata.policy} may carry, across planes. */
+export type RedactionPolicy =
+  | BrowserRedactionPolicy
+  | BackendRedactionPolicy
+  | MobileRedactionPolicy;
 export const REDACTED_VALUE = "[REDACTED]";
 export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
 
