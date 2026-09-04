@@ -88,6 +88,87 @@ describe("createReactNativeCrumbtrail on a React Native global", () => {
     expect(transport.sent.some((event) => event.k === "err")).toBe(true);
   });
 
+  it("captures each console line once, through core, redacted", async () => {
+    reactNativeGlobals();
+    const transport = capturingTransport();
+    const { logger } = createReactNativeCrumbtrail({
+      config: {
+        httpEndpoint: "http://127.0.0.1:9898",
+        transportInstance: transport,
+      },
+      resolver: () => undefined,
+      collectors: {
+        errors: false,
+        network: false,
+        environment: false,
+        appState: false,
+        navigation: false,
+        replayLite: false,
+        nativeDiagnostics: false,
+        jsWatchdog: false,
+      },
+    });
+
+    console.log("session Bearer sk_live_abcdef1234567890");
+    await logger.stop();
+
+    // Two collectors used to patch `console`: core's, which redacts, and this
+    // package's, which did not. Both fired on every line, so the raw copy sat
+    // beside the redacted one in the same session.
+    const cons = transport.sent.filter((event) => event.k === "con");
+    expect(cons).toHaveLength(1);
+    expect(JSON.stringify(cons[0]?.d)).not.toContain(
+      "sk_live_abcdef1234567890",
+    );
+  });
+
+  it("turns core's console collector off when the RN switch is off", async () => {
+    reactNativeGlobals();
+    const transport = capturingTransport();
+    const { logger } = createReactNativeCrumbtrail({
+      config: {
+        httpEndpoint: "http://127.0.0.1:9898",
+        transportInstance: transport,
+      },
+      resolver: () => undefined,
+      collectors: { console: false },
+    });
+
+    console.log("quiet");
+    await logger.stop();
+    expect(transport.sent.some((event) => event.k === "con")).toBe(false);
+  });
+
+  it("hands state providers the raw value and lets core redact it", async () => {
+    reactNativeGlobals();
+    const transport = capturingTransport();
+    const { logger } = createReactNativeCrumbtrail({
+      config: {
+        httpEndpoint: "http://127.0.0.1:9898",
+        transportInstance: transport,
+      },
+      resolver: () => undefined,
+      collectors: false,
+    });
+
+    logger.registerStateProvider("checkout", () => ({
+      cartId: "8f14e45fceea167a5a36dedd4bea2543",
+      email: "jane@example.com",
+    }));
+    logger.flag({ note: "state check" });
+    await logger.stop();
+
+    const snap = transport.sent.find((event) => event.k === "state.snap");
+    const d = snap?.d as { json: string; redaction?: { fields: Array<{ reason: string }> } };
+    expect(d.json).not.toContain("jane@example.com");
+    expect(d.json).not.toContain("8f14e45fceea167a5a36dedd4bea2543");
+    // This package used to flatten both to a bare `[REDACTED]` first, so core
+    // could no longer say why either value went. The reasons are the point.
+    expect(d.redaction?.fields.map((field) => field.reason)).toEqual(
+      expect.arrayContaining(["long_hex_token", "sensitive_json_field"]),
+    );
+  });
+
   it("leaves core's DOM error collector off, because RN reports through ErrorUtils", async () => {
     reactNativeGlobals();
     const globalObject = globalThis as typeof globalThis &

@@ -56,7 +56,7 @@ describe("startReactNativeCollectors", () => {
       vi.useRealTimers();
     }
   });
-  it("emits environment, app lifecycle, navigation, console, and replay-lite events", () => {
+  it("emits environment, app lifecycle, navigation, and replay-lite events", () => {
     const testLogger = logger();
     const originalLog = vi.fn();
     const globalObject = {
@@ -151,12 +151,13 @@ describe("startReactNativeCollectors", () => {
         data: expect.objectContaining({ name: "Home" }),
       }),
     );
-    expect(testLogger.addEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "con",
-        data: expect.objectContaining({ lv: "log" }),
-      }),
+    // Console is core's now, so this package emits no `con` event and leaves
+    // `console` unpatched. A second patch here stored the raw arguments beside
+    // core's redacted copy of the same line.
+    expect(testLogger.addEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "con" }),
     );
+    expect(globalObject.console.log).toBe(originalLog);
     expect(testLogger.addEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "view-snapshot",
@@ -266,7 +267,7 @@ describe("startReactNativeCollectors", () => {
     ).not.toThrow();
   });
 
-  it("skips missing console methods and non-restorable ErrorUtils patches", () => {
+  it("leaves console alone and skips non-restorable ErrorUtils patches", () => {
     const testLogger = logger();
     const globalObject = {
       console: { log: vi.fn() },
@@ -292,14 +293,13 @@ describe("startReactNativeCollectors", () => {
       errorUtils: errorUtilsWithoutGetter,
     });
 
+    const originalLog = globalObject.console.log;
     globalObject.console.log("safe");
     controller.cleanup();
 
-    expect(testLogger.addEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "con",
-        data: expect.objectContaining({ args: ["safe"] }),
-      }),
+    expect(globalObject.console.log).toBe(originalLog);
+    expect(testLogger.addEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "con" }),
     );
     expect(errorUtilsWithoutGetter.setGlobalHandler).not.toHaveBeenCalled();
     expect(() =>

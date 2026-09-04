@@ -172,6 +172,7 @@ import {
 function Screen({ logger, cart }) {
   useBugState(logger, "cart", cart); // redacted state snapshot on the next event
 
+
   return (
     <CrumbtrailReactNativeErrorBoundary logger={logger}>
       <ScreenContent />
@@ -180,15 +181,38 @@ function Screen({ logger, cart }) {
 }
 ```
 
-`useBugState` and the error boundary both redact sensitive-looking keys/values
-(tokens, passwords, cookies, etc.) before the snapshot is recorded.
+## Redaction
+
+Everything this SDK captures goes through the redaction engine in
+`crumbtrail-core` before it leaves the device: fetch and `XMLHttpRequest` URLs
+(userinfo and fragment dropped, query values replaced), `ErrorUtils` messages
+and stacks, error boundary messages, stacks and component stacks, accessibility
+labels in the view snapshot, and console lines.
+
+Captures taken on a device carry the policy id `crumbtrail.mobile-redaction.v1`,
+so a reader can tell a phone capture from a browser one. Developer-written
+identifiers survive: `componentName`, `role`, `testID` and `accessibilityId`
+name a widget rather than showing what the user sees.
+
+`useBugState` hands the value over unmodified and `crumbtrail-core` redacts it
+where the state snapshot is emitted. To capture state values in the clear, set
+`captureRawState: true` on the `Crumbtrail` config; the per-hook option of the
+same name is deprecated and does nothing.
+
+The crash screenshot is captured unmasked. Do not enable `replayLite` on a
+screen showing data you are not prepared to store.
+
+Bounds are applied alongside redaction: 2,000 characters of URL, 2,000 of error
+message, 8,000 of stack, 512 of accessibility label, 32 levels and 200 children
+of view tree.
 
 ## What gets captured
 
 RN-specific collectors, each capability-gated and independently toggleable via
 `createReactNativeCrumbtrail({ collectors: { ... } })`:
 
-- `console` — console patch
+- `console` — maps onto `crumbtrail-core`'s console collector, which patches
+  `globalThis.console` and works on React Native as it stands
 - `errors` — `ErrorUtils` global handler + the error boundary above
 - `network` — `fetch` / `XMLHttpRequest` patch
 - `appState` — foreground/background/terminate transitions
