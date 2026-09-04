@@ -75,7 +75,7 @@ in an app.
 | `native-crash` | An uncaught exception, delivered on the next launch |
 | `native-hang` | Foreground main thread stalls after recovery or on the next launch, when enabled |
 | `err` | Errors you report with `recordError` |
-| `net` | HTTP requests you report with `recordRequest` |
+| `net` | HTTP requests through `CrumbtrailOkHttpInterceptor` or `recordRequest` |
 | `app-lifecycle` | Foreground and background transitions; process exits and memory pressure when native diagnostics are enabled |
 | `navigation` | Which Activity came to the front |
 | `env` | Device, OS, app version and locale at startup |
@@ -139,40 +139,37 @@ replaced with `[REDACTED]` before storage or delivery.
 
 ### Network
 
-There is no automatic interception. Android apps use OkHttp, Retrofit, Ktor and
-`HttpURLConnection` in roughly equal measure, and an SDK that reached into any
-one of them would either miss most apps or break on a version bump. Report from
-wherever your app already has an interceptor:
+Add the maintained interceptor once to the OkHttp client your application uses.
+Retrofit requests are captured when Retrofit uses that client. Requires OkHttp
+4.12 or a compatible API. Crumbtrail compiles against OkHttp without adding it
+as a runtime dependency, so your application supplies its own OkHttp dependency.
 
 ```kotlin
-class CrumbtrailInterceptor(private val logger: Crumbtrail) : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val startedAt = System.currentTimeMillis()
-        val request = chain.request()
-        return try {
-            chain.proceed(request).also { response ->
-                logger.recordRequest(
-                    url = request.url.toString(),
-                    method = request.method,
-                    status = response.code,
-                    durationMs = System.currentTimeMillis() - startedAt,
-                )
-            }
-        } catch (error: IOException) {
-            logger.recordRequest(
-                url = request.url.toString(),
-                method = request.method,
-                status = null,
-                durationMs = System.currentTimeMillis() - startedAt,
-                error = error.message,
-            )
-            throw error
-        }
-    }
-}
+import ai.crumbtrail.sdk.Crumbtrail
+import ai.crumbtrail.sdk.CrumbtrailOkHttpInterceptor
+import okhttp3.OkHttpClient
+
+fun applicationHttpClient(logger: Crumbtrail): OkHttpClient =
+    OkHttpClient.Builder()
+        .addInterceptor(CrumbtrailOkHttpInterceptor(logger))
+        .build()
 ```
 
-`recordRequest` redacts the URL for you. Bodies are never captured.
+Use `addInterceptor`, not `addNetworkInterceptor`, to record one result per
+application call, including its redirects and retries. Set
+`CrumbtrailCollectors(network = false)` to disable adapter capture. The default
+is `true`. Stopping Crumbtrail prevents further events.
+
+The adapter records redacted URL, method, status, error type, and monotonic time
+to response headers. It leaves request and response bodies and headers untouched.
+Stream read failures after response headers are not captured. Original HTTP
+exceptions are rethrown. Capture failures do not replace HTTP results.
+Do not also call `recordRequest` for calls using this interceptor.
+
+Verify with `gradle test --tests '*OkHttp*'` from this package. In your app,
+issue a request through the configured client, flush Crumbtrail, and inspect its
+session for a `net` event with the request status. Other HTTP clients can still
+use `recordRequest` directly.
 
 ## Recording things yourself
 

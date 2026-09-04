@@ -32,7 +32,13 @@ object CrumbtrailRedaction {
         name.lowercase().filter { it.isLetterOrDigit() }
 
     fun isDeniedHeader(name: String): Boolean {
-        val compacted = compact(name)
+        val decoded = try {
+                java.net.URLDecoder.decode(name, "UTF-8")
+            } catch (_: IllegalArgumentException) {
+                return PLACEHOLDER
+            }
+            if (decoded.contains('\uFFFD')) return PLACEHOLDER
+            val compacted = compact(decoded)
         return compacted in deniedHeaderNames ||
             deniedNameTokens.any { compacted.contains(it) }
     }
@@ -77,7 +83,13 @@ object CrumbtrailRedaction {
 
         val redactedQuery = uri.rawQuery?.split('&')?.joinToString("&") { pair ->
             val name = pair.substringBefore('=')
-            val compacted = compact(name)
+            val decoded = try {
+                java.net.URLDecoder.decode(name, "UTF-8")
+            } catch (_: IllegalArgumentException) {
+                return PLACEHOLDER
+            }
+            if (decoded.contains('\uFFFD')) return PLACEHOLDER
+            val compacted = compact(decoded)
             if (deniedNameTokens.any { compacted.contains(it) }) "$name=$PLACEHOLDER"
             else pair
         }

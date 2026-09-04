@@ -95,24 +95,47 @@ GoRouter(
 
 ### Requests
 
-Flutter has no single HTTP chokepoint the way a browser does, so requests are
-recorded explicitly. This is deliberate: swallowing every request through a
-global interceptor would capture requests from packages you did not choose to
-instrument.
+Wrap the `http` client your application uses, or register the Dio interceptor
+once on your existing Dio instance. The adapters record status, URL, method,
+duration, and error type. The adapters do not read bodies or add headers.
 
 ```dart
-final started = DateTime.now();
-final response = await client.get(url);
-Crumbtrail.instance?.recordRequest(
-  url: url.toString(),
-  method: 'GET',
-  status: response.statusCode,
-  durationMs: DateTime.now().difference(started).inMilliseconds,
+import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
+import 'package:http/http.dart' as http;
+
+final client = CrumbtrailClient(
+  crumbtrail: Crumbtrail.instance!,
+  inner: http.Client(),
 );
+final response = await client.get(Uri.parse('https://example.com/api/items'));
+client.close(); // Also closes the wrapped client.
 ```
 
-The URL is redacted before it is queued: userinfo, fragment and
-credential-shaped query values are stripped on the device.
+For Dio:
+
+```dart
+import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
+import 'package:dio/dio.dart';
+
+final dio = Dio();
+dio.interceptors.add(CrumbtrailDioInterceptor(Crumbtrail.instance!));
+```
+
+Start Crumbtrail before registering an adapter. Set
+`CrumbtrailCollectors(network: false)` to disable adapter capture. The default
+is `true`. Stopping Crumbtrail prevents further events. Register each adapter
+once and avoid calling `recordRequest` for the same request.
+
+URLs are redacted before queueing. Error messages, headers, and bodies are not
+collected by these adapters. The `http` wrapper measures time to response headers. Dio measures time until
+its response or error interceptor runs, which includes normal buffered body
+download and decoding. With `ResponseType.stream`, Dio returns before stream
+consumption. Later stream read errors are not captured by either adapter. The original response, exception, cancellation, and stream
+remain available to the application. Capture failures do not replace HTTP results.
+
+Verify with `flutter test test/network_adapters_test.dart` from this package.
+For an application check, issue a request through the configured client, flush
+Crumbtrail, and inspect its session for a `net` event with the request status.
 
 ### Caught errors
 
@@ -135,7 +158,7 @@ try {
 | Dart hang | Foreground Dart event loop watchdog, disabled in debug mode by default |
 | Screen changes | `CrumbtrailNavigatorObserver` |
 | Environment | OS, OS version, locale and Dart version, from `dart:io` |
-| Requests | `recordRequest`, redacted |
+| Requests | `CrumbtrailClient` or `CrumbtrailDioInterceptor`, redacted metadata |
 
 Both error surfaces are installed, and both chain to any handler already in
 place, so adding Crumbtrail never silently removes a crash reporter you already

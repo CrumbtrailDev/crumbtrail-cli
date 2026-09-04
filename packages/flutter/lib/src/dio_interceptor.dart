@@ -21,8 +21,12 @@ class CrumbtrailDioInterceptor extends Interceptor {
     if (clock == null) return;
     try {
       crumbtrail.recordRequest(
-        url: options.uri.toString(), method: options.method, status: status,
-        durationMs: clock.elapsedMilliseconds, source: 'dio', error: error,
+        url: options.uri.toString(),
+        method: options.method,
+        status: status,
+        durationMs: clock.elapsedMilliseconds,
+        source: 'dio',
+        error: error,
       );
     } catch (_) {
       // Capture failures must not change the application's HTTP result.

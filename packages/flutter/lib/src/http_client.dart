@@ -15,13 +15,18 @@ class CrumbtrailClient extends http.BaseClient {
     void record(int? status, [String? error]) {
       try {
         crumbtrail.recordRequest(
-          url: request.url.toString(), method: request.method, status: status,
-          durationMs: clock.elapsedMilliseconds, source: 'http', error: error,
+          url: request.url.toString(),
+          method: request.method,
+          status: status,
+          durationMs: clock.elapsedMilliseconds,
+          source: 'http',
+          error: error,
         );
       } catch (_) {
         // Capture failures must not change the application's HTTP result.
       }
     }
+
     final http.StreamedResponse response;
     try {
       response = await inner.send(request);
