@@ -79,6 +79,19 @@ export interface FilePartSyncDescription {
 }
 
 /**
+ * The redaction reason a file name is described under.
+ *
+ * A file name is not a classified value — nothing here decides that the name is
+ * safe, and the name itself never leaves the page. It is named as its own reason
+ * so the shape gate in `redaction.ts` can rule on it: a name carries structure a
+ * reader needs (`IMG_0042.jpg` against `Q3 board deck (final).pdf`) and no
+ * `ext`, `len` or hash conveys it, so the reason opts into the richer fields and
+ * into the stand-in. The stem reaches nothing else: `ext` is the tail only, and
+ * every other field is shape.
+ */
+const FILE_NAME_REASON = "file_name_value";
+
+/**
  * Everything about a file part that is safe to compute without reading its
  * bytes: the extension, the shape of its name, and its declared (but
  * grammar-validated) MIME type. None of this rides inside the request body's
@@ -95,7 +108,8 @@ export function describeFilePartSync(
   if (typeof file.name === "string") {
     const ext = extractFileExtension(file.name);
     if (ext) description.ext = ext;
-    if (file.name.length > 0) description.nameShape = computeRedactedShape(file.name);
+    if (file.name.length > 0)
+      description.nameShape = computeRedactedShape(file.name, FILE_NAME_REASON);
   }
   const declaredType = validateDeclaredMimeType(file.type);
   if (declaredType) description.declaredType = declaredType;

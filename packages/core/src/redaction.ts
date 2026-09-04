@@ -2855,14 +2855,20 @@ function redactedShapeEdges(text: string): RedactedShapeEdges | undefined {
  * validated credential and personal pattern was tested first and failed.
  * `url_query_value` is the query catch-all, and its call site passes it only
  * when the parameter name is not sensitive, because that path does not classify
- * the value itself.
+ * the value itself. `file_name_value` is an upload's file name, which a person
+ * typed or a program generated and which the reader needs the structure of to
+ * tell `IMG_0042.jpg` from `Q3 board deck (final).pdf`.
  *
  * The value-based credential reasons are deliberately absent. `email_value`,
  * `jwt_value`, `luhn_value`, `iban_value`, `token_like_value` and
  * `high_entropy_value` each name a format, so anything further narrows a value
  * the classifier already judged secret.
  */
-const SHAPE_DETAIL_REASONS = new Set(["free_text_value", "url_query_value"]);
+const SHAPE_DETAIL_REASONS = new Set([
+  "free_text_value",
+  "url_query_value",
+  "file_name_value",
+]);
 
 /** May a value redacted for this reason carry more than the floor? */
 export function redactedShapeDetailAllowed(
@@ -2882,10 +2888,21 @@ export function redactedShapeDetailAllowed(
  * asking for nothing at all. A punctuation-preserving stand-in for a value of
  * any of those kinds narrows it further, and the whole point of the field is
  * that it must not.
+ *
+ * `file_name_value` is here and `url_query_value` is not, because a file name
+ * is the one place where the stand-in is the whole point: the name's stem never
+ * reaches any other field, so `Xxxxx xxxx xxxx (xxxxx).xxx` is all a reader
+ * ever gets of it. A query value already spells its shape into a marker string
+ * that carries no example.
  */
-const SHAPE_EXAMPLE_REASONS = new Set(["free_text_value"]);
+const SHAPE_EXAMPLE_REASONS = new Set(["free_text_value", "file_name_value"]);
 
-/** May a value redacted for this reason carry an `example`? */
+/**
+ * May a value redacted for this reason carry an `example`?
+ *
+ * The reason and the hash are the whole of this gate. The second gate is on the
+ * stand-in itself: see {@link redactedShapeExampleCarriesLetters}.
+ */
 export function redactedShapeExampleAllowed(
   reason: string | undefined,
   shape: RedactedValueShape,
@@ -2956,8 +2973,10 @@ export function computeRedactedShape(
   if (hasNonAscii(text)) shape.nonAscii = true;
   if (SHAPE_EMOJI_RE.test(text)) shape.emoji = true;
   if (pattern !== undefined) shape.pattern = pattern;
-  if (redactedShapeExampleAllowed(reason, shape))
-    shape.example = redactedShapeExample(text);
+  if (redactedShapeExampleAllowed(reason, shape)) {
+    const example = redactedShapeExample(text);
+    if (redactedShapeExampleCarriesLetters(example)) shape.example = example;
+  }
   return shape;
 }
 
@@ -3008,6 +3027,50 @@ const SHAPE_EXAMPLE_ALPHABET = new Set<string>([
   SHAPE_EXAMPLE_OTHER_LETTER,
   ...SHAPE_EXAMPLE_SCRIPT_LETTERS.map(([, letter]) => letter),
 ]);
+
+/**
+ * The subset of the alphabet that stands for a letter or a digit, as opposed to
+ * whitespace, punctuation, an emoji, or the two catch-alls. Every `\p{L}` code
+ * point and every ASCII digit maps into this set; a non-ASCII digit does not,
+ * because the alphabet has no digit representative outside ASCII and writes it
+ * as `¤`.
+ */
+const SHAPE_EXAMPLE_LETTER_ALPHABET = new Set<string>([
+  "X",
+  "x",
+  "0",
+  SHAPE_EXAMPLE_OTHER_LETTER,
+  ...SHAPE_EXAMPLE_SCRIPT_LETTERS.map(([, letter]) => letter),
+]);
+
+/**
+ * How many letters or digits a stand-in must carry before it is worth emitting.
+ */
+export const REDACTED_SHAPE_EXAMPLE_MIN_LETTERS = 3;
+
+/**
+ * Does this stand-in show enough of a value to be worth its residual?
+ *
+ * The stand-in's letters and digits are what make it a shape; its whitespace and
+ * ASCII punctuation are kept verbatim and are the one thing a lying client can
+ * write freely. On `<<>>--__..!!??` the two cancel out: every character is
+ * carried through unchanged, so the field is a verbatim copy of the value under
+ * a name that promises it is not. Below three letters or digits the stand-in is
+ * withheld and the rest of the shape still describes the value.
+ *
+ * Counted over the stand-in rather than over the original so that the client's
+ * gate and {@link isValidRedactedShapeExample} can never disagree: the server
+ * has only the stand-in, and a truncated one only its first 120 code units.
+ */
+export function redactedShapeExampleCarriesLetters(example: string): boolean {
+  let letters = 0;
+  for (const codePoint of example) {
+    if (!SHAPE_EXAMPLE_LETTER_ALPHABET.has(codePoint)) continue;
+    letters += 1;
+    if (letters >= REDACTED_SHAPE_EXAMPLE_MIN_LETTERS) return true;
+  }
+  return false;
+}
 
 function shapeExampleReplacement(codePoint: string): string {
   if (codePoint.length === 1 && codePoint.charCodeAt(0) < 0x80) {
@@ -3088,8 +3151,9 @@ function isShapeExampleCharacter(codePoint: string): boolean {
  *
  * The capture server regenerates nothing — it never sees the original — so this
  * is what stands between a lying client and a value smuggled through in a field
- * that reads as harmless. It checks the alphabet, the length against `len`, and
- * agreement with `charset`, `nonAscii` and `emoji`. A truncated example is held
+ * that reads as harmless. It checks the alphabet, the length against `len`, the
+ * letter floor of {@link redactedShapeExampleCarriesLetters}, and agreement with
+ * `charset`, `nonAscii` and `emoji`. A truncated example is held
  * to the one-directional half of the flag checks, because the flags describe the
  * whole value and the example only its first 120 code units.
  */
@@ -3129,6 +3193,7 @@ export function isValidRedactedShapeExample(
     if (!sawEmoji && shape.emoji === true) return false;
     if (!sawNonAscii && shape.nonAscii === true) return false;
   }
+  if (!redactedShapeExampleCarriesLetters(body)) return false;
   if (shape.charset === "alpha") return /^[Xx]*$/.test(body);
   if (shape.charset === "num") return /^0*$/.test(body);
   if (shape.charset === "alnum") return /^[Xx0]*$/.test(body);
