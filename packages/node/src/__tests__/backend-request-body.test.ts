@@ -389,6 +389,43 @@ describe("express request body capture", () => {
     expect(captured).toMatchObject({ quantity: 7, sku: "A-1" });
   });
 
+  it("reads the stream when the application has no body parser at all", async () => {
+    const { events, fetchImpl } = expressIntake();
+    const app = express();
+    app.use(
+      createCrumbtrailExpressMiddleware({
+        sessionId: () => SESSION,
+        endpoint: "http://capture.test",
+        fetch: fetchImpl,
+        captureRequestBody: "all",
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+      }),
+    );
+    // No parser, so `req.body` never exists and the shadowed `push` is the only
+    // possible source. The handler consumes the stream itself and echoes it.
+    let received = "";
+    app.post("/raw", (req, res) => {
+      const frames: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => frames.push(chunk));
+      req.on("end", () => {
+        received = Buffer.concat(frames).toString("utf8");
+        res.status(200).json({ ok: true });
+      });
+    });
+    const port = await listen(createServer(app));
+
+    const payload = JSON.stringify({ quantity: 7, sku: "A-1" });
+    const answered = await postChunked(port, "/raw", [payload]);
+    await flushBackendEvents();
+
+    expect(answered.status).toBe(200);
+    expect(received).toBe(payload);
+    expect(
+      JSON.parse(String(endEvent(events)?.d.requestBody)),
+    ).toMatchObject({ quantity: 7, sku: "A-1" });
+  });
+
   it("falls back to the parser's own body when mounted after it", async () => {
     const { events, fetchImpl } = expressIntake();
     const app = express();
