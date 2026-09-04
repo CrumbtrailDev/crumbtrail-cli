@@ -756,7 +756,12 @@ describe("session replay at setup", () => {
       );
 
       expect(await runCli(["node", "cli", flag], deps)).toBe(0);
-      expect(confirm).not.toHaveBeenCalled();
+      // Data reproduction is a separate setting with its own flag, so a TTY run
+      // still asks about it. What these flags settle is the replay question.
+      expect(confirm).not.toHaveBeenCalledWith(
+        expect.stringContaining("Record session replay"),
+        expect.anything(),
+      );
       expect(steps).toContain(step);
     }
   });
