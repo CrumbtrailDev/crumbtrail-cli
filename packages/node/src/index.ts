@@ -317,6 +317,13 @@ export type {
   BackendResponseLike,
 } from "./backend-response";
 
+export { DEFAULT_REQUEST_BODY_MAX_BYTES } from "./backend-request-body";
+
+export type {
+  BackendRequestBodyCaptureOptions,
+  BackendRequestBodyLike,
+} from "./backend-request-body";
+
 // ── Ambient request context ──────────────────────────────────────────────────
 // Append-only block. Do not reorder the exports above.
 // The request a piece of backend evidence was produced inside, carried on the
