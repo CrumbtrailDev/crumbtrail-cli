@@ -63,11 +63,18 @@ class WSGIMiddleware:
         if capture is None:
             return self.app(environ, start_response)
         try:
-            length = int(environ.get("CONTENT_LENGTH") or "0")
+            length = int(environ["CONTENT_LENGTH"]) if environ.get("CONTENT_LENGTH") else None
             if environ.get("wsgi.input_terminated"):
                 length = None
         except ValueError:
             length = None
+        def safe_route():
+            try:
+                value = self.route(environ)
+                return value if isinstance(value, str) and len(value) <= 2048 else "/"
+            except Exception:
+                return "/"
+
         original_input = environ["wsgi.input"]
         environ["wsgi.input"] = _Input(original_input, capture, length)
         capture.request_complete = length == 0
@@ -87,7 +94,7 @@ class WSGIMiddleware:
         try:
             iterable = self.app(environ, wrapped_start)
         except BaseException as error:
-            capture.finish(self.client.sink, environ.get("CONTENT_TYPE", ""), self.route(environ), error)
+            capture.finish(self.client.sink, environ.get("CONTENT_TYPE", ""), safe_route(), error)
             environ["wsgi.input"] = original_input
             raise
         finally:
@@ -97,7 +104,7 @@ class WSGIMiddleware:
 
         class Response:
             def __init__(self):
-                self.iterator = iter(iterable)
+                self.iterator = None
                 self.closed = False
                 self.error = None
 
@@ -107,6 +114,8 @@ class WSGIMiddleware:
             def __next__(self):
                 token = current_capture.set(capture)
                 try:
+                    if self.iterator is None:
+                        self.iterator = iter(iterable)
                     chunk = next(self.iterator)
                     capture.keep(capture.response_bytes, chunk)
                     return chunk
@@ -130,9 +139,14 @@ class WSGIMiddleware:
                     close = getattr(iterable, "close", None)
                     if close:
                         close()
+                except BaseException as failure:
+                    if self.error is None:
+                        self.error = failure
+                        raise
+                    # Preserve the primary application exception when cleanup also fails.
                 finally:
                     try:
-                        capture.finish(middleware.client.sink, environ.get("CONTENT_TYPE", ""), middleware.route(environ), self.error)
+                        capture.finish(middleware.client.sink, environ.get("CONTENT_TYPE", ""), safe_route(), self.error)
                     finally:
                         environ["wsgi.input"] = original_input
                         current_capture.reset(token)

@@ -16,7 +16,7 @@ def _sensitive(key):
 
 
 def _card(number):
-    digits = str(number)
+    digits = str(int(number)) if isinstance(number, float) and number.is_integer() else str(number)
     if not re.fullmatch(r"[0-9]{13,19}", digits):
         return False
     total = 0

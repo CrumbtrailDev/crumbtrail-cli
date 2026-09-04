@@ -35,7 +35,7 @@ def capture():
     (b'{"amount":1,"amount":2}', 'invalid'), (b'{"bad.key":1}', 'invalid'),
     (b'{"value":NaN}', 'invalid'), (b'[' * 1000, 'invalid'),
     (b'x' * 16385, 'truncated'), (json.dumps([1] * 41).encode(), 'invalid'),
-    (b'{"accountNumber":1234}', 'redacted'), (b'{"value":4111111111111111}', 'redacted'),
+    (b'{"accountNumber":1234}', 'redacted'), (b'{"value":4111111111111111}', 'redacted'), (b'{"value":4111111111111111.0}', 'redacted'),
 ])
 def test_profile(raw, state):
     assert capture_body(raw)[1] == state
@@ -61,7 +61,7 @@ def test_flask_request_database_and_response(capture, tmp_path):
             assert connection.execute(text("select :secret"), {"secret": "private sql operand"}).scalar() == "private sql operand"
         return jsonify(amount=body["amount"] * 2, currency="CAD", token="hidden response")
 
-    response = app.test_client().post('/api/orders/731?password=hidden', json={"amount": 18.75, "currency": "CAD", "password": "hidden request"}, headers=HEADERS)
+    response = app.test_client().post('/api/orders/731?password=hidden', json={"amount": 18.75, "currency": "CAD", "orderId": 731, "password": "never-transmit", "email": "a@example.com", "card": "4111111111111111"}, headers=HEADERS)
     assert response.status_code == 200
     assert response.json == {"amount": 37.5, "currency": "CAD", "token": "hidden response"}
     events = sink.events
@@ -107,7 +107,7 @@ def test_wsgi_streaming_input_output_and_close(capture):
 
     def app(environ, start_response):
         assert environ['wsgi.input'].read(3) == b'{"a'
-        buffer = bytearray(12)
+        buffer = bytearray(13)
         count = environ['wsgi.input'].readinto(buffer)
         assert b'{"a' + buffer[:count] == b'{"amount":18.75}'
         start_response('200 OK', [('Content-Type', 'application/json')])
@@ -182,3 +182,79 @@ def test_sink_failure_does_not_change_response():
     install(app, Client(sink=Broken(), should_capture=lambda _: True))
     app.add_url_rule('/api/a', view_func=lambda: {'amount': 1})
     assert app.test_client().get('/api/a', headers=HEADERS).json == {'amount': 1}
+
+
+def test_asgi_concurrent_requests_do_not_share_evidence(capture):
+    client, sink = capture
+    async def app(scope, receive, send):
+        identity = scope['path'].split('/')[-1]
+        await asyncio.sleep(0)
+        assert current_capture.get().request == identity
+        current_capture.get().add('db.statement', {'requestId': identity})
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await asyncio.sleep(0)
+        await send({'type': 'http.response.body', 'body': b'{}'})
+    async def run(identity):
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            pass
+        scope = {'type': 'http', 'path': '/api/' + identity, 'headers': [(b'x-crumbtrail-session-id', identity.encode()), (b'x-crumbtrail-request-id', identity.encode())]}
+        await ASGIMiddleware(app, client)(scope, receive, send)
+        assert current_capture.get() is None
+    async def main():
+        await asyncio.gather(*(run(str(i)) for i in range(30)))
+    asyncio.run(main())
+    assert len(sink.batches) == 30
+    for batch in sink.batches:
+        assert all(e['d']['requestId'] == batch['sessionId'] for e in batch['events'])
+
+
+@pytest.mark.parametrize('failure_point', ['iter', 'next'])
+def test_wsgi_preserves_primary_failure_when_close_also_fails(capture, failure_point):
+    client, sink = capture
+    primary = RuntimeError('primary secret')
+    closed = []
+    class BadIterable:
+        def __iter__(self):
+            assert current_capture.get() is not None
+            if failure_point == 'iter':
+                raise primary
+            return self
+        def __next__(self):
+            raise primary
+        def close(self):
+            closed.append(True)
+            raise ValueError('secondary secret')
+    def route(environ):
+        raise ValueError('bad route callback')
+    env = {'PATH_INFO': '/api/a', 'wsgi.input': io.BytesIO(), 'HTTP_X_CRUMBTRAIL_SESSION_ID': 's', 'HTTP_X_CRUMBTRAIL_REQUEST_ID': 'r'}
+    response = WSGIMiddleware(lambda *args: BadIterable(), client, route)(env, lambda *args: None)
+    with pytest.raises(RuntimeError) as failure:
+        next(response)
+    assert failure.value is primary
+    assert closed == [True]
+    assert sink.events[-1]['d']['statusCode'] == 500
+    assert current_capture.get() is None
+
+
+def test_sqlalchemy_error_is_preserved_and_redacted(capture):
+    from crumbtrail.database import instrument_sqlalchemy
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.exc import OperationalError
+    from crumbtrail.core import Capture
+    client, sink = capture
+    engine = create_engine('sqlite://')
+    uninstall = instrument_sqlalchemy(engine)
+    captured = Capture('s', 'r', 'test', 'GET')
+    token = current_capture.set(captured)
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(OperationalError):
+                connection.execute(text('select secret_column from secret_table'))
+    finally:
+        current_capture.reset(token)
+        uninstall()
+    captured.finish(sink, '')
+    assert sink.events[1]['k'] == 'db.error'
+    assert 'secret_' not in json.dumps(sink.events)
