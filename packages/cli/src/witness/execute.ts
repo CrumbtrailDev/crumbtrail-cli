@@ -57,7 +57,13 @@ export async function executeWitness(
           ? connectionString
           : new URL(connectionString).hostname;
     } catch {
-      /* Driver errors can contain credentials and SQL. */
+      if (witness.engine === "mssql") {
+        const server =
+          /(?:^|;)\s*(?:server|data source)\s*=\s*(?:tcp:)?([A-Za-z0-9_.\-]+)(?:[,;\\]|$)/i.exec(
+            connectionString,
+          )?.[1];
+        if (server) target = server;
+      }
     }
     throw new WitnessConnectionError(target);
   } finally {
@@ -189,6 +195,19 @@ export async function connectWitness(
           .aggregate(
             [
               { $match: s.filter },
+              ...(s.relatedFilters ?? []).flatMap((row, index) => {
+                const alias = `__ct_witness_gate_${index}`;
+                return [
+                  {
+                    $lookup: {
+                      from: row.table,
+                      pipeline: [{ $match: row.filter }, { $limit: 1 }],
+                      as: alias,
+                    },
+                  },
+                  { $match: { [`${alias}.0`]: { $exists: true } } },
+                ];
+              }),
               {
                 $facet: {
                   count: [{ $count: "total" }],

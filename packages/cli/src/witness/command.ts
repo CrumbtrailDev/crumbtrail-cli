@@ -192,7 +192,7 @@ export async function runWitnessCommand(
           keys: JSON.stringify(safeStatements.map((s) => s.identifyingRows)),
         }),
       );
-      const sessionId = randomUUID();
+      const sessionId = `witness_${randomUUID().replaceAll("-", "")}`;
       await request(
         "/api/session/start",
         { sessionId, metadata: { service, migration: fingerprint } },

@@ -132,4 +132,49 @@ describe("witness execution", () => {
     );
     db.close();
   });
+  it("clears every projection when one side of a linked contradiction is repaired", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "witness-linked-"));
+    dirs.push(dir);
+    const file = join(dir, "data.sqlite");
+    const db = new DatabaseSync(file);
+    db.exec(
+      "CREATE TABLE items(id INTEGER PRIMARY KEY,total INTEGER); CREATE TABLE payments(id INTEGER PRIMARY KEY,total INTEGER); INSERT INTO items VALUES(1,19); INSERT INTO payments VALUES(2,20)",
+    );
+    const a = witness.statements[0];
+    const b = {
+      table: "payments",
+      identifyingColumns: ["id"],
+      predicates: [
+        { column: "id", value: 2 },
+        { column: "total", value: 20 },
+      ],
+    };
+    const linked = {
+      ...witness,
+      statements: [
+        { ...a, relatedRows: [b] },
+        { ...b, relatedRows: [a] },
+      ],
+    };
+    expect((await executeWitness(linked, file)).map((s) => s.rowCount)).toEqual(
+      [1, 1],
+    );
+    db.exec("UPDATE items SET total=20 WHERE id=1");
+    expect((await executeWitness(linked, file)).map((s) => s.rowCount)).toEqual(
+      [0, 0],
+    );
+    expect(db.prepare("SELECT total FROM payments").get()?.total).toBe(20);
+    db.close();
+  });
+  it("names a SQL Server host without exposing connection credentials", async () => {
+    await expect(
+      executeWitness(
+        { ...witness, engine: "mssql" },
+        "Server=tcp:unreachable.example,1433;User Id=sa;Password=secret",
+        async () => {
+          throw new Error("secret");
+        },
+      ),
+    ).rejects.toMatchObject({ target: "unreachable.example" });
+  });
 });

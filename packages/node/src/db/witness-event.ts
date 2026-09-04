@@ -15,12 +15,26 @@ export function buildDbWitnessEvent(
 ): BugEvent {
   if (
     observation.witnessId !== witness.id ||
+    observation.engine !== witness.engine ||
+    !["before", "after"].includes(observation.phase) ||
+    observation.identity?.kind !== "migration" ||
+    !/^[a-f0-9]{64}$/.test(observation.identity.fingerprint) ||
     observation.statements.length !== witness.statements.length
   )
     throw new Error("WITNESS_OBSERVATION_MISMATCH");
   const compiled = compileDataWitness(witness);
   const statements = observation.statements.map((statement, index) => {
     const proposal = witness.statements[index];
+    if (
+      statement.shape !== compiled[index].shape ||
+      JSON.stringify(statement.parameters) !==
+        JSON.stringify(compiled[index].parameters) ||
+      !Number.isSafeInteger(statement.rowCount) ||
+      statement.rowCount < 0 ||
+      !Array.isArray(statement.identifyingRows) ||
+      statement.identifyingRows.length !== Math.min(statement.rowCount, 25)
+    )
+      throw new Error("WITNESS_OBSERVATION_MISMATCH");
     const scrub = (row: Record<string, unknown>) => {
       const event = buildDbReadEvent({
         engine: witness.engine,
@@ -40,7 +54,17 @@ export function buildDbWitnessEvent(
     return {
       ...statement,
       parameters,
-      identifyingRows: statement.identifyingRows.map(scrub),
+      identifyingRows: statement.identifyingRows.map((row) =>
+        scrub(
+          Object.fromEntries(
+            proposal.identifyingColumns.map((column) => {
+              if (!Object.hasOwn(row, column))
+                throw new Error("WITNESS_OBSERVATION_MISMATCH");
+              return [column, row[column]];
+            }),
+          ),
+        ),
+      ),
     };
   });
   return {

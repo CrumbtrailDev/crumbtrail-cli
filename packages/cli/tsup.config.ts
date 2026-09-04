@@ -15,6 +15,7 @@ export default defineConfig({
     "src/testing.ts",
   ],
   format: ["esm", "cjs"],
+  removeNodeProtocol: false,
   // crumbtrail-core is bundled, not required at runtime: the CLI declares no
   // dependencies, and the only thing it needs from core is a handful of
   // constants that tree-shake down to inline values. Declaring it here rather

@@ -15,6 +15,10 @@ export interface WitnessStatement {
   predicates: WitnessPredicate[];
   keySets?: WitnessPredicate[][];
   minimumRows?: number;
+  relatedRows?: Pick<
+    WitnessStatement,
+    "table" | "identifyingColumns" | "predicates"
+  >[];
 }
 export interface DataWitness {
   schemaVersion: "data-witness.v1";
@@ -89,6 +93,7 @@ export function validateDataWitness(
             "predicates",
             "keySets",
             "minimumRows",
+            "relatedRows",
           ].includes(key),
       ) ||
       typeof statement.table !== "string" ||
@@ -134,6 +139,28 @@ export function validateDataWitness(
         ))
     ) {
       throw new WitnessValidationError("invalid_witness");
+    }
+    if (statement.relatedRows !== undefined) {
+      if (
+        !Array.isArray(statement.relatedRows) ||
+        statement.relatedRows.length > 2
+      )
+        throw new WitnessValidationError("invalid_witness");
+      for (const related of statement.relatedRows) {
+        if (
+          !related ||
+          Object.keys(related).some(
+            (key) =>
+              !["table", "identifyingColumns", "predicates"].includes(key),
+          )
+        )
+          throw new WitnessValidationError("invalid_witness");
+        validateDataWitness({
+          ...witness,
+          requiresBoundKey: true,
+          statements: [related],
+        });
+      }
     }
     const allPredicates = [
       ...statement.predicates,
@@ -190,6 +217,7 @@ export interface CompiledWitnessStatement {
   table: string;
   parameterColumns: string[];
   filter?: Record<string, unknown>;
+  relatedFilters?: { table: string; filter: Record<string, unknown> }[];
   minimumRows?: number;
 }
 export function compileDataWitness(
@@ -248,6 +276,14 @@ export function compileDataWitness(
       const shape = {
         find: statement.table,
         filter: mongoFilter(true),
+        ...(statement.relatedRows?.length
+          ? {
+              relatedRows: statement.relatedRows.map((row) => ({
+                table: row.table,
+                filter: document(row.predicates, true),
+              })),
+            }
+          : {}),
         ...(statement.minimumRows !== undefined
           ? { minimumRows: bind("__ct_witness_minimum", statement.minimumRows) }
           : {}),
@@ -259,12 +295,20 @@ export function compileDataWitness(
         identifyingColumns: statement.identifyingColumns,
         table: statement.table,
         filter,
+        relatedFilters: statement.relatedRows?.map((row) => ({
+          table: row.table,
+          filter: document(row.predicates, false),
+        })),
         minimumRows: statement.minimumRows,
       };
     }
     let where = statement.predicates.map(equal).join(" AND ");
     if (statement.keySets)
       where += ` AND (${statement.keySets.map((keys) => `(${keys.map(equal).join(" AND ")})`).join(" OR ")})`;
+    for (const related of statement.relatedRows ?? []) {
+      const relatedTable = related.table.split(".").map(quote).join(".");
+      where += ` AND EXISTS (SELECT 1 FROM ${relatedTable} WHERE ${related.predicates.map(equal).join(" AND ")})`;
+    }
     const columns = statement.identifyingColumns.map(quote).join(", ");
     const table = statement.table.split(".").map(quote).join(".");
     const shape =
