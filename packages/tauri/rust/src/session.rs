@@ -1,18 +1,85 @@
 use serde_json::Value;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::post_process;
 use crate::writer;
+
+/// Longest accepted path segment. Comfortably above any id or blob name the SDK
+/// produces, and below the 255 byte component limit every target filesystem enforces.
+const MAX_SEGMENT_LEN: usize = 128;
 
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Every id and file name reaching this module comes from the webview, so any
+/// content or script running there chooses it. Validate each one as a single
+/// path segment before it is joined onto a base directory, and reject anything
+/// that fails: sanitising instead would silently map two distinct sessions onto
+/// one directory.
+///
+/// A charset check alone is not enough. `..` is made only of accepted characters,
+/// and `Path::join` with an absolute argument discards the base path entirely, so
+/// an absolute string escapes with no `..` in it at all.
+fn validate_segment(segment: &str, what: &str) -> io::Result<()> {
+    let reject = |reason: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {what}: {reason}"),
+        ))
+    };
+
+    if segment.is_empty() {
+        return reject("empty");
+    }
+    if segment.len() > MAX_SEGMENT_LEN {
+        return reject("too long");
+    }
+    if segment == "." || segment == ".." {
+        return reject("relative path segment");
+    }
+    if !segment
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return reject("disallowed character");
+    }
+
+    // Belt and braces: the charset above already excludes separators, drive
+    // prefixes and NUL, but the parse is what actually proves the result is one
+    // ordinary component rather than a root, a prefix, or a traversal.
+    let path = Path::new(segment);
+    if path.is_absolute() || path.has_root() {
+        return reject("absolute path");
+    }
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::Normal(_)) => {}
+        _ => return reject("not a plain path segment"),
+    }
+    if components.next().is_some() {
+        return reject("more than one path segment");
+    }
+
+    Ok(())
+}
+
+/// Take the write lock, recovering the guard if a previous holder panicked.
+///
+/// `lock().unwrap()` on a poisoned mutex panics, and because the poison is
+/// permanent that turns one panicked write into every later write failing for
+/// the life of the process. A poisoned lock guards no data of its own here, so
+/// recovering it degrades capture for the panicked write only rather than
+/// ending capture entirely.
+fn write_guard(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct SessionState {
@@ -36,22 +103,18 @@ impl SessionState {
         }
     }
 
-    fn session_dir(&self, session_id: &str) -> PathBuf {
-        self.output_dir.join(session_id)
+    fn session_dir(&self, session_id: &str) -> io::Result<PathBuf> {
+        validate_segment(session_id, "session id")?;
+        Ok(self.output_dir.join(session_id))
     }
 
     fn bug_dir(&self, bug_id: &str) -> io::Result<PathBuf> {
-        if !bug_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-        {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid bug id"));
-        }
+        validate_segment(bug_id, "bug id")?;
         Ok(self.bugs_dir.join(bug_id))
     }
 
     pub fn create_session(&self, session_id: &str, metadata: &Value) -> io::Result<()> {
-        let session_dir = self.session_dir(session_id);
+        let session_dir = self.session_dir(session_id)?;
         fs::create_dir_all(&session_dir)?;
         fs::create_dir_all(session_dir.join("frames"))?;
 
@@ -72,8 +135,8 @@ impl SessionState {
     }
 
     pub fn append_events(&self, session_id: &str, events: &[Value]) -> io::Result<()> {
-        let _lock = self.write_lock.lock().unwrap();
-        let events_path = self.session_dir(session_id).join("events.ndjson");
+        let events_path = self.session_dir(session_id)?.join("events.ndjson");
+        let _lock = write_guard(&self.write_lock);
         writer::append_ndjson(&events_path, events)
     }
 
@@ -84,12 +147,13 @@ impl SessionState {
         data: &[u8],
         _metadata: &Value,
     ) -> io::Result<()> {
-        let blob_path = self.session_dir(session_id).join(name);
+        validate_segment(name, "blob name")?;
+        let blob_path = self.session_dir(session_id)?.join(name);
         writer::write_binary(&blob_path, data)
     }
 
     pub fn finalize_session(&self, session_id: &str) -> io::Result<()> {
-        let session_dir = self.session_dir(session_id);
+        let session_dir = self.session_dir(session_id)?;
         let meta_path = session_dir.join("meta.json");
 
         if meta_path.exists() {
@@ -116,7 +180,7 @@ impl SessionState {
         fs::create_dir_all(&bug_dir)?;
         fs::create_dir_all(bug_dir.join("frames"))?;
 
-        let _lock = self.write_lock.lock().unwrap();
+        let _lock = write_guard(&self.write_lock);
         writer::append_ndjson(&bug_dir.join("events.ndjson"), events)?;
         fs::write(
             bug_dir.join("report.json"),
@@ -206,6 +270,227 @@ mod tests {
             &fs::read_to_string(dir.path().join("ses_001/meta.json")).unwrap()
         ).unwrap();
         assert!(meta["end"].as_u64().unwrap() > 0);
+    }
+
+    // Path traversal regressions. Every id and blob name below is reachable from
+    // the webview through the commands in `commands.rs`, all of which
+    // `permissions/default.toml` grants by default.
+
+    /// Ids and names that must never reach the filesystem. `..` and `.` pass a
+    /// charset check unchanged; an absolute path escapes with no `..` at all,
+    /// because `Path::join` with an absolute argument replaces the base entirely.
+    fn escaping_segments() -> Vec<&'static str> {
+        vec![
+            "..",
+            ".",
+            "",
+            "../evil",
+            "../../etc/passwd",
+            "..\\..\\windows",
+            "/etc/passwd",
+            "/tmp/evil",
+            "C:\\Windows\\System32",
+            "\\\\server\\share",
+            "sub/dir",
+            "ses\0null",
+        ]
+    }
+
+    #[test]
+    fn validate_segment_accepts_ordinary_ids() {
+        for ok in ["ses_001", "ses-20260904.120000", "a", "bug_1.2.3-rc1"] {
+            validate_segment(ok, "test").unwrap_or_else(|e| panic!("{ok} rejected: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_segment_rejects_every_escape_shape() {
+        for bad in escaping_segments() {
+            let err = validate_segment(bad, "test")
+                .expect_err(&format!("{bad:?} was accepted"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::join_absolute_paths)]
+    fn validate_segment_rejects_absolute_path_specifically() {
+        // Distinct from the traversal cases: no `..` anywhere, yet
+        // `base.join("/tmp/evil")` yields `/tmp/evil` and abandons `base`.
+        let base = PathBuf::from("/var/app/sessions");
+        assert_eq!(base.join("/tmp/evil"), PathBuf::from("/tmp/evil"));
+        validate_segment("/tmp/evil", "test").unwrap_err();
+    }
+
+    #[test]
+    fn validate_segment_rejects_overlong_id() {
+        let long = "a".repeat(MAX_SEGMENT_LEN + 1);
+        validate_segment(&long, "test").unwrap_err();
+        validate_segment(&"a".repeat(MAX_SEGMENT_LEN), "test").unwrap();
+    }
+
+    /// Nothing outside the session root may be created, whichever command is used.
+    fn assert_nothing_escaped(root: &TempDir) {
+        let outside = root.path().parent().unwrap();
+        for stray in ["evil", "evil.ndjson", "pwned.png", "etc"] {
+            assert!(
+                !outside.join(stray).exists(),
+                "{stray} was written outside the session root"
+            );
+        }
+    }
+
+    #[test]
+    fn create_session_rejects_escaping_session_id() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        for bad in escaping_segments() {
+            state
+                .create_session(bad, &json!({}))
+                .expect_err(&format!("create_session accepted {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn append_events_rejects_escaping_session_id() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        let events = vec![json!({"t": 1, "k": "con", "d": {}})];
+        for bad in escaping_segments() {
+            state
+                .append_events(bad, &events)
+                .expect_err(&format!("append_events accepted {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn finalize_session_rejects_escaping_session_id() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        for bad in escaping_segments() {
+            state
+                .finalize_session(bad)
+                .expect_err(&format!("finalize_session accepted {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn write_blob_rejects_escaping_blob_name() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        state.create_session("ses_001", &json!({})).unwrap();
+        for bad in escaping_segments() {
+            state
+                .write_blob("ses_001", bad, b"pwned", &json!({}))
+                .expect_err(&format!("write_blob accepted name {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn write_blob_rejects_absolute_blob_name() {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("absolute-target.png");
+        let state = SessionState::new(root.path().join("sessions"));
+        state.create_session("ses_001", &json!({})).unwrap();
+
+        // No `..` in this name. Without validation `session_dir.join(name)`
+        // discards the session directory and writes straight to `target`.
+        state
+            .write_blob("ses_001", target.to_str().unwrap(), b"pwned", &json!({}))
+            .unwrap_err();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn write_blob_rejects_escaping_session_id() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        for bad in escaping_segments() {
+            state
+                .write_blob(bad, "screenshot.png", b"pwned", &json!({}))
+                .expect_err(&format!("write_blob accepted session id {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn flag_bug_rejects_escaping_bug_id() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        for bad in escaping_segments() {
+            state
+                .flag_bug(&json!({"bugId": bad}), &[])
+                .expect_err(&format!("flag_bug accepted {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn write_bug_voice_rejects_escaping_bug_id() {
+        let root = TempDir::new().unwrap();
+        let state = SessionState::new(root.path().join("sessions"));
+        for bad in escaping_segments() {
+            state
+                .write_bug_voice(bad, b"pwned")
+                .expect_err(&format!("write_bug_voice accepted {bad:?}"));
+        }
+        assert_nothing_escaped(&root);
+    }
+
+    #[test]
+    fn valid_ids_still_write_inside_their_own_directories() {
+        let root = TempDir::new().unwrap();
+        let sessions = root.path().join("sessions");
+        let state = SessionState::new(sessions.clone());
+
+        state.create_session("ses_001", &json!({})).unwrap();
+        state.write_blob("ses_001", "frames.0001.png", &[1, 2], &json!({})).unwrap();
+        state.flag_bug(&json!({"bugId": "bug_1"}), &[]).unwrap();
+
+        assert!(sessions.join("ses_001/frames.0001.png").exists());
+        assert!(root.path().join("crumbtrail-bugs/bug_1/report.json").exists());
+    }
+
+    #[test]
+    fn write_guard_recovers_from_a_poisoned_lock() {
+        // A panic while holding the lock must degrade one write, not end capture
+        // for the life of the process.
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let poisoner = std::sync::Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("capture write panicked");
+        })
+        .join();
+
+        assert!(lock.is_poisoned());
+        let _recovered = write_guard(&lock);
+    }
+
+    #[test]
+    fn capture_continues_after_a_poisoned_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let state = std::sync::Arc::new(SessionState::new(dir.path().to_path_buf()));
+        state.create_session("ses_001", &json!({})).unwrap();
+
+        let poisoner = std::sync::Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _held = write_guard(&poisoner.write_lock);
+            panic!("capture write panicked");
+        })
+        .join();
+
+        assert!(state.write_lock.is_poisoned());
+        state
+            .append_events("ses_001", &[json!({"t": 2, "k": "con", "d": {}})])
+            .expect("capture must survive a poisoned write lock");
+
+        let content = fs::read_to_string(dir.path().join("ses_001/events.ndjson")).unwrap();
+        assert!(content.contains("\"k\":\"con\""));
     }
 
     #[test]
