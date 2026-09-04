@@ -48,7 +48,7 @@ sent it in a body or wrote it to storage, and any signal that two implementation
 is a comparison you set up, not a fact the product detects.
 
 No detector names a parity gap. Detectors that do fire on its downstream symptoms, and that you
-will see named in the candidate list, are `ui_api_divergence`, `displayed_field_mismatch`,
+will see named in the candidate list, are `displayed_field_mismatch`,
 `db_write_read_column_split`, `result_row_loss` and `stale_client_build`.
 
 One operational limit worth knowing before you plan the work: `getRegressionContext` and
