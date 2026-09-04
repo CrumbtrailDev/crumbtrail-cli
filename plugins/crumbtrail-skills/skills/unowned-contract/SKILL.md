@@ -32,7 +32,7 @@ joined frontend and backend view of one request id.
 Several named detector signals point straight at this archetype when they fire:
 `content_type_body_mismatch`, `api_route_returned_document` (a document arriving where structured
 data was expected, which is what an expired session or a moved authentication endpoint looks
-like), `response_count_mismatch`, `ui_api_divergence`, `backend_http_error`,
+like), `response_count_mismatch`, `backend_http_error`,
 `backend_http_client_error` and `invalid_webhook_signature_accepted`.
 
 It does not see a call your backend makes to a vendor unless the backend integration is installed

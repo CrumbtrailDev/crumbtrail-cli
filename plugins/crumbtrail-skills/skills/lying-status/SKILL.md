@@ -42,7 +42,7 @@ names, are `acknowledged_write_never_landed`, `acknowledged_write_lost`,
 `acknowledged_batch_rows_missing`, `acknowledged_state_contradicted_by_read`,
 `response_count_mismatch`, `derived_count_below_observed_inserts`, `counter_contradiction`,
 `report_total_contradicts_source_row`, `job_did_not_complete`, `job_drain_left_work_deferred`,
-`downstream_succeeded_after_timeout` and `ui_api_divergence`.
+and `downstream_succeeded_after_timeout`.
 
 What it cannot see, and this is the load bearing caveat for the whole skill: work that happens
 outside a recorded process. A queue consumer, a scheduled job, a second service without the backend
