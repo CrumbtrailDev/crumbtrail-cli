@@ -115,7 +115,12 @@ function isSSE(ct: string): boolean {
   return ct.toLowerCase().includes("text/event-stream");
 }
 
-function shouldExclude(url: string, config: CrumbtrailConfig): boolean {
+/**
+ * Exported because the admission hold re-asks this question at release time: a
+ * policy that arrives while events are held may add an `excludeUrls` pattern,
+ * and a held request for a now-excluded URL must not reach the wire.
+ */
+export function shouldExclude(url: string, config: CrumbtrailConfig): boolean {
   if (config.httpEndpoint && url.includes(config.httpEndpoint)) return true;
   return config.networkExcludeUrls.some((pattern) => url.includes(pattern));
 }
@@ -337,7 +342,11 @@ function extractRequestBody(
       typeof FormData !== "undefined" && body instanceof FormData
         ? body
         : undefined;
-    return { body: readable, nonText: false, ...(formData ? { formData } : {}) };
+    return {
+      body: readable,
+      nonText: false,
+      ...(formData ? { formData } : {}),
+    };
   }
   return { nonText: true };
 }

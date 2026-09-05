@@ -105,6 +105,11 @@ import {
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
 import {
+  readMaskingState,
+  reapplyPolicyToHeldEvent,
+  type MaskingState,
+} from "./admission-hold";
+import {
   CRUMBTRAIL_SDK_VERSION,
   readApplicationReleaseIdentity,
   type ApplicationReleaseIdentity,
@@ -624,8 +629,16 @@ export class Crumbtrail {
    * ever transporting them, which is the same outcome refusing them had.
    */
   private pendingAdmissionEvents: BugEvent[] = [];
-  /** Events the hold's own cap discarded, reported as one `capture_gap`. */
+  /** Events the hold discarded, by its cap or by the policy, as one `capture_gap`. */
   private pendingAdmissionDropped = 0;
+  /**
+   * The masking switches in force when the hold started. A policy that tightens
+   * them cannot be applied retroactively to content already rendered into an
+   * event, so the release pass drops those events instead of guessing.
+   */
+  private pendingAdmissionMasking?: MaskingState;
+  /** Guards against a released event being re-held by its own emit. */
+  private releasingAdmissionHold = false;
   private samplingShed: boolean;
   private samplingGapEmitted = false;
   /** Bounded so an endpoint that is refusing everything cannot storm the bus. */
@@ -1804,6 +1817,11 @@ export class Crumbtrail {
     if (!wasShed && this.samplingShed) {
       this.bus.clear();
       this.ringBuffer.clear();
+      // The hold is the third place events rest, and it holds the first screen.
+      // A visitor this policy just shed must not upload it.
+      this.pendingAdmissionEvents = [];
+      this.pendingAdmissionDropped = 0;
+      this.pendingAdmissionMasking = undefined;
       this.emitSamplingGapIfNeeded();
     }
   }
@@ -2189,6 +2207,12 @@ export class Crumbtrail {
       // gate first would make the subscriber discard the final batch.
       this.applicationExpectations.stop();
       this.bus.flush();
+      // Anything still held belongs to the session that is ending. Carrying it
+      // past the close would replay pre-suspend events, with pre-suspend
+      // timestamps, into the new session `resumeFromLifecycle` mints.
+      this.pendingAdmissionEvents = [];
+      this.pendingAdmissionDropped = 0;
+      this.pendingAdmissionMasking = undefined;
       this.lifecycleClosing = true;
       this.expirePersistedVisit();
       try {
@@ -2605,11 +2629,18 @@ export class Crumbtrail {
   private isCaptureDenied(): boolean {
     if (this.stopped || this.killSwitch || this.explicitConsent === false)
       return true;
-    // Global Privacy Control is an answer, not a pending question. Without this
-    // a suppressed session would hold evidence waiting for a consent call the
-    // host has already been told not to make.
+    // Global Privacy Control is an answer, not a pending question: a suppressed
+    // session would otherwise hold evidence forever, waiting for a consent call
+    // the host has already been told not to make.
+    //
+    // Except under `consentMode: "required"`, where the host is expected to
+    // answer and may still answer yes. Destroying the early queue on the first
+    // poll would take the first screen away from every consent-gated app,
+    // which is the loss this hold exists to prevent. Those events rest in page
+    // memory and reach the wire only if consent is granted.
     return (
       this.explicitConsent === undefined &&
+      this.config.consentMode !== "required" &&
       Boolean(this.config.respectGpc) &&
       hasGlobalPrivacyControl()
     );
@@ -2636,6 +2667,10 @@ export class Crumbtrail {
     // A shed session records nothing but the gap that says it was shed, so
     // there is nothing here worth holding for it.
     if (this.samplingShed && event.k !== CAPTURE_GAP_EVENT_KIND) return;
+    // An event the release pass just emitted must never fall back into the
+    // hold it came out of.
+    if (this.releasingAdmissionHold) return;
+    this.pendingAdmissionMasking ??= readMaskingState(this.config);
     this.pendingAdmissionEvents.push(event);
     const overflow =
       this.pendingAdmissionEvents.length - MAX_PENDING_ADMISSION_EVENTS;
@@ -2654,11 +2689,36 @@ export class Crumbtrail {
    */
   private releasePendingAdmissionEvents(admitted: boolean): void {
     const held = this.pendingAdmissionEvents;
-    const dropped = this.pendingAdmissionDropped;
+    let dropped = this.pendingAdmissionDropped;
+    const heldMasking =
+      this.pendingAdmissionMasking ?? readMaskingState(this.config);
     this.pendingAdmissionEvents = [];
     this.pendingAdmissionDropped = 0;
+    this.pendingAdmissionMasking = undefined;
     if (!admitted || held.length === 0) return;
-    for (const event of held) this.bus.emit(event, { bypassAdmission: true });
+
+    // The policy that just opened the gate may also have narrowed what may be
+    // captured, and these events were BUILT before it arrived. Each one is
+    // re-asked under the current policy and dropped when it no longer passes.
+    // Nothing bypasses admission: the same predicate that gates a live event
+    // gates a released one.
+    this.releasingAdmissionHold = true;
+    try {
+      for (const event of held) {
+        const allowed = reapplyPolicyToHeldEvent(event, this.config, {
+          heldMasking,
+          samplingShed: this.samplingShed,
+        });
+        if (!allowed) {
+          dropped += 1;
+          continue;
+        }
+        if (!this.bus.emit(allowed)) dropped += 1;
+      }
+    } finally {
+      this.releasingAdmissionHold = false;
+    }
+
     if (dropped > 0) {
       this.bus.emit(
         buildCaptureGapEvent({
@@ -2667,7 +2727,6 @@ export class Crumbtrail {
           droppedEventCount: dropped,
           sessionId: this.sessionId,
         }),
-        { bypassAdmission: true },
       );
     }
   }

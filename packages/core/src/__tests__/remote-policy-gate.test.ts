@@ -16,10 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail, REMOTE_POLICY_TIMEOUT_MS } from "../crumbtrail";
-import {
-  installEarlyCapture,
-  uninstallEarlyCapture,
-} from "../early-capture";
+import { installEarlyCapture, uninstallEarlyCapture } from "../early-capture";
 import { CAPTURE_GAP_EVENT_KIND, type BugEvent } from "../types";
 
 function makeTransport() {
@@ -132,7 +129,6 @@ describe("the window between init() and the first capture policy", () => {
     expect(String(early[0]?.d?.url)).toContain("/api/orders");
   });
 
-
   // The dogfood shape: an application that imports `crumbtrail-core/early`,
   // initializes with `remoteConfig: true`, and loads its first screen while the
   // capture policy is still in flight. Three of the four requests came back as
@@ -195,9 +191,7 @@ describe("the window between init() and the first capture policy", () => {
     const responses = events.filter((event) => event.k === "net.res");
     const appUrl = (event: BugEvent) => String(event.d?.url);
 
-    expect(requests.map(appUrl).sort()).toEqual(
-      responses.map(appUrl).sort(),
-    );
+    expect(requests.map(appUrl).sort()).toEqual(responses.map(appUrl).sort());
     for (const url of [
       "/api/participants",
       "/held/api/disputes",
@@ -214,7 +208,6 @@ describe("the window between init() and the first capture policy", () => {
     }
     expect(new Set(requests.map((event) => event.d?.id)).size).toBe(4);
   });
-
 
   // The hold must never become a way for evidence to reach the wire after the
   // host said no. A decision against capture discards it.
@@ -233,7 +226,7 @@ describe("the window between init() and the first capture policy", () => {
       httpEndpoint: "https://api.crumbtrail.test",
       httpAuthToken: "ctkey_live",
       remoteConfig: true,
-      consentMode: "explicit",
+      consentMode: "required",
     });
 
     logger.mark("before-the-answer");
@@ -261,7 +254,7 @@ describe("the window between init() and the first capture policy", () => {
       httpEndpoint: "https://api.crumbtrail.test",
       httpAuthToken: "ctkey_live",
       remoteConfig: true,
-      consentMode: "explicit",
+      consentMode: "required",
     });
 
     await globalThis.fetch("/api/participants");
@@ -273,7 +266,8 @@ describe("the window between init() and the first capture policy", () => {
     const forUrl = (kind: string) =>
       events.filter(
         (event) =>
-          event.k === kind && String(event.d?.url).includes("/api/participants"),
+          event.k === kind &&
+          String(event.d?.url).includes("/api/participants"),
       );
     expect(forUrl("net.req")).toHaveLength(1);
     expect(forUrl("net.res")).toHaveLength(1);
@@ -305,9 +299,7 @@ describe("the window between init() and the first capture policy", () => {
 
     const events = delivered(transport);
     expect(events.filter((event) => event.k === "mark")).toHaveLength(1);
-    const gaps = events.filter(
-      (event) => event.k === CAPTURE_GAP_EVENT_KIND,
-    );
+    const gaps = events.filter((event) => event.k === CAPTURE_GAP_EVENT_KIND);
     expect(gaps.map((event) => event.d?.reason)).toContain(
       "policy_unavailable",
     );
@@ -351,5 +343,288 @@ describe("the window between init() and the first capture policy", () => {
         .filter((event) => event.k === CAPTURE_GAP_EVENT_KIND)
         .map((event) => event.d?.reason),
     ).toContain("policy_unavailable");
+  });
+});
+
+/**
+ * A held event was BUILT under the local config. The policy that releases it may
+ * also have narrowed what may be captured at all, so release re-asks every
+ * question the built event can still answer and drops what no longer passes.
+ * Each case here tightens exactly one control and proves the held events obey it.
+ */
+describe("a policy that tightens while events are held", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    uninstallEarlyCapture();
+    globalThis.fetch = originalFetch;
+    sessionStorage.clear();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Holds one request carrying a secret-shaped body, then answers the config
+   * route with `policy`, then returns everything the transport received.
+   */
+  async function holdThenApply(
+    policy: Record<string, unknown>,
+    options: {
+      url?: string;
+      body?: string;
+      init?: Record<string, unknown>;
+    } = {},
+  ): Promise<BugEvent[]> {
+    let answerConfig: (() => void) | undefined;
+    const configAnswer = new Promise<Response>((resolve) => {
+      answerConfig = () => resolve(new Response(JSON.stringify(policy)));
+    });
+    const fetchStub = vi.fn().mockImplementation((input: unknown) => {
+      if (String(input).includes("/api/capture-config")) return configAnswer;
+      return Promise.resolve(appResponse());
+    });
+    globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      network: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+      ...options.init,
+    });
+
+    await globalThis.fetch(options.url ?? "/api/kyc", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-secret": "value" },
+      body: options.body ?? JSON.stringify({ ssn: "123-45-6789" }),
+    });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    answerConfig?.();
+    await configAnswer;
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    await logger.stop();
+    return delivered(transport);
+  }
+
+  it("drops a held request for a URL the policy now excludes", async () => {
+    const events = await holdThenApply({
+      killSwitch: false,
+      network: { excludeUrls: ["/api/kyc"] },
+    });
+    expect(
+      events.filter((event) => String(event.d?.url).includes("/api/kyc")),
+    ).toHaveLength(0);
+    // The loss is declared rather than silent.
+    expect(
+      events
+        .filter((event) => event.k === CAPTURE_GAP_EVENT_KIND)
+        .map((event) => event.d?.reason),
+    ).toContain("buffer_overflow");
+  });
+
+  it("drops held events of a collector the policy turned off", async () => {
+    const events = await holdThenApply({
+      killSwitch: false,
+      collectors: { network: false },
+    });
+    expect(
+      events.filter((event) => event.k === "net.req" || event.k === "net.res"),
+    ).toHaveLength(0);
+  });
+
+  it("re-redacts a held body under denyFields the policy added", async () => {
+    const events = await holdThenApply(
+      {
+        killSwitch: false,
+        redaction: { denyFields: ["coupon"] },
+      },
+      { body: JSON.stringify({ coupon: "SAVE50" }) },
+    );
+    const bodies = JSON.stringify(
+      events.filter((event) => event.k === "net.req"),
+    );
+    expect(bodies).not.toContain("SAVE50");
+    expect(events.filter((event) => event.k === "net.req").length).toBe(1);
+  });
+
+  // `captureInputValues: false` is the one-way switch that turns every input
+  // into a placeholder. A value typed on the first screen is held, so this is
+  // the only place the switch can still reach it.
+  it("blanks a held input value when the policy turns input capture off", async () => {
+    let answerConfig: (() => void) | undefined;
+    const configAnswer = new Promise<Response>((resolve) => {
+      answerConfig = () =>
+        resolve(
+          new Response(
+            JSON.stringify({
+              killSwitch: false,
+              redaction: { captureInputValues: false },
+            }),
+          ),
+        );
+    });
+    globalThis.fetch = vi.fn().mockImplementation((input: unknown) => {
+      if (String(input).includes("/api/capture-config")) return configAnswer;
+      return Promise.resolve(appResponse());
+    }) as unknown as typeof globalThis.fetch;
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      interactions: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+    });
+
+    const field = document.createElement("input");
+    field.name = "search";
+    field.value = "Sofia Restrepo";
+    document.body.appendChild(field);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+
+    answerConfig?.();
+    await configAnswer;
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    await logger.stop();
+    field.remove();
+
+    const events = delivered(transport);
+    const inputs = events.filter((event) => event.k === "inp");
+    expect(inputs.length).toBeGreaterThan(0);
+    expect(JSON.stringify(inputs)).not.toContain("Sofia Restrepo");
+    // Held, the value was the character-shape mask the default policy produces,
+    // which still carries its length and word count. The opt-out replaces the
+    // value outright, and it has to reach the held event to mean anything.
+    for (const event of inputs) expect(event.d?.val).toBe("[REDACTED]");
+  });
+
+  it("strips held request headers when the policy turns header capture off", async () => {
+    const withHeaders = await holdThenApply({ killSwitch: false });
+    expect(
+      withHeaders.some(
+        (event) => event.k === "net.req" && event.d?.hdrs !== undefined,
+      ),
+    ).toBe(true);
+
+    const withoutHeaders = await holdThenApply({
+      killSwitch: false,
+      network: { captureHeaders: false },
+    });
+    expect(
+      withoutHeaders.some(
+        (event) => event.k === "net.req" && event.d?.hdrs !== undefined,
+      ),
+    ).toBe(false);
+  });
+
+  it("summarizes a held body the policy's lowered size cap no longer allows", async () => {
+    const big = JSON.stringify({ note: "x".repeat(4_000) });
+    const events = await holdThenApply(
+      { killSwitch: false, network: { maxBodySize: 64 } },
+      { body: big },
+    );
+    const request = events.find((event) => event.k === "net.req");
+    expect(request).toBeDefined();
+    // Over the cap the body is replaced by a summary that says so, rather than
+    // riding out at the size the looser config allowed.
+    expect(request?.d?.body).toBeUndefined();
+    expect(request?.d?.bodySummary).toMatchObject({
+      action: "summarized",
+      reason: "payload_too_large",
+      limit: 64,
+    });
+  });
+
+  // A shed visitor uploads nothing. The hold is the third place events rest,
+  // after the bus buffer and the ring buffer, and it holds the first screen.
+  it("uploads nothing held when the policy sheds the session", async () => {
+    const events = await holdThenApply({
+      killSwitch: false,
+      sampling: { captureSampleRate: 0 },
+    });
+    expect(
+      events.filter((event) => event.k === "net.req" || event.k === "net.res"),
+    ).toHaveLength(0);
+  });
+});
+
+describe("the hold and the page lifecycle", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    uninstallEarlyCapture();
+    globalThis.fetch = originalFetch;
+    sessionStorage.clear();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // Events held before a page hide belong to the session that is ending. Carried
+  // across, they would surface in the next session with pre-suspend timestamps.
+  it("does not carry events held before a page hide into the next session", async () => {
+    let answerConfig: (() => void) | undefined;
+    const configAnswer = new Promise<Response>((resolve) => {
+      answerConfig = () => resolve(new Response(RECOGNIZED_POLICY));
+    });
+    const fetchStub = vi.fn().mockImplementation((input: unknown) => {
+      if (String(input).includes("/api/capture-config")) return configAnswer;
+      return Promise.resolve(appResponse());
+    });
+    globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      network: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+      endOnPageHide: true,
+    });
+
+    await globalThis.fetch("/api/participants");
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    const internals = logger as unknown as {
+      closeForLifecycle(immediate: boolean): Promise<void>;
+      resumeFromLifecycle(): Promise<void> | undefined;
+    };
+    await internals.closeForLifecycle(true);
+    // Everything the transport saw up to here belongs to the session that ended.
+    const beforeResume = transport.sendEvents.mock.calls.length;
+    await internals.resumeFromLifecycle();
+
+    answerConfig?.();
+    await configAnswer;
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    await logger.stop();
+
+    const afterResume = transport.sendEvents.mock.calls
+      .slice(beforeResume)
+      .flatMap((call) => call[0] as BugEvent[]);
+    expect(
+      afterResume.filter((event) =>
+        String(event.d?.url).includes("/api/participants"),
+      ),
+    ).toHaveLength(0);
   });
 });
