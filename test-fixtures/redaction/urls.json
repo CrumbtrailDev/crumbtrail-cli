@@ -1,0 +1,94 @@
+{
+  "cases": [
+    {
+      "name": "empty input is not a URL",
+      "input": "",
+      "expected": "[REDACTED]"
+    },
+    {
+      "name": "plain request URL is untouched",
+      "input": "https://api.example.com/v1/orders",
+      "expected": "https://api.example.com/v1/orders"
+    },
+    {
+      "name": "port is preserved",
+      "input": "http://localhost:8080/api/health",
+      "expected": "http://localhost:8080/api/health"
+    },
+    {
+      "name": "userinfo and fragment are dropped",
+      "input": "https://user:hunter2@api.example.com/v1/orders#access_token=abc",
+      "expected": "https://api.example.com/v1/orders"
+    },
+    {
+      "name": "credential query key redacts its value and keeps the rest",
+      "input": "https://api.example.com/v1?page=2&access_token=abc123&q=shoes",
+      "expected": "https://api.example.com/v1?page=2&access_token=[REDACTED]&q=shoes"
+    },
+    {
+      "name": "percent encoded credential query key is decoded before the check",
+      "input": "https://api.example.com/api?to%6ben=secret",
+      "expected": "https://api.example.com/api?to%6ben=[REDACTED]"
+    },
+    {
+      "name": "repeated query keys survive as written",
+      "input": "https://api.example.com/api?id=1&id=2",
+      "expected": "https://api.example.com/api?id=1&id=2"
+    },
+    {
+      "name": "an encoded space stays an encoded space",
+      "input": "https://api.example.com/search?q=hello%20world",
+      "expected": "https://api.example.com/search?q=hello%20world"
+    },
+    {
+      "name": "an email in a path segment is a value, not a route",
+      "input": "https://api.example.com/v1/users/omar@shabana.dev/profile",
+      "expected": "https://api.example.com/v1/users/[REDACTED]/profile"
+    },
+    {
+      "name": "a token after a credential preceder is redacted",
+      "input": "https://api.example.com/reset-password/eyJhbGciOiJIUzI1NiJ9.abc.def",
+      "expected": "https://api.example.com/reset-password/[REDACTED]"
+    },
+    {
+      "name": "a credential shaped query value is redacted under a harmless key",
+      "input": "https://api.example.com/api?q=Bearer%20sk-live-1234567890",
+      "expected": "https://api.example.com/api?q=[REDACTED]"
+    },
+    {
+      "name": "a nested URL cannot smuggle a token past the outer key",
+      "input": "https://api.example.com/api?next=https%3A%2F%2Fx.com%3Ftoken%3Dsecret",
+      "expected": "https://api.example.com/api?next=[REDACTED]"
+    },
+    {
+      "name": "a hex identifier in a path is redacted",
+      "input": "https://api.example.com/v1/d41d8cd98f00b204e9800998ecf8427e",
+      "expected": "https://api.example.com/v1/[REDACTED]"
+    },
+    {
+      "name": "a uuid in a path is redacted",
+      "input": "https://api.example.com/orders/3f2504e0-4f89-11d3-9a0c-0305e82c3301/items",
+      "expected": "https://api.example.com/orders/[REDACTED]/items"
+    },
+    {
+      "name": "a product slug is words, not a key",
+      "input": "https://shop.example.com/product/aurora-desk-lamp",
+      "expected": "https://shop.example.com/product/aurora-desk-lamp"
+    },
+    {
+      "name": "a route name after auth stays readable",
+      "input": "https://api.example.com/api/auth/whoami",
+      "expected": "https://api.example.com/api/auth/whoami"
+    },
+    {
+      "name": "a value after a credential preceder is redacted even when it is a word",
+      "input": "https://api.example.com/reset/hunter2",
+      "expected": "https://api.example.com/reset/[REDACTED]"
+    },
+    {
+      "name": "a relative URL keeps only its path",
+      "input": "/v1/orders?access_token=abc",
+      "expected": "/v1/orders"
+    }
+  ]
+}
