@@ -63,6 +63,56 @@ function captionMatchesDenyField(
 }
 
 /**
+ * `redactNetworkTextBody`'s JSON-vs-text detection runs `looksLikeJson`
+ * (first/last char is a matching bracket or brace) REGARDLESS of the
+ * `contentType` we pass it, so a caption like "[Draft]" or "{beta}" is
+ * routed down the JSON branch, `JSON.parse` throws on it (it is not valid
+ * JSON), and the function returns `{ metadata: <a "dropped" field> }` with
+ * no `body` — as if the caption had been inspected and redacted, when
+ * nothing has actually looked at its content. Left alone that produces two
+ * different wrong answers depending on length: at or under the cap,
+ * `redactAccessibleName` falls back to the raw caption for its VALUE (`body
+ * ?? rawLabel`) while still attaching the bogus "dropped" metadata, so the
+ * caption ships in clear tagged as redacted; over the cap, seeing that
+ * metadata makes `redactAccessibleName` drop a caption that no leak check
+ * ever actually cleared.
+ *
+ * A leading zero-width space (not part of `trim()`'s whitespace set, so it
+ * survives the internal `.trim()` that `looksLikeJson` runs) defeats the
+ * bracket sniff without shifting any substring the URL/key-value/token
+ * passes look at, and is stripped back off the returned body afterward.
+ */
+const JSON_SNIFF_GUARD = "\u200B";
+
+function looksBracketWrapped(value: string): boolean {
+  const trimmed = value.trim();
+  return (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  );
+}
+
+function redactCaptionTextPlane(rawLabel: string) {
+  if (!looksBracketWrapped(rawLabel)) {
+    return redactNetworkTextBody(rawLabel, {
+      contentType: "text/plain",
+      path: "el.label",
+    });
+  }
+  const result = redactNetworkTextBody(JSON_SNIFF_GUARD + rawLabel, {
+    contentType: "text/plain",
+    path: "el.label",
+  });
+  if (result.body === undefined) return result;
+  return {
+    ...result,
+    body: result.body.startsWith(JSON_SNIFF_GUARD)
+      ? result.body.slice(JSON_SNIFF_GUARD.length)
+      : result.body,
+  };
+}
+
+/**
  * Runs an accessible name through the redaction the mobile lane already
  * applies to free text (`redactMobileText`'s `redactNetworkTextBody` call,
  * `contentType: "text/plain"`) before the structured classifier gets it.
@@ -82,7 +132,10 @@ function captionMatchesDenyField(
  * {@link captionMatchesDenyField}, an explicit exact-word match against the
  * caption's own words — narrower than the classifier's built-in
  * sensitive-name patterns on purpose, since those now only see the element's
- * real identifier.
+ * real identifier. `redaction.keepFields` is passed straight through to
+ * `classifyStructuredValue` as its fourth argument, exactly as the other
+ * lane (`ui-numbers.ts`) does, so an application that declares `keepFields:
+ * ["email"]` can keep a field actually named `email`.
  *
  * The text-plane pass runs first because it can replace just the sensitive
  * SUBSTRING of a longer sentence (a Bearer token, a key:value pair, an
@@ -106,14 +159,17 @@ function redactAccessibleName(
   rawLabel: string,
   keyName: string | undefined,
   denyFields: string[] | undefined,
+  keepFields: string[] | undefined,
 ): { value: string | undefined; metadata?: RedactionMetadata } {
-  const textPlane = redactNetworkTextBody(rawLabel, {
-    contentType: "text/plain",
-    path: "el.label",
-  });
+  const textPlane = redactCaptionTextPlane(rawLabel);
   const working = textPlane.body ?? rawLabel;
 
-  const classification = classifyStructuredValue(working, keyName, denyFields);
+  const classification = classifyStructuredValue(
+    working,
+    keyName,
+    denyFields,
+    keepFields,
+  );
   const structurallyDenied =
     classification.action === "redact" &&
     classification.reason !== "free_text_value";
@@ -171,6 +227,7 @@ function finalizeAccessibleName(
     rawLabel,
     accessibleNameKey(target),
     config.redaction?.denyFields,
+    config.redaction?.keepFields,
   );
   const merged = mergeRedactionMetadata(
     readDescriptorMetadata(rest),

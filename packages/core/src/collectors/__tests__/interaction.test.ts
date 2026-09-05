@@ -1065,6 +1065,70 @@ describe("interaction target accessible name", () => {
     expect(elOf(clk)?.label).toBe(REDACTED_VALUE);
   });
 
+  it("redacts a card number embedded in a title, never a digit fragment", () => {
+    // Regression: a naive pipeline could ship "...ending in 4111 1111 1111"
+    // (a truncated fragment still containing 12 of the 16 digits) if
+    // classification ran after truncation. The digit run is caught by the
+    // unanchored Luhn scan on the untruncated text, so the whole caption
+    // redacts outright rather than being truncated into a partial number.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<a title="Payment method ending in 4111 1111 1111 1111"></a>';
+    document.querySelector("a")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    const label = elOf(clk)?.label;
+    expect(label === undefined || label === REDACTED_VALUE).toBe(true);
+    expect(String(label ?? "")).not.toMatch(/\d{4}/);
+  });
+
+  it("ships a bracket-wrapped caption in full, with no redaction metadata", () => {
+    // Regression: `redactNetworkTextBody`'s JSON sniff triggers on any
+    // string whose first and last character are a matching bracket/brace,
+    // regardless of the `contentType` passed to it. "[Draft]" is not valid
+    // JSON, so `JSON.parse` used to throw inside that call and the text
+    // plane pass came back with a "malformed_json_body" drop attached to
+    // text nothing had actually inspected — shipping the caption in clear
+    // while `el.redaction` falsely claimed a drop.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = '<button aria-label="[Draft]">go</button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe("[Draft]");
+    expect(clk?.d.redaction).toBeUndefined();
+  });
+
+  it("keeps a field named email when redaction.keepFields declares it", () => {
+    const config: CrumbtrailConfig = {
+      ...DEFAULT_CONFIG,
+      redaction: { ...DEFAULT_CONFIG.redaction, keepFields: ["email"] },
+    };
+    cleanup = interactionCollector(bus, config);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<input name="email" placeholder="Search name, email or employee number">';
+    const input = document.querySelector("input")!;
+    input.value = "Sofia";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe(
+      "Search name, email or employee number",
+    );
+  });
+
   it("suppresses a name matched by redaction.denyFields", () => {
     const config: CrumbtrailConfig = {
       ...DEFAULT_CONFIG,
