@@ -734,18 +734,14 @@ describe("interaction target accessible name", () => {
   // A signature path (`div[id]>div:nth-of-type(1)>...>button:nth-of-type(2)`)
   // cannot distinguish "clicked Next" from any other click. `el.label` is the
   // fix: the target's accessible name, resolved the way a screen reader would.
+  //
+  // Every case here runs against the real, unmodified DEFAULT_CONFIG: an
+  // authored caption is not user content, so it survives
+  // `maskAllText`/`maskAllInputs` on its own, and a test that had to defeat
+  // masking to observe the field would be proving nothing about production.
   let bus: EventBus;
   let events: BugEvent[];
   let cleanup: () => void;
-
-  // DEFAULT_CONFIG masks all DOM text by default, so these cases run unmasked
-  // to see the name a reader would actually get; the last case restores the
-  // default to prove a masked element carries none at all.
-  const unmaskedConfig: CrumbtrailConfig = {
-    ...DEFAULT_CONFIG,
-    maskAllText: false as unknown as true,
-    maskAllInputs: false as unknown as true,
-  };
 
   const elOf = (event: BugEvent | undefined) =>
     event?.d.el as Record<string, unknown> | undefined;
@@ -761,8 +757,8 @@ describe("interaction target accessible name", () => {
     document.body.innerHTML = "";
   });
 
-  it("names a click target by its visible text", () => {
-    cleanup = interactionCollector(bus, unmaskedConfig);
+  it("names a click target by its visible text, against the production default config", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
@@ -775,7 +771,30 @@ describe("interaction target accessible name", () => {
   });
 
   it("names a typed-into input by its placeholder", () => {
-    cleanup = interactionCollector(bus, unmaskedConfig);
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = '<input placeholder="Preferred contact time">';
+    const input = document.querySelector("input")!;
+    input.value = "Sofia";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe("Preferred contact time");
+  });
+
+  it("redacts the fix plan's own example placeholder, because 'email' names a PII-shaped field", () => {
+    // "Search name, email or employee number" is the literal placeholder text
+    // from the dogfood target app that motivated this feature (F4 in the fix
+    // plan). It still redacts: the word "email" matches the same
+    // deny-name/PII pattern a field named `email` would, and the classifier
+    // cannot tell "this text names an email field" from "this text ships an
+    // email value" — the same accepted-residual-risk tradeoff `ui-numbers.ts`
+    // makes for `isDeniedLabel`. The benign-placeholder case above proves
+    // ordinary caption capture still works when no such word is present.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
@@ -787,11 +806,11 @@ describe("interaction target accessible name", () => {
     bus.flush();
 
     const inp = events.find((e) => e.k === "inp");
-    expect(elOf(inp)?.label).toBe("Search name, email or employee number");
+    expect(elOf(inp)?.label).toBe(REDACTED_VALUE);
   });
 
   it("prefers an aria-label over the placeholder", () => {
-    cleanup = interactionCollector(bus, unmaskedConfig);
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
@@ -806,8 +825,105 @@ describe("interaction target accessible name", () => {
     expect(elOf(inp)?.label).toBe("Employee search");
   });
 
+  it("falls back to the title attribute when nothing else names the element", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<button title="Dismiss this notice"><svg></svg></button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe("Dismiss this notice");
+  });
+
+  it("names an input from its label[for]", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<label for="qty">Quantity</label><input id="qty">';
+    const input = document.querySelector("input")!;
+    input.value = "3";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe("Quantity");
+  });
+
+  it("names an input from a wrapping label", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<label>Shipping speed <input id="speed"></label>';
+    const input = document.querySelector("input")!;
+    input.value = "Overnight";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe("Shipping speed");
+  });
+
+  it("excludes a wrapped select's option text from a wrapping label's name", () => {
+    // A <label> wrapping a <select> would otherwise pick up every option's
+    // text via textContent, leaking the unchosen options along with the
+    // chosen one.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<label>Country <select id="country"><option value="ca">Canada</option><option value="us">United States</option></select></label>';
+    const select = document.querySelector("select")!;
+    select.value = "us";
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe("Country");
+  });
+
+  it("does not use a wrapping label's text when the label itself is blocked", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<label data-crumbtrail-block>Shipping speed <input id="speed2"></label>';
+    const input = document.querySelector("input")!;
+    input.value = "Overnight";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBeUndefined();
+  });
+
+  it("does not use a label[for] source when that label sits inside a blocked subtree", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<div data-crumbtrail-block><label for="qty2">Quantity</label></div><input id="qty2">';
+    const input = document.querySelector("input")!;
+    input.value = "3";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBeUndefined();
+  });
+
   it("carries no name for a password field", () => {
-    cleanup = interactionCollector(bus, unmaskedConfig);
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
@@ -823,7 +939,7 @@ describe("interaction target accessible name", () => {
   });
 
   it("caps a long label at 40 characters", () => {
-    cleanup = interactionCollector(bus, unmaskedConfig);
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
@@ -840,15 +956,55 @@ describe("interaction target accessible name", () => {
     expect(elOf(clk)?.label).toBe(long.trim().slice(0, 40));
   });
 
-  it("carries no name at all for a masked element", () => {
-    // DEFAULT_CONFIG masks all DOM text. Asterisking "Next" into "****" would
-    // answer nothing a reader could act on, so the field is dropped entirely
-    // rather than shipped as a mask.
+  it("drops a name rather than ship a truncated fragment of an embedded email", () => {
+    // The email sits past where a naive truncate-then-classify pipeline would
+    // cut, so the old bug (classify AFTER truncating) would have shipped
+    // "...accounting.dept@nort" in clear. Classifying the untruncated text
+    // catches it; the name still must not leak a fragment, so it either
+    // redacts outright or is dropped, never truncated into cleartext.
     cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
-    document.body.innerHTML = "<button>Next</button>";
+    const long =
+      "Send the invoice to accounting.dept@northwind.example for review";
+    expect(long.length).toBeGreaterThan(40);
+    document.body.innerHTML = `<button aria-label="${long}">go</button>`;
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    const label = elOf(clk)?.label;
+    expect(label === undefined || label === REDACTED_VALUE).toBe(true);
+    expect(String(label ?? "")).not.toContain("accounting.dept@nort");
+  });
+
+  it("carries no name at all for an element marked data-crumbtrail-mask", () => {
+    // The per-element escape hatch: an integration that wants a specific
+    // caption kept out of capture regardless of the (survives-masking-by-
+    // default) rule above.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = "<button data-crumbtrail-mask>Next</button>";
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBeUndefined();
+  });
+
+  it("carries no name at all for an element matched by ignoreSelectors", () => {
+    const config: CrumbtrailConfig = {
+      ...DEFAULT_CONFIG,
+      ignoreSelectors: [".no-capture"],
+    };
+    cleanup = interactionCollector(bus, config);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = '<button class="no-capture">Next</button>';
     document.querySelector("button")!.click();
     bus.flush();
 
@@ -857,7 +1013,7 @@ describe("interaction target accessible name", () => {
   });
 
   it("redacts a name that looks like a value, same as a captured input value", () => {
-    cleanup = interactionCollector(bus, unmaskedConfig);
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
@@ -871,5 +1027,76 @@ describe("interaction target accessible name", () => {
     expect(clk?.d.redaction).toMatchObject({
       policy: BROWSER_REDACTION_POLICY,
     });
+  });
+
+  it("redacts an email embedded in a longer caption, not just a whole-string email", () => {
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<button aria-label="Sign in as omar@example.com">go</button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe(REDACTED_VALUE);
+  });
+
+  it("suppresses a name matched by redaction.denyFields", () => {
+    const config: CrumbtrailConfig = {
+      ...DEFAULT_CONFIG,
+      redaction: { ...DEFAULT_CONFIG.redaction, denyFields: ["patient"] },
+    };
+    cleanup = interactionCollector(bus, config);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<button aria-label="Patient Sofia Ramirez">go</button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe(REDACTED_VALUE);
+  });
+
+  it("keeps an ordinary human-name caption when no denyFields match (accepted residual risk)", () => {
+    // Documents the same tradeoff `ui-numbers.ts` accepts for rendered
+    // labels: a caption that is itself PII but reads as ordinary free text
+    // is indistinguishable from a benign caption, so it survives capture by
+    // default. Mitigate with `redaction.denyFields`.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = '<button aria-label="Sofia Ramirez">go</button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe("Sofia Ramirez");
+  });
+
+  it("does not catch a spaced phone number, a dashed SSN-style run, or an IBAN embedded in a sentence (accepted residual risk)", () => {
+    // Neither the text-plane pass (no colon/equals-delimited key, no URL, no
+    // Bearer/JWT/hex/alnum-run token shape) nor the whole-string structured
+    // classifier (none of these is the ENTIRE string, which is what the
+    // anchored IBAN check and the deny-name checks require) catches these.
+    // Documented here, and in the interaction.ts docblock and README, rather
+    // than silently left uncovered.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<button aria-label="Call me at 555 123 4567 about the order">go</button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe(
+      "Call me at 555 123 4567 about the order",
+    );
   });
 });

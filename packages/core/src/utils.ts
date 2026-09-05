@@ -1,4 +1,6 @@
 import { computeElementSignature } from "./signature";
+import { isBlocked, isMaskForced } from "./masking";
+import type { CrumbtrailConfig } from "./types";
 
 export interface ElementDescriptor {
   tag: string;
@@ -15,11 +17,14 @@ export interface ElementDescriptor {
   /**
    * Accessible name of the interaction target, in priority order: `aria-label`,
    * an associated `<label>` (`for=` or wrapping), the element's own visible
-   * text for a button or link, `placeholder`, then `title`. Trimmed, capped at
-   * 40 characters and passed through the same redaction a captured value gets,
-   * so a name that happens to look like an email or a token is replaced rather
-   * than shipped in clear. Never the VALUE of an input, and never present at
-   * all for a password field or an element whose text is masked.
+   * text for a button or link, `placeholder`, then `title`. Trimmed and
+   * whitespace-collapsed here; redacted and capped at 40 characters by
+   * `collectors/interaction.ts` — deliberately in that order, so a secret
+   * embedded in a long caption is classified before the cap can cut it into
+   * an unrecognizable, un-redacted fragment. Never the VALUE of an input, and
+   * never present at all for a password field, an element (or, for a
+   * `<label>`-derived name, the label itself) matched by `ignoreSelectors`,
+   * or carrying `data-crumbtrail-block`/`data-crumbtrail-mask`.
    */
   label?: string;
 }
@@ -75,11 +80,72 @@ export function truncate(str: string, maxLen: number): string {
   return str.slice(0, maxLen);
 }
 
-const ACCESSIBLE_NAME_MAX_LENGTH = 40;
+/**
+ * Cap applied to `el.label` after redaction, in `collectors/interaction.ts`.
+ * Exported so that pipeline is the only place the number is written down.
+ */
+export const ACCESSIBLE_NAME_MAX_LENGTH = 40;
 const BUTTON_LIKE_TAGS = new Set(["BUTTON", "A"]);
+const FORM_CONTROL_DESCENDANT_TAGS = new Set([
+  "SELECT",
+  "OPTION",
+  "INPUT",
+  "TEXTAREA",
+]);
 
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Whether `el` is a legitimate source for an accessible name: not blocked, not
+ * force-masked, and not matched by `ignoreSelectors`. Applied to the
+ * interaction TARGET and, separately, to a `<label>` found elsewhere in the
+ * document — a `for=` reference or a wrapping ancestor is a different element
+ * than the one that was clicked or typed into, and an integrator excluding
+ * that element (a blocked panel, an ignored region) must not have its opt-out
+ * bypassed just because the control it labels sits outside it.
+ */
+function isAccessibleNameSource(
+  el: Element,
+  config: Pick<CrumbtrailConfig, "ignoreSelectors">,
+): boolean {
+  if (isBlocked(el) || isMaskForced(el)) return false;
+  for (const selector of config.ignoreSelectors) {
+    try {
+      if (el.closest(selector)) return false;
+    } catch {
+      // An invalid selector is the integrator's typo, not a reason to refuse
+      // an otherwise-usable source.
+    }
+  }
+  return true;
+}
+
+/**
+ * A label's own text, excluding anything read from a form control it wraps.
+ *
+ * A `<label>` wrapping a `<select>` reports every option's text through
+ * `textContent` — chosen and unchosen alike — which turned "Country" into
+ * "CountryCanadaUnited StatesMexico...". Only `SELECT`, `OPTION`, `INPUT` and
+ * `TEXTAREA` subtrees are skipped; visually-hidden but accessible text
+ * (`sr-only`-style spans) is ordinary text here and is kept, same as it
+ * would be read by a screen reader.
+ */
+function labelOwnText(label: Element): string {
+  let text = "";
+  const collect = (node: Node): void => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += node.textContent ?? "";
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as Element;
+    if (FORM_CONTROL_DESCENDANT_TAGS.has(element.tagName)) return;
+    for (const child of Array.from(element.childNodes)) collect(child);
+  };
+  for (const child of Array.from(label.childNodes)) collect(child);
+  return text;
 }
 
 /**
@@ -88,7 +154,10 @@ function collapseWhitespace(value: string): string {
  * invalid `for` value or an unsupported selector engine costs us this one
  * source, not the whole name.
  */
-function readAssociatedLabelText(el: Element): string | undefined {
+function readAssociatedLabelText(
+  el: Element,
+  config: Pick<CrumbtrailConfig, "ignoreSelectors">,
+): string | undefined {
   try {
     if (el.id) {
       const escaped =
@@ -98,14 +167,20 @@ function readAssociatedLabelText(el: Element): string | undefined {
       const forLabel = el.ownerDocument?.querySelector(
         `label[for="${escaped}"]`,
       );
-      if (forLabel instanceof HTMLElement) {
-        const text = forLabel.innerText ?? forLabel.textContent;
+      if (
+        forLabel instanceof HTMLElement &&
+        isAccessibleNameSource(forLabel, config)
+      ) {
+        const text = labelOwnText(forLabel);
         if (text) return text;
       }
     }
     const wrapping = el.closest("label");
-    if (wrapping instanceof HTMLElement) {
-      const text = wrapping.innerText ?? wrapping.textContent;
+    if (
+      wrapping instanceof HTMLElement &&
+      isAccessibleNameSource(wrapping, config)
+    ) {
+      const text = labelOwnText(wrapping);
       if (text) return text;
     }
   } catch {
@@ -118,22 +193,29 @@ function readAssociatedLabelText(el: Element): string | undefined {
  * The accessible name of an interaction target, resolved in the same order a
  * screen reader would: an explicit `aria-label`, an associated `<label>`, the
  * element's own visible text for a button or link, `placeholder`, then
- * `title`. Trimmed, whitespace-collapsed and capped at
- * {@link ACCESSIBLE_NAME_MAX_LENGTH} characters.
+ * `title`. Trimmed and whitespace-collapsed, but deliberately NOT redacted or
+ * capped here — `collectors/interaction.ts` does both, in that order, over
+ * the untruncated text, because classifying a name after it has already been
+ * cut to size lets a truncated secret (an email whose domain got sliced off,
+ * a card number missing its last four digits) ship in clear.
  *
  * Never reads `.value` — a name answers "what is this control called", not
- * what a user typed into it, and a password field is refused outright so a
- * name never becomes a second path for a credential to leak. Redaction of the
- * result (a name that happens to look like an email or a token) is the
- * caller's job: this only extracts what the page says the element is called.
+ * what a user typed into it — and a password field is refused outright so a
+ * name never becomes a second path for a credential to leak. `ignoreSelectors`,
+ * `data-crumbtrail-block` and `data-crumbtrail-mask` are honoured on `el`
+ * itself and, separately, on a `<label>` read from elsewhere in the document.
  */
-export function computeAccessibleName(el: Element): string | undefined {
+export function computeAccessibleName(
+  el: Element,
+  config: Pick<CrumbtrailConfig, "ignoreSelectors">,
+): string | undefined {
   if (el instanceof HTMLInputElement && el.type.toLowerCase() === "password")
     return undefined;
+  if (!isAccessibleNameSource(el, config)) return undefined;
 
   const candidates: Array<string | null | undefined> = [
     el.getAttribute("aria-label"),
-    readAssociatedLabelText(el),
+    readAssociatedLabelText(el, config),
     BUTTON_LIKE_TAGS.has(el.tagName) && el instanceof HTMLElement
       ? (el.innerText ?? el.textContent)
       : undefined,
@@ -144,13 +226,16 @@ export function computeAccessibleName(el: Element): string | undefined {
   for (const candidate of candidates) {
     if (!candidate) continue;
     const collapsed = collapseWhitespace(candidate);
-    if (collapsed) return truncate(collapsed, ACCESSIBLE_NAME_MAX_LENGTH);
+    if (collapsed) return collapsed;
   }
 
   return undefined;
 }
 
-export function describeElement(el: Element): ElementDescriptor {
+export function describeElement(
+  el: Element,
+  config: Pick<CrumbtrailConfig, "ignoreSelectors"> = { ignoreSelectors: [] },
+): ElementDescriptor {
   const desc: ElementDescriptor = { tag: el.tagName };
 
   if (el.id) desc.id = el.id;
@@ -188,7 +273,7 @@ export function describeElement(el: Element): ElementDescriptor {
     // Descriptor stays valid without a signature — never break capture.
   }
 
-  const label = computeAccessibleName(el);
+  const label = computeAccessibleName(el, config);
   if (label) desc.label = label;
 
   return desc;

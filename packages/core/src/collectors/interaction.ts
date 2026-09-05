@@ -8,6 +8,7 @@ import {
   computeRedactedShape,
   mergeRedactionMetadata,
   redactInputValue,
+  redactNetworkTextBody,
   redactUrl,
   type RedactionMetadata,
 } from "../redaction";
@@ -17,72 +18,114 @@ import {
   maskElementDescriptor,
   maskText,
 } from "../masking";
-import { describeElement, now } from "../utils";
+import {
+  ACCESSIBLE_NAME_MAX_LENGTH,
+  describeElement,
+  now,
+  truncate,
+} from "../utils";
 import { subscribeNavCommit } from "../nav-signal";
 
 /**
- * Redacts an accessible name the same way `ui-numbers.ts` redacts a rendered
- * label, and for the same reason: this text was authored into the page
- * (`aria-label`, a placeholder, a button's own text), not typed by a user, so
- * the deny-biased free-text classifier `redactInputValue` applies to a
- * captured VALUE is the wrong gate here — it would redact "Search name, email
- * or employee number" itself, which is a caption, not a value. Only a
- * deny-listed name or PII/secret-shaped content (an email, a card number, a
- * JWT, a token or a high-entropy string) redacts; the classifier's
- * `free_text_value` catch-all is deliberately not applied to a name.
+ * Runs an accessible name through the redaction the mobile lane already
+ * applies to free text (`redactMobileText`'s `redactNetworkTextBody` call,
+ * `contentType: "text/plain"`) before the structured classifier gets it.
+ *
+ * Order matters and is the whole point: a caption is authored into the page,
+ * not typed by a user, so it needs the SAME deny-biased classifier a value
+ * gets — an embedded email, card number, JWT or token must still be caught —
+ * but with `ui-numbers.ts`'s free-text carve-out, because the classifier's
+ * `free_text_value` catch-all was tuned for network body VALUES, where any
+ * multi-word string is suspect, and a label is a short, visible-by-design
+ * string ("Preferred contact time") where free text is normal. `keyName` is
+ * the label text itself, exactly as `ui-numbers.ts`
+ * passes it, so `redaction.denyFields` can match words inside the caption
+ * ("patient" denies "Patient Sofia Ramirez") the same way it matches a field
+ * name — and, by the same built-in rules, a caption containing a bare
+ * "email"/"phone"/"ssn"/… is name-denied even with no custom deny list,
+ * which is accepted here for the reason `ui-numbers.ts` accepts it: the
+ * classifier cannot tell "this caption IS the sensitive datum" from "this
+ * caption is A LABEL FOR ONE", so it redacts both.
+ *
+ * The text-plane pass runs first because it can replace just the sensitive
+ * SUBSTRING of a longer sentence (a Bearer token, a key:value pair, an
+ * embedded URL's query string) and leave the rest of the caption intact,
+ * which the whole-value structured classifier cannot do. What it does not
+ * catch — a spaced phone number, a dashed nine-digit SSN-style run, an IBAN
+ * written into a sentence — is exactly what the structured classifier does
+ * not catch either: neither is Bearer/JWT/prefixed/long-hex/long-alnum
+ * token-shaped, and neither is a colon- or equals-delimited key/value pair.
+ * That gap is accepted, the same way `ui-numbers.ts` accepts that a label
+ * which is itself PII but reads as ordinary free text (a human name) survives
+ * capture: mitigate with `redaction.denyFields`, `ignoreSelectors`, or
+ * `data-crumbtrail-mask` on the element.
+ *
+ * `undefined` means "drop the field": returned when nothing is left to ship,
+ * or when the cap would have to cut into text the text-plane pass already
+ * redacted — slicing a `[REDACTED]` marker in half, or hiding that anything
+ * was replaced at all, is worse than shipping no name.
  */
-function redactAccessibleName(rawLabel: string): {
-  value: string;
-  metadata?: RedactionMetadata;
-} {
-  const classification = classifyStructuredValue(rawLabel);
+function redactAccessibleName(
+  rawLabel: string,
+  denyFields: string[] | undefined,
+): { value: string | undefined; metadata?: RedactionMetadata } {
+  const textPlane = redactNetworkTextBody(rawLabel, {
+    contentType: "text/plain",
+    path: "el.label",
+  });
+  const working = textPlane.body ?? rawLabel;
+
+  const classification = classifyStructuredValue(working, working, denyFields);
   if (
     classification.action === "redact" &&
     classification.reason !== "free_text_value"
   ) {
+    const classifyMetadata: RedactionMetadata = {
+      policy: BROWSER_REDACTION_POLICY,
+      fields: [
+        {
+          path: "el.label",
+          reason: classification.reason,
+          action: "redacted",
+          shape: computeRedactedShape(working, classification.reason),
+        },
+      ],
+    };
     return {
       value: REDACTED_VALUE,
-      metadata: {
-        policy: BROWSER_REDACTION_POLICY,
-        fields: [
-          {
-            path: "el.label",
-            reason: classification.reason,
-            action: "redacted",
-            shape: computeRedactedShape(rawLabel, classification.reason),
-          },
-        ],
-      },
+      metadata: mergeRedactionMetadata(textPlane.metadata, classifyMetadata),
     };
   }
-  return { value: rawLabel };
+
+  if (working.length <= ACCESSIBLE_NAME_MAX_LENGTH) {
+    return { value: working, metadata: textPlane.metadata };
+  }
+  if (textPlane.metadata) {
+    return { value: undefined, metadata: textPlane.metadata };
+  }
+  return { value: truncate(working, ACCESSIBLE_NAME_MAX_LENGTH) };
 }
 
 /**
- * Decides whether the descriptor's `label` (the target's accessible name,
- * computed by {@link describeElement}) ships, and if so redacts it.
+ * Redacts the descriptor's `label` (the target's accessible name, computed by
+ * {@link describeElement}) and drops it entirely when nothing survives.
  *
- * A masked element carries none at all, deliberately: `maskText` would turn
- * "Next" into `"****"`, which answers nothing a reader could act on, so under
- * `maskAllText`/`maskAllInputs` (and no per-element opt-in) the field is
- * dropped rather than obscured.
+ * An authored caption is not user content, so — unlike `val` on an `inp`
+ * event — it survives `maskAllText`/`maskAllInputs`: `computeAccessibleName`
+ * already refused a password field, and already honoured `ignoreSelectors`,
+ * `data-crumbtrail-block` and `data-crumbtrail-mask` on the element (and, for
+ * a `<label>`-derived name, on the label itself), which is the same
+ * reasoning `ui-numbers.ts` applies to a rendered label.
  */
 function finalizeAccessibleName(
-  target: Element,
   descriptor: Record<string, unknown>,
   config: CrumbtrailConfig,
 ): Record<string, unknown> {
-  if (typeof descriptor.label !== "string") return descriptor;
+  if (typeof descriptor.label !== "string" || descriptor.label === "")
+    return descriptor;
 
   const { label: rawLabel, ...rest } = descriptor;
-
-  if (!isUnmasked(target) && (config.maskAllText || config.maskAllInputs)) {
-    return rest;
-  }
-
-  const redacted = redactAccessibleName(rawLabel);
-  if (redacted.value === "") return rest;
-
+  const redacted = redactAccessibleName(rawLabel, config.redaction?.denyFields);
   const merged = mergeRedactionMetadata(
     readDescriptorMetadata(rest),
     redacted.metadata,
@@ -90,7 +133,7 @@ function finalizeAccessibleName(
 
   return {
     ...rest,
-    label: redacted.value,
+    ...(redacted.value !== undefined ? { label: redacted.value } : {}),
     ...(merged ? { redaction: merged } : {}),
   };
 }
@@ -101,14 +144,22 @@ function describeInteractionTarget(
 ): Record<string, unknown> {
   try {
     const descriptor =
-      config.describeInteractionElement?.(target) ?? describeElement(target);
+      config.describeInteractionElement?.(target) ??
+      describeElement(target, config);
     if (isRecord(descriptor)) {
-      const named = finalizeAccessibleName(
-        target,
-        removeUndefined(descriptor),
-        config,
-      );
-      return maskElementDescriptor(target, named, config);
+      // `label` is pulled out before the generic mask pass: `maskElementDescriptor`
+      // asterisks every text-shaped descriptor field under `maskAllText`/
+      // `maskAllInputs`, which is the right default for the rest of the
+      // descriptor but wrong for an authored caption (see `finalizeAccessibleName`).
+      // Masking everything else first, then finalizing the name last, is what
+      // keeps the caption out of that generic pass without also exempting the
+      // descriptor's other fields from it.
+      const { label: rawLabel, ...rest } = removeUndefined(descriptor);
+      const masked = maskElementDescriptor(target, rest, config);
+      if (typeof rawLabel === "string" && rawLabel !== "") {
+        return finalizeAccessibleName({ ...masked, label: rawLabel }, config);
+      }
+      return masked;
     }
   } catch {
     // Keep interaction capture alive even if a page-specific descriptor probe fails.

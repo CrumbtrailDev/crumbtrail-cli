@@ -778,10 +778,25 @@ export interface DbStatementEventData {
  * the integration needs, but the built-in descriptor always carries `tag` and
  * a structural `sig`/`path` pair, and additionally a `label` when one was
  * found — the target's accessible name (`aria-label`, an associated
- * `<label>`, visible text for a button or link, `placeholder`, then `title`),
- * capped at 40 characters and redacted like any other captured text. Never
- * the value of an input, and never present for a password field or a masked
- * element.
+ * `<label>` — either `label[for]` or a wrapping `<label>`, excluding the text
+ * of any nested form control — visible text for a button or link,
+ * `placeholder`, then `title`), capped at 40 characters after redaction.
+ *
+ * Never the value of an input, and never present for a password field, an
+ * element (or label source) matched by `ignoreSelectors`, inside a
+ * `data-crumbtrail-block` subtree, or under `data-crumbtrail-mask`. Unlike
+ * other captured text, `label` is NOT dropped by `maskAllText`/
+ * `maskAllInputs`: an authored caption is not user content, so it survives
+ * that setting the same way a rendered on-screen label does for `ui.num`
+ * (see `README.md`'s "On-screen numbers"). The name still runs through the
+ * deny-biased redaction classifier (an embedded email, card number, JWT or
+ * token still redacts, and `redaction.denyFields` still matches words inside
+ * the caption), with the same accepted residual risk as `ui.num`'s label
+ * redaction: a caption that is itself PII but reads as ordinary free text (a
+ * human name) can survive capture, and a spaced phone number, dashed
+ * nine-digit SSN-style run, or IBAN embedded in a sentence is not caught
+ * either. Mitigate with `redaction.denyFields`, `ignoreSelectors`, or
+ * `data-crumbtrail-mask` on the element.
  */
 export type InteractionElementDescriptor = Record<string, unknown>;
 export type InteractionElementDescriptorFactory = (
