@@ -128,22 +128,33 @@ describe("assembleBundle hypothesis classification", () => {
   });
 
   it("does not call current-only evidence a regression", () => {
-    const evidence = [
-      item({ id: "cache", lane: "flow", kind: "cache.activity", after: "hit" }),
+    const evidence = Array.from({ length: 7 }, (_, index) =>
       item({
-        id: "mcp",
-        lane: "network",
-        kind: "mcp.error",
-        after: "invalid arguments",
+        id: `current-${index}`,
+        lane: index < 3 ? "flow" : "network",
+        kind: index < 3 ? "cache.activity" : "mcp.error",
+        before: null,
+        after: index < 3 ? "hit" : "invalid arguments",
       }),
-      item({ id: "close", lane: "network", kind: "sdk.close", after: 500 }),
-    ];
+    );
 
     const hypotheses = classify(symptom, evidence, []);
 
     expect(hypotheses).toEqual([
       expect.objectContaining({ kind: "inconclusive", evidenceIds: [] }),
     ]);
+  });
+
+  it("does not compare unsupported values by type mismatch", () => {
+    const hypotheses = classify(
+      symptom,
+      [item({ lane: "network", before: () => "old", after: "new" })],
+      [],
+    );
+
+    expect(
+      hypotheses.some((hypothesis) => hypothesis.kind === "regression"),
+    ).toBe(false);
   });
 
   it("does not call equal before and after values a regression", () => {

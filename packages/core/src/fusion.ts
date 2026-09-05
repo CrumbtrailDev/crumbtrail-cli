@@ -691,33 +691,31 @@ function classifyHypotheses(
 }
 
 function hasComparativeChange(item: EvidenceItem): boolean {
-  if (item.before === undefined || item.after === undefined) return false;
-  return evidenceValuesEqual(item.before, item.after) === false;
+  if (item.before == null || item.after == null) return false;
+  if (
+    !isComparableEvidenceValue(item.before) ||
+    !isComparableEvidenceValue(item.after)
+  )
+    return false;
+  return !evidenceValuesEqual(item.before, item.after);
 }
 
 /**
  * Compares JSON-shaped evidence without depending on object key insertion
- * order. An unsupported or cyclic value is inconclusive, so it cannot support
- * a regression claim.
+ * order. Callers validate both values first.
  */
 function evidenceValuesEqual(
   left: unknown,
   right: unknown,
   seen = new WeakMap<object, object>(),
-): boolean | undefined {
+): boolean {
   if (Object.is(left, right)) return true;
   if (typeof left !== typeof right || left === null || right === null)
     return false;
-  if (typeof left !== "object" || typeof right !== "object") {
-    return typeof left === "string" ||
-      typeof left === "number" ||
-      typeof left === "boolean"
-      ? false
-      : undefined;
-  }
+  if (typeof left !== "object" || typeof right !== "object") return false;
 
   const prior = seen.get(left);
-  if (prior) return undefined;
+  if (prior) return prior === right;
   seen.set(left, right);
 
   if (Array.isArray(left) || Array.isArray(right)) {
@@ -725,18 +723,10 @@ function evidenceValuesEqual(
     if (left.length !== right.length) return false;
     for (let index = 0; index < left.length; index += 1) {
       const equal = evidenceValuesEqual(left[index], right[index], seen);
-      if (equal !== true) return equal;
+      if (!equal) return false;
     }
     return true;
   }
-
-  const leftPrototype = Object.getPrototypeOf(left);
-  const rightPrototype = Object.getPrototypeOf(right);
-  if (
-    (leftPrototype !== Object.prototype && leftPrototype !== null) ||
-    (rightPrototype !== Object.prototype && rightPrototype !== null)
-  )
-    return undefined;
 
   const leftRecord = left as Record<string, unknown>;
   const rightRecord = right as Record<string, unknown>;
@@ -750,7 +740,27 @@ function evidenceValuesEqual(
       rightRecord[rightKeys[index]],
       seen,
     );
-    if (equal !== true) return equal;
+    if (!equal) return false;
   }
   return true;
+}
+
+function isComparableEvidenceValue(
+  value: unknown,
+  seen = new WeakSet<object>(),
+): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean")
+    return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+
+  if (Array.isArray(value))
+    return value.every((entry) => isComparableEvidenceValue(entry, seen));
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Object.values(value).every((entry) =>
+    isComparableEvidenceValue(entry, seen),
+  );
 }
