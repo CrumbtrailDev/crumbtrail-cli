@@ -29,10 +29,13 @@ class CrumbtrailDioInterceptor extends Interceptor {
         // unrecorded. A retry interceptor cloning RequestOptions is the usual
         // cause. Said out loud rather than returning silently, because the
         // symptom otherwise is a session that is simply missing requests.
+        // Redacted, because this line lands in the application's own log and a
+        // path segment is exactly where a reset token lives.
         debugPrint(
-          'crumbtrail: no start time for ${options.method} ${options.uri.path}; '
-          'the request options were replaced after onRequest, so this request '
-          'is not recorded',
+          'crumbtrail: no start time for ${options.method} '
+          '${CrumbtrailRedaction.redactUrl(options.uri.toString())}; the '
+          'request options were replaced after onRequest, so this request is '
+          'not recorded',
         );
       }
       return;
