@@ -8,7 +8,6 @@ import {
   OTLP_STACKS,
   allStackInstalls,
   buildAgentPrompt,
-  otlpAgentPrompt,
   buildBackendJsNote,
   buildOtlpSnippets,
   getInstallVariant,
@@ -253,36 +252,19 @@ describe("install-instructions snippets", () => {
     expect(p).toContain('service: "payments-api"');
   });
 
-  // No stack reaches the OTLP prompt now that every OTLP stack has a maintained
-  // or published package, so it is exercised directly. It is the answer for the
-  // next stack added before its artifact ships, and this keeps it from rotting.
-  it("OTLP prompt still tells a reader everything the exporter path needs", () => {
-    const p = otlpAgentPrompt(
-      "https://app.crumbtrail.com",
-      "CRUMBTRAIL_KEY",
-      "<your-app-name>",
-      false,
-    );
-    expect(p).toContain(
-      "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
-    );
-    // The prompt must not carry a live key into a coding agent. It tells the
-    // reader to set the server env var and have the exporter read it.
-    expect(p).not.toContain("bl_live_xyz");
-    expect(p).toContain("CRUMBTRAIL_KEY");
-    expect(p).toContain("crumbtrail.session.id");
-    expect(p).toContain("Optional");
-    expect(p).toContain("sessionless OTLP is accepted");
-    expect(p).toContain("Keep your existing exporter");
-    expect(p).toContain("OTEL_SERVICE_NAME=<your-app-name>");
-    expect(p).toContain(
-      "Replace <your-app-name> with a stable name for this app before running it.",
-    );
-    expect(p).not.toContain("PRESET_PASSIVE");
-    // A resolved name needs no instruction to replace the placeholder.
-    expect(
-      otlpAgentPrompt("https://app.crumbtrail.com", "CRUMBTRAIL_KEY", "orders", true),
-    ).not.toContain("Replace <your-app-name>");
+  // The OTLP agent prompt is gone: native capture is the only agent path for an
+  // OTLP stack. A stack added to OTLP_STACKS before its package ships must fail
+  // loudly rather than fall through to the JS SDK prompt for the wrong runtime.
+  it("refuses an OTLP stack that has no published native package", () => {
+    const original = NATIVE_PACKAGES.go!.published;
+    NATIVE_PACKAGES.go!.published = false;
+    try {
+      expect(() =>
+        buildAgentPrompt("go", keys, { serviceName: "orders" }),
+      ).toThrow(/no published native package/);
+    } finally {
+      NATIVE_PACKAGES.go!.published = original;
+    }
   });
 
   // Every OTLP stack, not just django: the native path once returned early for

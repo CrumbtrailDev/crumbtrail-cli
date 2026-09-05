@@ -354,54 +354,6 @@ export interface AgentPromptOptions {
   backendOrigins?: readonly string[] | null;
 }
 
-/**
- * The OpenTelemetry prompt for a backend with no maintained native package.
- *
- * Extracted rather than inlined because no stack reaches it today: every entry
- * in `OTLP_STACKS` now has either a maintained package (dotnet) or a published
- * native one. It stays because it is the answer for the next OTLP stack added
- * before its package ships, and it is exercised directly by the suite so it
- * cannot rot the way an unreachable inline branch would.
- */
-export function otlpAgentPrompt(
-  endpoint: string,
-  keyEnv: string,
-  serviceName: string,
-  hasExplicitServiceName: boolean,
-): string {
-  return [
-    "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
-    "do not refactor or touch anything else, then verify the build still passes.",
-    "",
-    `Ingest endpoint: ${endpoint}`,
-    "",
-    "This is a non-JS backend that already uses OpenTelemetry. Do NOT install a",
-    "second SDK. Instead, add Crumbtrail as an additional OTLP/HTTP exporter:",
-    `  1. Set OTEL_EXPORTER_OTLP_ENDPOINT=${endpoint} (the exporter appends`,
-    "     /v1/traces and /v1/logs — do not add those paths).",
-    `  2. Set ${keyEnv} in the runtime environment to your Crumbtrail ingest key.`,
-    `     Configure the exporter to read ${keyEnv} when sending`,
-    "     X-Crumbtrail-Auth (or Authorization: Bearer <key> if it prefers that).",
-    "     Never put the key value in committed source.",
-    `  3. Optional: set ${OTLP_CAPABILITY_FACTS.sessionAttribute} when you have a`,
-    "     frontend session id and want backend spans/logs joined to that session.",
-    "     Do not block setup on this: sessionless OTLP is accepted and Crumbtrail",
-    "     creates a session from the telemetry.",
-    // One ingest key covers a whole project, so the key names no app. The
-    // receiver reads service.name instead, and every OTLP SDK sets it from
-    // OTEL_SERVICE_NAME.
-    `  4. Set OTEL_SERVICE_NAME=${serviceName} so this app's`,
-    "     telemetry is filed under it rather than under no app at all.",
-    ...(hasExplicitServiceName
-      ? []
-      : [
-          "     Replace <your-app-name> with a stable name for this app before running it.",
-        ]),
-    "  5. Keep your existing exporter — add Crumbtrail alongside it.",
-    "  6. Verify the app still builds and starts.",
-    ].join("\n");
-}
-
 export function buildAgentPrompt(
   stack: Stack,
   keys: EndpointKey,
@@ -441,12 +393,15 @@ export function buildAgentPrompt(
   });
   if (nativeSetup) return nativeSetup;
 
+  // Native capture is the only agent path for an OTLP stack. dotnet answers
+  // above with its maintained package and every other entry in OTLP_STACKS has
+  // a published native one, so nativeSetup has already returned. A stack added
+  // to OTLP_STACKS before its artifact ships would otherwise fall through to
+  // the JS SDK prompt below and be told to install a package for the wrong
+  // runtime, so it fails here instead.
   if (kind === "otlp") {
-    return otlpAgentPrompt(
-      endpoint,
-      otlpKeyEnv,
-      serviceName,
-      hasExplicitServiceName,
+    throw new Error(
+      `${stack} is an OTLP stack with no published native package. Add one to NATIVE_PACKAGES and publish it, or remove the stack from OTLP_STACKS.`,
     );
   }
 
