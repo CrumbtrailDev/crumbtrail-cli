@@ -1,3 +1,4 @@
+import { nativeCaptureSetup } from "../native-owned";
 // Pure injection plan-builders. Each recipe reads (never writes) via InjectIO and
 // returns a Plan describing exactly what should happen. The executor (executor.ts)
 // is the only module that mutates the filesystem.
@@ -2529,6 +2530,16 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
       return `${process}: python crumbtrail_otel.py ${launch}`;
     },
   );
+  const nativeGuidePath = path.join(input.cwd, "CRUMBTRAIL_NATIVE_SETUP.md");
+  // Null for every stack today: no native backend package is published. See
+  // native-owned.ts. The guide rides along with the tracing edits when it exists
+  // at all, and never on its own: a fully wired project must still report
+  // "already set up" rather than recreating a file the reader deleted.
+  const nativeGuide = nativeCaptureSetup(stack!, endpoint, serviceName, {
+    keyEnv: "CRUMBTRAIL_KEY",
+    hasExplicitServiceName: true,
+  });
+  const existingNativeGuide = io.readFile(nativeGuidePath);
   if (
     processes > 0 &&
     configured === processes &&
@@ -2562,12 +2573,27 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
         content: helperContent,
         label: "added the Python OpenTelemetry launch helper",
       },
+      ...(nativeGuide && existingNativeGuide == null
+        ? [
+            {
+              path: nativeGuidePath,
+              mode: "create" as const,
+              content: `# Configure native backend evidence\n\n${nativeGuide}\n`,
+              label: "added native package setup instructions",
+            },
+          ]
+        : []),
     ],
     sdkPackages: dependencyEdit.packages,
     keyEnvVar: "CRUMBTRAIL_KEY",
     warnings: [
       "Crumbtrail will add Python OpenTelemetry dependencies and wrap the Procfile web and worker commands with zero code instrumentation.",
       "Python automatic instrumentation currently exports traces. Metrics and logs remain off.",
+      ...(nativeGuide && existingNativeGuide == null
+        ? [
+            "JSON body and database evidence require the maintained native package. Follow CRUMBTRAIL_NATIVE_SETUP.md or the package README. Trace delivery does not verify native capture.",
+          ]
+        : []),
     ],
   };
 }

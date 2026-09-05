@@ -270,6 +270,52 @@ describe("install-instructions snippets", () => {
     expect(p).not.toContain("PRESET_PASSIVE");
   });
 
+  // Every OTLP stack, not just django: the native path once returned early for
+  // all six and made the whole block above unreachable for each of them.
+  it("keeps the OTLP prompt for every stack with no published native package", () => {
+    for (const stack of [
+      "django",
+      "flask",
+      "fastapi",
+      "dotnet",
+      "go",
+      "rails",
+    ] as const) {
+      const p = buildAgentPrompt(stack, keys, { serviceName: "orders" });
+      if (stack === "dotnet") {
+        // dotnet has its own maintained package and answers before the OTLP path.
+        expect(p).toContain("maintained ASP.NET Core package");
+        continue;
+      }
+      expect(p).toContain(
+        "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
+      );
+      expect(p).toContain("Keep your existing exporter");
+      expect(p).toContain("OTEL_SERVICE_NAME=orders");
+      expect(p).toContain("crumbtrail.session.id");
+      // A resolved name needs no instruction to replace the placeholder.
+      expect(p).not.toContain(
+        "Replace <your-app-name> with a stable name for this app before running it.",
+      );
+    }
+  });
+
+  // These names exist only on unmerged branches, or nowhere at all. A prompt
+  // that hands them to a coding agent produces code that does not compile.
+  it("dotnet prompt names no unpublished or nonexistent .NET API", () => {
+    const p = buildAgentPrompt("dotnet", keys, { serviceName: "orders" });
+    expect(p).toContain("Crumbtrail.AspNetCore");
+    for (const absent of [
+      "Crumbtrail.EntityFrameworkCore",
+      "AddCrumbtrailEntityFramework",
+      "CaptureCache.Observe",
+      "CaptureJob.RunAsync",
+      "DbContextOptionsBuilder",
+    ]) {
+      expect(p).not.toContain(absent);
+    }
+  });
+
   it("keyEnvRef maps stacks to the framework-correct public env var", () => {
     expect(keyEnvRef("nextjs")).toEqual({
       envVar: "NEXT_PUBLIC_CRUMBTRAIL_KEY",

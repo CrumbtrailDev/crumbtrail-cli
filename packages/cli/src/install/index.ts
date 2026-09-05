@@ -1,3 +1,4 @@
+import { nativeCaptureSetup } from "../native-owned";
 import { DOTNET_PACKAGE, DOTNET_VERSION } from "../dotnet-package";
 // Pure, framework-agnostic install-instruction routing for the /welcome wizard.
 //
@@ -382,8 +383,17 @@ export function buildAgentPrompt(
     ].join("\n");
   }
 
+  const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
+
+  // Null for every stack today: no native backend package is published, so the
+  // OTLP prompt below stays the one this wizard hands out. See native-owned.ts.
+  const nativeSetup = nativeCaptureSetup(stack, endpoint, serviceName, {
+    keyEnv: otlpKeyEnv,
+    hasExplicitServiceName,
+  });
+  if (nativeSetup) return nativeSetup;
+
   if (kind === "otlp") {
-    const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
     return [
       "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
       "do not refactor or touch anything else, then verify the build still passes.",

@@ -39,7 +39,7 @@ setup wizard will not wire an app against a package it cannot resolve.
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
 | [`Crumbtrail` (Swift)](packages/swift)                | Swift Package Manager. Native iOS, macOS and tvOS. No dependencies.                        | Not published yet     |
 | [`tauri-plugin-crumbtrail`](packages/tauri/rust)      | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published             |
-| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet     |
+| [`ai.crumbtrail:crumbtrail-kotlin`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet     |
 | [`crumbtrail_flutter`](packages/flutter)              | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet     |
 | [`crumbtrail_flutter_http`](packages/flutter-http)    | pub.dev. `package:http` capture for Flutter. Optional, so an app never resolves a client it does not use. | Not published yet     |
 | [`crumbtrail_flutter_dio`](packages/flutter-dio)      | pub.dev. Dio capture for Flutter. Optional, so an app never resolves a client it does not use. | Not published yet     |
@@ -261,3 +261,20 @@ dry run, CI use, output, and verdicts.
 redaction. The CLI installs or updates its package reference with
 `crumbtrail dotnet install <project.csproj>`. Version `0.1.0` requires NuGet
 publication before customers can restore it from the public feed.
+
+### Maintained native adapters
+
+One native backend package exists here today:
+
+| Package                 | Registration and evidence                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------------------------- |
+| [.NET](packages/dotnet) | ASP.NET Core HTTP request and response evidence, with redaction and delivery owned by the package |
+
+Register it on eligible application routes instead of copying its capture
+implementation into the application. It is built and tested here but not on
+NuGet yet, so the setup wizard does not wire an app against it.
+
+Python, Ruby and Go native packages are in development on their own branches and
+are not part of this repository yet. Until each one is published, the CLI sends
+those stacks down the OpenTelemetry path, which sends traces only: it does not
+install or verify JSON body capture or database evidence.

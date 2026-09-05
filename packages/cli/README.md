@@ -484,3 +484,21 @@ code or mint credentials. Register `AddCrumbtrail` and `UseCrumbtrail`, configur
 the project key and select eligible routes using the [package guide](../dotnet/README.md).
 The package owns buffering, redaction and delivery. No routes are captured by default.
 For local package verification, append `--source /path/to/local/nuget`.
+
+### Native backend evidence
+
+Python, Rails and Go have no native package the CLI can install today. Nothing
+is published to PyPI, RubyGems or the Go module proxy, so those stacks get the
+OpenTelemetry guidance, which configures trace export and neither installs nor
+verifies JSON body capture or database evidence.
+
+The registration guidance for those packages is written but gated off in
+`src/native-owned.ts` until each artifact is published. When it turns on, the
+generated guide preserves existing OpenTelemetry configuration and separately
+explains route selection, correlation, registration and shutdown; Python
+Procfile setup adds `CRUMBTRAIL_NATIVE_SETUP.md` alongside the tracing edits when
+that file is absent, and never replaces an existing one.
+
+.NET is the exception: `Crumbtrail.AspNetCore` lives in this repository and its
+guidance covers ASP.NET Core HTTP request and response evidence. It still needs
+NuGet publication and a CLI release before a customer can restore it.
