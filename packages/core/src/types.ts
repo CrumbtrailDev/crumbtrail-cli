@@ -771,6 +771,18 @@ export interface DbStatementEventData {
   t: number;
 }
 
+/**
+ * The `el` payload of a `clk` or `inp` event: either the SDK's built-in
+ * {@link describeElement} output or whatever `describeInteractionElement`
+ * returns in its place. Untyped because a custom factory may shape it however
+ * the integration needs, but the built-in descriptor always carries `tag` and
+ * a structural `sig`/`path` pair, and additionally a `label` when one was
+ * found — the target's accessible name (`aria-label`, an associated
+ * `<label>`, visible text for a button or link, `placeholder`, then `title`),
+ * capped at 40 characters and redacted like any other captured text. Never
+ * the value of an input, and never present for a password field or a masked
+ * element.
+ */
 export type InteractionElementDescriptor = Record<string, unknown>;
 export type InteractionElementDescriptorFactory = (
   element: Element,

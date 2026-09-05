@@ -2,7 +2,11 @@ import type { EventBus } from "../event-bus";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
 import {
   BROWSER_REDACTION_POLICY,
+  REDACTED_VALUE,
   attachRedactionMetadata,
+  classifyStructuredValue,
+  computeRedactedShape,
+  mergeRedactionMetadata,
   redactInputValue,
   redactUrl,
   type RedactionMetadata,
@@ -16,6 +20,81 @@ import {
 import { describeElement, now } from "../utils";
 import { subscribeNavCommit } from "../nav-signal";
 
+/**
+ * Redacts an accessible name the same way `ui-numbers.ts` redacts a rendered
+ * label, and for the same reason: this text was authored into the page
+ * (`aria-label`, a placeholder, a button's own text), not typed by a user, so
+ * the deny-biased free-text classifier `redactInputValue` applies to a
+ * captured VALUE is the wrong gate here — it would redact "Search name, email
+ * or employee number" itself, which is a caption, not a value. Only a
+ * deny-listed name or PII/secret-shaped content (an email, a card number, a
+ * JWT, a token or a high-entropy string) redacts; the classifier's
+ * `free_text_value` catch-all is deliberately not applied to a name.
+ */
+function redactAccessibleName(rawLabel: string): {
+  value: string;
+  metadata?: RedactionMetadata;
+} {
+  const classification = classifyStructuredValue(rawLabel);
+  if (
+    classification.action === "redact" &&
+    classification.reason !== "free_text_value"
+  ) {
+    return {
+      value: REDACTED_VALUE,
+      metadata: {
+        policy: BROWSER_REDACTION_POLICY,
+        fields: [
+          {
+            path: "el.label",
+            reason: classification.reason,
+            action: "redacted",
+            shape: computeRedactedShape(rawLabel, classification.reason),
+          },
+        ],
+      },
+    };
+  }
+  return { value: rawLabel };
+}
+
+/**
+ * Decides whether the descriptor's `label` (the target's accessible name,
+ * computed by {@link describeElement}) ships, and if so redacts it.
+ *
+ * A masked element carries none at all, deliberately: `maskText` would turn
+ * "Next" into `"****"`, which answers nothing a reader could act on, so under
+ * `maskAllText`/`maskAllInputs` (and no per-element opt-in) the field is
+ * dropped rather than obscured.
+ */
+function finalizeAccessibleName(
+  target: Element,
+  descriptor: Record<string, unknown>,
+  config: CrumbtrailConfig,
+): Record<string, unknown> {
+  if (typeof descriptor.label !== "string") return descriptor;
+
+  const { label: rawLabel, ...rest } = descriptor;
+
+  if (!isUnmasked(target) && (config.maskAllText || config.maskAllInputs)) {
+    return rest;
+  }
+
+  const redacted = redactAccessibleName(rawLabel);
+  if (redacted.value === "") return rest;
+
+  const merged = mergeRedactionMetadata(
+    readDescriptorMetadata(rest),
+    redacted.metadata,
+  );
+
+  return {
+    ...rest,
+    label: redacted.value,
+    ...(merged ? { redaction: merged } : {}),
+  };
+}
+
 function describeInteractionTarget(
   target: Element,
   config: CrumbtrailConfig,
@@ -23,8 +102,14 @@ function describeInteractionTarget(
   try {
     const descriptor =
       config.describeInteractionElement?.(target) ?? describeElement(target);
-    if (isRecord(descriptor))
-      return maskElementDescriptor(target, removeUndefined(descriptor), config);
+    if (isRecord(descriptor)) {
+      const named = finalizeAccessibleName(
+        target,
+        removeUndefined(descriptor),
+        config,
+      );
+      return maskElementDescriptor(target, named, config);
+    }
   } catch {
     // Keep interaction capture alive even if a page-specific descriptor probe fails.
   }

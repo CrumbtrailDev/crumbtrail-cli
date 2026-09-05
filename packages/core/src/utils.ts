@@ -12,6 +12,16 @@ export interface ElementDescriptor {
   sig?: string;
   /** Deterministic structural path the sig is derived from. */
   path?: string;
+  /**
+   * Accessible name of the interaction target, in priority order: `aria-label`,
+   * an associated `<label>` (`for=` or wrapping), the element's own visible
+   * text for a button or link, `placeholder`, then `title`. Trimmed, capped at
+   * 40 characters and passed through the same redaction a captured value gets,
+   * so a name that happens to look like an email or a token is replaced rather
+   * than shipped in clear. Never the VALUE of an input, and never present at
+   * all for a password field or an element whose text is masked.
+   */
+  label?: string;
 }
 
 export function safeStringify(value: unknown, maxDepth = 3): string {
@@ -65,6 +75,81 @@ export function truncate(str: string, maxLen: number): string {
   return str.slice(0, maxLen);
 }
 
+const ACCESSIBLE_NAME_MAX_LENGTH = 40;
+const BUTTON_LIKE_TAGS = new Set(["BUTTON", "A"]);
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The text of a `<label>` associated with `el`, by `for=` first and then by
+ * wrapping — the two ways HTML lets a label claim a control. Best-effort: an
+ * invalid `for` value or an unsupported selector engine costs us this one
+ * source, not the whole name.
+ */
+function readAssociatedLabelText(el: Element): string | undefined {
+  try {
+    if (el.id) {
+      const escaped =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(el.id)
+          : el.id.replace(/["\\]/g, "\\$&");
+      const forLabel = el.ownerDocument?.querySelector(
+        `label[for="${escaped}"]`,
+      );
+      if (forLabel instanceof HTMLElement) {
+        const text = forLabel.innerText ?? forLabel.textContent;
+        if (text) return text;
+      }
+    }
+    const wrapping = el.closest("label");
+    if (wrapping instanceof HTMLElement) {
+      const text = wrapping.innerText ?? wrapping.textContent;
+      if (text) return text;
+    }
+  } catch {
+    // An invalid `for=` value or a detached node costs us this source, not the whole name.
+  }
+  return undefined;
+}
+
+/**
+ * The accessible name of an interaction target, resolved in the same order a
+ * screen reader would: an explicit `aria-label`, an associated `<label>`, the
+ * element's own visible text for a button or link, `placeholder`, then
+ * `title`. Trimmed, whitespace-collapsed and capped at
+ * {@link ACCESSIBLE_NAME_MAX_LENGTH} characters.
+ *
+ * Never reads `.value` — a name answers "what is this control called", not
+ * what a user typed into it, and a password field is refused outright so a
+ * name never becomes a second path for a credential to leak. Redaction of the
+ * result (a name that happens to look like an email or a token) is the
+ * caller's job: this only extracts what the page says the element is called.
+ */
+export function computeAccessibleName(el: Element): string | undefined {
+  if (el instanceof HTMLInputElement && el.type.toLowerCase() === "password")
+    return undefined;
+
+  const candidates: Array<string | null | undefined> = [
+    el.getAttribute("aria-label"),
+    readAssociatedLabelText(el),
+    BUTTON_LIKE_TAGS.has(el.tagName) && el instanceof HTMLElement
+      ? (el.innerText ?? el.textContent)
+      : undefined,
+    el.getAttribute("placeholder"),
+    el.getAttribute("title"),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const collapsed = collapseWhitespace(candidate);
+    if (collapsed) return truncate(collapsed, ACCESSIBLE_NAME_MAX_LENGTH);
+  }
+
+  return undefined;
+}
+
 export function describeElement(el: Element): ElementDescriptor {
   const desc: ElementDescriptor = { tag: el.tagName };
 
@@ -102,6 +187,9 @@ export function describeElement(el: Element): ElementDescriptor {
   } catch {
     // Descriptor stays valid without a signature — never break capture.
   }
+
+  const label = computeAccessibleName(el);
+  if (label) desc.label = label;
 
   return desc;
 }

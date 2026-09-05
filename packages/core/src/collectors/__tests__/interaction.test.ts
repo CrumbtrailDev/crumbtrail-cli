@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventBus } from "../../event-bus";
-import { BROWSER_REDACTION_POLICY } from "../../redaction";
+import { BROWSER_REDACTION_POLICY, REDACTED_VALUE } from "../../redaction";
 import { maskText } from "../../masking";
 import {
   DEFAULT_CONFIG,
@@ -727,5 +727,149 @@ describe("click integrity", () => {
     const clk = clickOn(button);
     expect(clk).toBeDefined();
     expect(clk!.d.covered).toBeUndefined();
+  });
+});
+
+describe("interaction target accessible name", () => {
+  // A signature path (`div[id]>div:nth-of-type(1)>...>button:nth-of-type(2)`)
+  // cannot distinguish "clicked Next" from any other click. `el.label` is the
+  // fix: the target's accessible name, resolved the way a screen reader would.
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  // DEFAULT_CONFIG masks all DOM text by default, so these cases run unmasked
+  // to see the name a reader would actually get; the last case restores the
+  // default to prove a masked element carries none at all.
+  const unmaskedConfig: CrumbtrailConfig = {
+    ...DEFAULT_CONFIG,
+    maskAllText: false as unknown as true,
+    maskAllInputs: false as unknown as true,
+  };
+
+  const elOf = (event: BugEvent | undefined) =>
+    event?.d.el as Record<string, unknown> | undefined;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+  });
+
+  afterEach(() => {
+    cleanup();
+    document.body.innerHTML = "";
+  });
+
+  it("names a click target by its visible text", () => {
+    cleanup = interactionCollector(bus, unmaskedConfig);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = "<button>Next</button>";
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe("Next");
+  });
+
+  it("names a typed-into input by its placeholder", () => {
+    cleanup = interactionCollector(bus, unmaskedConfig);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<input placeholder="Search name, email or employee number">';
+    const input = document.querySelector("input")!;
+    input.value = "Sofia";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe("Search name, email or employee number");
+  });
+
+  it("prefers an aria-label over the placeholder", () => {
+    cleanup = interactionCollector(bus, unmaskedConfig);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<input aria-label="Employee search" placeholder="Search name, email or employee number">';
+    const input = document.querySelector("input")!;
+    input.value = "Sofia";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe("Employee search");
+  });
+
+  it("carries no name for a password field", () => {
+    cleanup = interactionCollector(bus, unmaskedConfig);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<input type="password" placeholder="Password" aria-label="Password" title="Password">';
+    const input = document.querySelector("input")!;
+    input.value = "hunter2";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBeUndefined();
+  });
+
+  it("caps a long label at 40 characters", () => {
+    cleanup = interactionCollector(bus, unmaskedConfig);
+    bus.flush();
+    events.length = 0;
+
+    // Ordinary prose, not a token-shaped run: proves the cap without also
+    // tripping the classifier's long-alnum-run heuristic.
+    const long = "This label describes what the button does ".repeat(5);
+    expect(long.length).toBeGreaterThan(200);
+    document.body.innerHTML = `<button aria-label="${long}">go</button>`;
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toHaveLength(40);
+    expect(elOf(clk)?.label).toBe(long.trim().slice(0, 40));
+  });
+
+  it("carries no name at all for a masked element", () => {
+    // DEFAULT_CONFIG masks all DOM text. Asterisking "Next" into "****" would
+    // answer nothing a reader could act on, so the field is dropped entirely
+    // rather than shipped as a mask.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML = "<button>Next</button>";
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBeUndefined();
+  });
+
+  it("redacts a name that looks like a value, same as a captured input value", () => {
+    cleanup = interactionCollector(bus, unmaskedConfig);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<button aria-label="omar@example.com">go</button>';
+    document.querySelector("button")!.click();
+    bus.flush();
+
+    const clk = events.find((e) => e.k === "clk");
+    expect(elOf(clk)?.label).toBe(REDACTED_VALUE);
+    expect(clk?.d.redaction).toMatchObject({
+      policy: BROWSER_REDACTION_POLICY,
+    });
   });
 });
