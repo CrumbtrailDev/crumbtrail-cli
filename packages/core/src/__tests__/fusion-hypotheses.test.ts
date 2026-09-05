@@ -32,8 +32,20 @@ const symptom: Symptom = { title: "checkout total is wrong" };
 describe("assembleBundle hypothesis classification", () => {
   it("emits regression as the top hypothesis for unexplained network/db divergences", () => {
     const evidence = [
-      item({ id: "net-1", lane: "network", kind: "net.status" }),
-      item({ id: "db-1", lane: "db", kind: "db.row-value" }),
+      item({
+        id: "net-1",
+        lane: "network",
+        kind: "net.status",
+        before: 200,
+        after: 500,
+      }),
+      item({
+        id: "db-1",
+        lane: "db",
+        kind: "db.row-value",
+        before: 4,
+        after: 3,
+      }),
     ];
 
     const hypotheses = classify(symptom, evidence, []);
@@ -48,11 +60,15 @@ describe("assembleBundle hypothesis classification", () => {
       id: "net-explained",
       lane: "network",
       kind: "net.status",
+      before: 200,
+      after: 500,
     });
     const unexplained = item({
       id: "net-unexplained",
       lane: "network",
       kind: "net.status",
+      before: 200,
+      after: 503,
     });
     const intent: IntentSignal[] = [
       {
@@ -102,8 +118,16 @@ describe("assembleBundle hypothesis classification", () => {
     }
   });
 
-  it("classifies env-lane-only evidence as environment", () => {
-    const evidence = [item({ id: "env-1", lane: "env", kind: "env.diff" })];
+  it("classifies comparative env-lane-only evidence as environment", () => {
+    const evidence = [
+      item({
+        id: "env-1",
+        lane: "env",
+        kind: "env.diff",
+        before: "staging",
+        after: "production",
+      }),
+    ];
 
     const hypotheses = classify(symptom, evidence, []);
 
@@ -111,9 +135,88 @@ describe("assembleBundle hypothesis classification", () => {
     expect(hypotheses[0].evidenceIds).toEqual(["env-1"]);
   });
 
-  it("classifies browser-lane-only evidence as client-side", () => {
+  it("does not call current-only evidence a regression", () => {
+    const evidence = Array.from({ length: 7 }, (_, index) =>
+      item({
+        id: `current-${index}`,
+        lane: index < 3 ? "flow" : index < 6 ? "network" : "browser",
+        kind:
+          index < 3
+            ? "cache.activity"
+            : index < 6
+              ? "mcp.error"
+              : "console.warning",
+        before: null,
+        after:
+          index < 3
+            ? "hit"
+            : index < 6
+              ? "invalid arguments"
+              : "SDK close returned 500",
+      }),
+    );
+
+    const hypotheses = classify(symptom, evidence, []);
+
+    expect(hypotheses).toEqual([
+      expect.objectContaining({ kind: "inconclusive", evidenceIds: [] }),
+    ]);
+  });
+
+  it("does not compare unsupported values by type mismatch", () => {
+    const hypotheses = classify(
+      symptom,
+      [item({ lane: "network", before: () => "old", after: "new" })],
+      [],
+    );
+
+    expect(
+      hypotheses.some((hypothesis) => hypothesis.kind === "regression"),
+    ).toBe(false);
+  });
+
+  it("does not call equal before and after values a regression", () => {
+    const hypotheses = classify(
+      symptom,
+      [
+        item({
+          lane: "db",
+          before: { total: 4, page: 1 },
+          after: { page: 1, total: 4 },
+        }),
+      ],
+      [],
+    );
+
+    expect(
+      hypotheses.some((hypothesis) => hypothesis.kind === "regression"),
+    ).toBe(false);
+  });
+
+  it("does not infer environment or client fault from current-only evidence", () => {
+    const hypotheses = classify(
+      symptom,
+      [
+        item({ lane: "env", before: null, after: "production" }),
+        item({ lane: "browser", before: null, after: "SDK warning" }),
+      ],
+      [],
+    );
+
+    expect(hypotheses).toEqual([
+      expect.objectContaining({ kind: "inconclusive", evidenceIds: [] }),
+    ]);
+  });
+
+  it("classifies comparative browser-lane-only evidence as client-side", () => {
     const evidence = [
-      item({ id: "browser-1", lane: "browser", kind: "browser.diff" }),
+      item({
+        id: "browser-1",
+        lane: "browser",
+        kind: "browser.diff",
+        before: "ready",
+        after: "crashed",
+      }),
     ];
 
     const hypotheses = classify(symptom, evidence, []);
@@ -122,11 +225,11 @@ describe("assembleBundle hypothesis classification", () => {
     expect(hypotheses[0].evidenceIds).toEqual(["browser-1"]);
   });
 
-  it("emits a single latent hypothesis for empty evidence with a non-empty symptom", () => {
+  it("stays inconclusive for empty evidence with a non-empty symptom", () => {
     const hypotheses = classify(symptom, [], []);
 
     expect(hypotheses).toHaveLength(1);
-    expect(hypotheses[0].kind).toBe("latent");
+    expect(hypotheses[0].kind).toBe("inconclusive");
     expect(hypotheses[0].evidenceIds).toEqual([]);
   });
 

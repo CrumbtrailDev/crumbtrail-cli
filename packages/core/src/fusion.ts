@@ -175,9 +175,7 @@ export interface EvidenceGap {
  * against it.
  */
 export type RetrievalDeferReason =
-  | "lane_not_relevant"
-  | "source_unavailable"
-  | "missing_join_key";
+  "lane_not_relevant" | "source_unavailable" | "missing_join_key";
 
 /**
  * What a selective retrieval pass decided before any adapter was queried: which
@@ -595,7 +593,7 @@ function rankEvidence(symptom: Symptom, items: EvidenceItem[]): EvidenceItem[] {
  * Pure, deterministic, never throws. Ordered by confidence desc.
  */
 function classifyHypotheses(
-  symptom: Symptom,
+  _symptom: Symptom,
   evidence: EvidenceItem[],
   intent: IntentSignal[],
 ): Hypothesis[] {
@@ -622,10 +620,11 @@ function classifyHypotheses(
 
   const unexplained = evidence.filter((item) => !explainedById.has(item.id));
 
-  // 2. regression — unexplained network/db/flow evidence.
+  // 2. regression — unexplained, comparative network/db/flow evidence.
   const regressionEvidence = unexplained.filter(
     (item) =>
-      item.lane === "network" || item.lane === "db" || item.lane === "flow",
+      (item.lane === "network" || item.lane === "db" || item.lane === "flow") &&
+      hasComparativeChange(item),
   );
   if (regressionEvidence.length > 0) {
     const confidence = Math.min(0.9, 0.4 + 0.1 * regressionEvidence.length);
@@ -637,8 +636,10 @@ function classifyHypotheses(
     });
   }
 
-  // 3. environment — unexplained env-lane evidence.
-  const envEvidence = unexplained.filter((item) => item.lane === "env");
+  // 3. environment — unexplained comparative env-lane evidence.
+  const envEvidence = unexplained.filter(
+    (item) => item.lane === "env" && hasComparativeChange(item),
+  );
   if (envEvidence.length > 0) {
     hypotheses.push({
       kind: "environment",
@@ -648,8 +649,10 @@ function classifyHypotheses(
     });
   }
 
-  // 4. client-side — browser-lane evidence.
-  const browserEvidence = unexplained.filter((item) => item.lane === "browser");
+  // 4. client-side — comparative browser-lane evidence.
+  const browserEvidence = unexplained.filter(
+    (item) => item.lane === "browser" && hasComparativeChange(item),
+  );
   if (browserEvidence.length > 0) {
     hypotheses.push({
       kind: "client-side",
@@ -659,18 +662,7 @@ function classifyHypotheses(
     });
   }
 
-  // 5. latent — no evidence at all, but a non-empty symptom.
-  if (evidence.length === 0 && symptom.title.trim().length > 0) {
-    hypotheses.push({
-      kind: "latent",
-      confidence: 0.3,
-      rationale:
-        "no behavior change captured; likely a long-standing/latent issue or missing instrumentation",
-      evidenceIds: [],
-    });
-  }
-
-  // 6. inconclusive — nothing else emitted.
+  // 5. inconclusive — nothing else emitted.
   if (hypotheses.length === 0) {
     hypotheses.push({
       kind: "inconclusive",
@@ -691,3 +683,77 @@ function classifyHypotheses(
     .map((entry) => entry.hypothesis);
 }
 
+function hasComparativeChange(item: EvidenceItem): boolean {
+  if (item.before == null || item.after == null) return false;
+  if (
+    !isComparableEvidenceValue(item.before) ||
+    !isComparableEvidenceValue(item.after)
+  )
+    return false;
+  return !evidenceValuesEqual(item.before, item.after);
+}
+
+/**
+ * Compares JSON-shaped evidence without depending on object key insertion
+ * order. Callers validate both values first.
+ */
+function evidenceValuesEqual(
+  left: unknown,
+  right: unknown,
+  seen = new WeakMap<object, object>(),
+): boolean {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== typeof right || left === null || right === null)
+    return false;
+  if (typeof left !== "object" || typeof right !== "object") return false;
+
+  const prior = seen.get(left);
+  if (prior) return prior === right;
+  seen.set(left, right);
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      const equal = evidenceValuesEqual(left[index], right[index], seen);
+      if (!equal) return false;
+    }
+    return true;
+  }
+
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (let index = 0; index < leftKeys.length; index += 1) {
+    if (leftKeys[index] !== rightKeys[index]) return false;
+    const equal = evidenceValuesEqual(
+      leftRecord[leftKeys[index]],
+      rightRecord[rightKeys[index]],
+      seen,
+    );
+    if (!equal) return false;
+  }
+  return true;
+}
+
+function isComparableEvidenceValue(
+  value: unknown,
+  seen = new WeakSet<object>(),
+): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean")
+    return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+
+  if (Array.isArray(value))
+    return value.every((entry) => isComparableEvidenceValue(entry, seen));
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Object.values(value).every((entry) =>
+    isComparableEvidenceValue(entry, seen),
+  );
+}

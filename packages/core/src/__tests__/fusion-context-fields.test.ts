@@ -10,8 +10,8 @@ function item(overrides: Partial<EvidenceItem> = {}): EvidenceItem {
     kind: "flow.step-missing",
     brief: "generic evidence",
     ref: {},
-    before: undefined,
-    after: undefined,
+    before: "baseline",
+    after: "current",
     ...overrides,
   };
 }
