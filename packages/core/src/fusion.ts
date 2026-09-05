@@ -175,9 +175,7 @@ export interface EvidenceGap {
  * against it.
  */
 export type RetrievalDeferReason =
-  | "lane_not_relevant"
-  | "source_unavailable"
-  | "missing_join_key";
+  "lane_not_relevant" | "source_unavailable" | "missing_join_key";
 
 /**
  * What a selective retrieval pass decided before any adapter was queried: which
@@ -622,10 +620,11 @@ function classifyHypotheses(
 
   const unexplained = evidence.filter((item) => !explainedById.has(item.id));
 
-  // 2. regression — unexplained network/db/flow evidence.
+  // 2. regression — unexplained, comparative network/db/flow evidence.
   const regressionEvidence = unexplained.filter(
     (item) =>
-      item.lane === "network" || item.lane === "db" || item.lane === "flow",
+      (item.lane === "network" || item.lane === "db" || item.lane === "flow") &&
+      hasComparativeChange(item),
   );
   if (regressionEvidence.length > 0) {
     const confidence = Math.min(0.9, 0.4 + 0.1 * regressionEvidence.length);
@@ -691,3 +690,53 @@ function classifyHypotheses(
     .map((entry) => entry.hypothesis);
 }
 
+function hasComparativeChange(item: EvidenceItem): boolean {
+  if (item.before === undefined || item.after === undefined) return false;
+  return evidenceValuesEqual(item.before, item.after) === false;
+}
+
+/**
+ * Compares JSON-shaped evidence without depending on object key insertion
+ * order. An unsupported or cyclic value is inconclusive, so it cannot support
+ * a regression claim.
+ */
+function evidenceValuesEqual(
+  left: unknown,
+  right: unknown,
+  seen = new WeakMap<object, object>(),
+): boolean | undefined {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== typeof right || left === null || right === null)
+    return false;
+  if (typeof left !== "object" || typeof right !== "object") return false;
+
+  const prior = seen.get(left);
+  if (prior) return prior === right ? true : undefined;
+  seen.set(left, right);
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      const equal = evidenceValuesEqual(left[index], right[index], seen);
+      if (equal !== true) return equal;
+    }
+    return true;
+  }
+
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (let index = 0; index < leftKeys.length; index += 1) {
+    if (leftKeys[index] !== rightKeys[index]) return false;
+    const equal = evidenceValuesEqual(
+      leftRecord[leftKeys[index]],
+      rightRecord[rightKeys[index]],
+      seen,
+    );
+    if (equal !== true) return equal;
+  }
+  return true;
+}

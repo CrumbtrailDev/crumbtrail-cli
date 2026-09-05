@@ -32,8 +32,20 @@ const symptom: Symptom = { title: "checkout total is wrong" };
 describe("assembleBundle hypothesis classification", () => {
   it("emits regression as the top hypothesis for unexplained network/db divergences", () => {
     const evidence = [
-      item({ id: "net-1", lane: "network", kind: "net.status" }),
-      item({ id: "db-1", lane: "db", kind: "db.row-value" }),
+      item({
+        id: "net-1",
+        lane: "network",
+        kind: "net.status",
+        before: 200,
+        after: 500,
+      }),
+      item({
+        id: "db-1",
+        lane: "db",
+        kind: "db.row-value",
+        before: 4,
+        after: 3,
+      }),
     ];
 
     const hypotheses = classify(symptom, evidence, []);
@@ -48,11 +60,15 @@ describe("assembleBundle hypothesis classification", () => {
       id: "net-explained",
       lane: "network",
       kind: "net.status",
+      before: 200,
+      after: 500,
     });
     const unexplained = item({
       id: "net-unexplained",
       lane: "network",
       kind: "net.status",
+      before: 200,
+      after: 503,
     });
     const intent: IntentSignal[] = [
       {
@@ -109,6 +125,43 @@ describe("assembleBundle hypothesis classification", () => {
 
     expect(hypotheses[0].kind).toBe("environment");
     expect(hypotheses[0].evidenceIds).toEqual(["env-1"]);
+  });
+
+  it("does not call current-only evidence a regression", () => {
+    const evidence = [
+      item({ id: "cache", lane: "flow", kind: "cache.activity", after: "hit" }),
+      item({
+        id: "mcp",
+        lane: "network",
+        kind: "mcp.error",
+        after: "invalid arguments",
+      }),
+      item({ id: "close", lane: "network", kind: "sdk.close", after: 500 }),
+    ];
+
+    const hypotheses = classify(symptom, evidence, []);
+
+    expect(hypotheses).toEqual([
+      expect.objectContaining({ kind: "inconclusive", evidenceIds: [] }),
+    ]);
+  });
+
+  it("does not call equal before and after values a regression", () => {
+    const hypotheses = classify(
+      symptom,
+      [
+        item({
+          lane: "db",
+          before: { total: 4, page: 1 },
+          after: { page: 1, total: 4 },
+        }),
+      ],
+      [],
+    );
+
+    expect(
+      hypotheses.some((hypothesis) => hypothesis.kind === "regression"),
+    ).toBe(false);
   });
 
   it("classifies browser-lane-only evidence as client-side", () => {
