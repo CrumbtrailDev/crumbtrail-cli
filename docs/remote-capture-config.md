@@ -90,6 +90,39 @@ cannot ratchet a limit back up one step at a time.
 | `consentMode` / `consent.mode` | `"implicit"` \| `"required"` | settable  | Explicit consent blocks all buffering until `consent(true)`.                 |
 | `respectGpc`                   | boolean                      | settable  | Treat Global Privacy Control as required consent.                            |
 
+### What happens to events captured before this response arrives
+
+Capture is closed until the first policy lands, and events emitted in that
+window are held in memory rather than discarded, then released once the answer
+arrives. Without the hold a request issued before the policy and answered after
+it kept its `net.res` and lost its `net.req`, which is how a first screen ends
+up recorded as responses with no calls behind them.
+
+Release re-asks the policy questions against the events it held, because they
+were built under the local config:
+
+| The response says                     | What happens to a held event                                     |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| `collectors.<name>: false`            | Events of that collector are dropped.                            |
+| `network.excludeUrls`                 | A held request for a matching URL is dropped.                    |
+| `network.captureHeaders: false`       | `d.hdrs` is removed.                                             |
+| `network.maxBodySize`                 | Bodies over the new cap become a `payload_too_large` summary.    |
+| `redaction.denyFields`                | Bodies are re-redacted under the added names.                    |
+| `redaction.mode`                      | Bodies are re-redacted under the named mode.                     |
+| `redaction.captureInputValues: false` | A held input value becomes a placeholder.                        |
+| `masking.*` tightened                 | Held `snap`, `key` and `clip` events are dropped, not re-masked. |
+| `sampling.captureSampleRate` sheds    | The whole hold is discarded.                                     |
+| `killSwitch: true`                    | The whole hold is discarded.                                     |
+
+Every drop is counted in one `capture_gap` with reason `buffer_overflow`, so a
+session says what release cost it. The hold itself is capped at 2,000 events and
+drops the oldest first.
+
+Global Privacy Control ends the wait rather than extending it: under the default
+`consentMode: "implicit"` a GPC visitor's hold is discarded on the first poll,
+because no consent call is coming. Under `consentMode: "required"` the hold is
+kept, unsent, until `consent(true)` or `consent(false)` answers.
+
 ## Reference: sampling and flight recorder
 
 | Field                                                                                                                    | Type       | Direction | Effect                                                                |

@@ -621,7 +621,35 @@ effect on the next upload whatever the client is running. Set `remoteConfig` to
 says. It is fail closed but bounded: capture waits up to five seconds for the
 first policy response, then falls back to this call and records a
 `policy_unavailable` gap, so a host that does not serve the route costs that
-wait on first load rather than the session. Point `configEndpoint` somewhere
+wait on first load rather than the session.
+
+Nothing leaves the page during that wait, and nothing is thrown away either.
+Events captured before the policy answers are held in memory and released once
+it does, in the order they happened and with their original timestamps, so the
+requests that render the first screen keep both halves of the pair rather than
+arriving as a response with no request behind it. The hold is bounded at 2,000
+events, drops the oldest first, and records a `buffer_overflow` gap counting
+whatever it dropped.
+
+Release is not a replay of what was captured, it is a re-ask under the policy
+that just arrived. A held event is dropped when its collector is now off, when
+its URL now matches `excludeUrls`, or when the session was shed by the sample
+rate the policy carried; its headers are dropped when the policy turns header
+capture off; its bodies are re-redacted under the policy's `denyFields`,
+redaction mode and body size cap; an input value becomes a placeholder when the
+policy sets `captureInputValues: false`; and a DOM snapshot, keystroke or
+clipboard event is dropped outright when the policy tightened masking, because
+the content it holds was already rendered under the looser rule. A held event
+can lose detail or lose itself on release. It can never gain reach.
+
+A decision against capture empties the hold without sending anything:
+`stop()`, a `killSwitch`, `consent(false)`, a page hide that ends the session,
+or Global Privacy Control. GPC counts as a decision under the default
+`consentMode: "implicit"`, so a suppressed visitor holds nothing waiting for a
+consent call that is never coming. Under `consentMode: "required"` it does not,
+because the host is expected to answer and may answer yes: the first screen
+stays in page memory, unsent, and reaches the wire only if `consent(true)`
+arrives. Point `configEndpoint` somewhere
 else only for a self hosted config service.
 
 When an ingest key is present, the SDK also registers one runtime identity with
