@@ -280,3 +280,29 @@ def test_wsgi_stream_error_retains_emitted_status(capture, send_chunk, expected_
     assert sink.events[-1]['d']['statusCode'] == expected_status
     assert sink.events[-1]['d']['responseBodyState'] == 'truncated'
     assert sink.events[-2]['k'] == 'backend.req.error'
+
+
+def test_wsgi_survives_a_non_conforming_status_and_str_chunks(capture):
+    """An SDK must not take down its host when an application breaks the WSGI contract."""
+    client, sink = capture
+    def app(environ, start_response):
+        start_response('OK', [('Content-Type', 'application/json')])
+        yield 'not bytes'
+    environ = {'PATH_INFO': '/api/a', 'wsgi.input': io.BytesIO(), 'HTTP_X_CRUMBTRAIL_SESSION_ID': 's', 'HTTP_X_CRUMBTRAIL_REQUEST_ID': 'r'}
+    response = WSGIMiddleware(app, client)(environ, lambda *args: None)
+    assert list(response) == ['not bytes']
+    assert sink.events[-1]['k'] == 'backend.req.end'
+
+
+def test_wsgi_write_callable_survives_str_chunks(capture):
+    client, sink = capture
+    written = []
+    def start_response(status, headers, exc_info=None):
+        return written.append
+    def app(environ, start_response):
+        start_response('200 OK', [('Content-Type', 'application/json')])('text')
+        return []
+    environ = {'PATH_INFO': '/api/a', 'wsgi.input': io.BytesIO(), 'HTTP_X_CRUMBTRAIL_SESSION_ID': 's', 'HTTP_X_CRUMBTRAIL_REQUEST_ID': 'r'}
+    assert list(WSGIMiddleware(app, client)(environ, start_response)) == []
+    assert written == ['text']
+    assert sink.events[-1]['d']['statusCode'] == 200
