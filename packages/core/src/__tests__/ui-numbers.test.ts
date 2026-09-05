@@ -141,13 +141,40 @@ describe("parseProseCounts", () => {
     ]);
   });
 
-  // A free multi-word noun is a way for page content to leave as a "label".
-  // Two words are allowed only when the first is a known qualifier.
-  it("refuses a noun that is not one word plus a known qualifier", () => {
+  // A noun that is not plural-shaped is a name or a brand, and a free
+  // multi-word noun is a way for page content to leave as a "label".
+  it("refuses a noun that is not plural-shaped or a known count noun", () => {
+    expect(parseProseCounts("2 jane")).toBeNull();
+    expect(parseProseCounts("12 acme")).toBeNull();
     expect(parseProseCounts("2 jane doe")).toBeNull();
     expect(parseProseCounts("1,204 active team members")).toBeNull();
     expect(parseProseCounts("3 unread messages")).toEqual([
       { label: "count:unread messages", value: 3 },
+    ]);
+    expect(parseProseCounts("6 staff")).toEqual([
+      { label: "count:staff", value: 6 },
+    ]);
+  });
+
+  // The pattern carries no `i` flag on purpose: case is the only signal at
+  // this length that a trailing word is a proper noun rather than a count.
+  it("refuses a capitalised trailing word", () => {
+    expect(parseProseCounts("5 Dr Smith")).toBeNull();
+    expect(parseProseCounts("5 Smith")).toBeNull();
+    expect(parseProseCounts("5 People")).toBeNull();
+  });
+
+  // Two `pager:total` values in one region is a contradiction the detector
+  // cannot resolve, so only a collection noun means "the size of this list".
+  it("routes a non-collection Total noun to the count namespace", () => {
+    expect(parseProseCounts("Total 3 errors")).toEqual([
+      { label: "count:errors", value: 3 },
+    ]);
+    expect(parseProseCounts("Total 85 items")).toEqual([
+      { label: "pager:total", value: 85 },
+    ]);
+    expect(parseProseCounts("Total 97 entries")).toEqual([
+      { label: "pager:total", value: 97 },
     ]);
   });
 
@@ -412,6 +439,42 @@ describe("scanUiNumbers rendered counts and pager state", () => {
     expect(
       items.filter((item) => item.label.startsWith("count:")),
     ).toHaveLength(UI_NUM_MAX_PHRASE_ITEMS);
+    // Clipped, not withheld — but never silently: the region and the count it
+    // actually held are reported, or the session reads as complete.
+    expect(scan!.phrasesCapped).toEqual([{ region: "ul.feed", seen: 60 }]);
+  });
+
+  it("reports no phrase cap for a region inside the budget", () => {
+    document.body.innerHTML = `
+      <ul class="feed">
+        <li><span>12 likes</span></li>
+        <li><span>3 comments</span></li>
+      </ul>`;
+    const scan = scanUiNumbers(document.body);
+    expect(scan!.phrasesCapped).toEqual([]);
+    expect(scan!.truncated).toEqual([]);
+  });
+
+  // A numbered pager states its current page only through aria-current, and
+  // renders no sentence anywhere. The page count is deliberately not guessed
+  // from the highest link: an elided pager and a truncated one look the same.
+  it("reads the current page of a numbered-link pager", () => {
+    document.body.innerHTML = `
+      <nav class="pagination">
+        <a href="?p=1">1</a>
+        <a href="?p=2" aria-current="page">2</a>
+        <a href="?p=3">3</a>
+        <a href="?p=3">Next</a>
+      </nav>`;
+    const items = allItems(scanUiNumbers(document.body));
+    expect(items).toContainEqual({ label: "pager:page", value: 2 });
+    expect(items).toContainEqual({ label: "control:next", value: 1 });
+    expect(items.some((item) => item.label === "pager:pages")).toBe(false);
+  });
+
+  it("ignores aria-current outside a navigation container", () => {
+    document.body.innerHTML = `<main><span aria-current="page">2</span></main>`;
+    expect(allItems(scanUiNumbers(document.body))).toEqual([]);
   });
 });
 

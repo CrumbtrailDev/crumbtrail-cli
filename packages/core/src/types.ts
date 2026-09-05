@@ -263,18 +263,27 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
  *
  * 2. **A count phrase**, read only when it is the WHOLE text of a leaf:
  *      - `{n} {noun}` ("31 people")   -> `count:<noun>`, e.g. `count:people`
- *      - `Total {n} {noun}`           -> `pager:total`
+ *      - `Total {n} {noun}`           -> `pager:total` for a collection noun
+ *                                        (items, results, records, rows,
+ *                                        entries, matches), else `count:<noun>`
  *      - `Page {a} of {b}`            -> `pager:page`, `pager:pages`
  *      - `{a}-{b} of {n}` (also – —,
  *        "to", optional "Showing")    -> `pager:range_start`, `pager:range_end`,
  *                                        `pager:total`
  *      - `Showing {a} of {n}`         -> `pager:shown`, `pager:total`
  *    A trailing unit noun ("… of 138 results") is accepted and ignored. The
- *    noun of a `{n} {noun}` count is ONE word, optionally preceded by one of a
- *    closed qualifier list (open, closed, new, unread, active, pending, total,
- *    matching), so free text cannot become a label. No label is ever taken
- *    from surrounding prose, and a sentence that merely contains a number
- *    produces nothing.
+ *    noun of a `{n} {noun}` count is ONE lowercase word, optionally preceded
+ *    by one of a closed qualifier list (open, closed, new, unread, active,
+ *    pending, total, matching), and it must look like a plural or be a known
+ *    non-plural count noun. No label is ever taken from surrounding prose, and
+ *    a sentence that merely contains a number produces nothing. The residual
+ *    is a shape test, not a dictionary: a plural-looking lowercase name can
+ *    still become a label.
+ *
+ *    A numbered-link pager carries no sentence, so an element with
+ *    `aria-current="page"` inside a nav/list contributes `pager:page`. The
+ *    page COUNT is never inferred from the highest numbered link, because an
+ *    elided pager and a truncated one look identical.
  *
  * 3. **A pager control's state.** `label` is `control:<word>` where `<word>` is
  *    the pager word the control's accessible name reduces to — `previous`,
@@ -284,6 +293,12 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
  *    class on the control or its wrapper, or an anchor with `tabindex="-1"`).
  *    A reader that sums or compares these as quantities is misreading them.
  *    `unit` is never set on a control item.
+ *
+ *    A control's word is all the collector knows. A bare Next or Previous
+ *    outside a pager — a form wizard, a carousel, a date picker — emits the
+ *    same item, so `control:next = 0` means "no page two" ONLY when the same
+ *    region also carries pager evidence (`pager:pages`, `pager:total`, a
+ *    range, or a `pager:page`).
  *
  * A control whose state cannot be established emits NO item, so an item is
  * always a claim about state and never a guess. Equally, "no `control:next`

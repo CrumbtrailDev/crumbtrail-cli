@@ -80,6 +80,15 @@ export interface UiNumScanResult {
   /** Regions captured whole. An over-cap region is absent, never clipped. */
   regions: Map<string, UiNumItem[]>;
   truncated: UiNumTruncatedRegion[];
+  /**
+   * Regions whose phrase and control items were CLIPPED at
+   * `UI_NUM_MAX_PHRASE_ITEMS`. Distinct from `truncated`, which withholds a
+   * region's tokens whole: phrases carry no completeness assumption, so
+   * clipping them is safe — but a silent clip would still let a session read
+   * as complete while a chatty region contributed only its first twenty
+   * counts, so it is reported with the same shape.
+   */
+  phrasesCapped: UiNumTruncatedRegion[];
 }
 
 /**
@@ -528,6 +537,41 @@ const COUNT_NOUN_QUALIFIERS = new Set([
   "unread",
 ]);
 
+/**
+ * Count nouns that are real but not plural in form. Everything else must LOOK
+ * like a plural (end in "s"), which is the only cheap signal that a lowercase
+ * word is a counted thing rather than a name or a brand.
+ *
+ * The honest residual: this is a shape test, not a dictionary. A lowercase
+ * word ending in "s" that happens to be a name ("3 williams") still becomes a
+ * label. The gate narrows the opening; it does not close it. Use
+ * `redaction.denyFields`, `PRESET_LIGHT`, or `uiNumbers: false` when a screen
+ * renders counts beside names.
+ */
+const COUNT_NOUN_ALLOW = new Set([
+  "children",
+  "data",
+  "feedback",
+  "people",
+  "personnel",
+  "staff",
+]);
+
+/**
+ * Collection nouns that make "Total {n} {noun}" a statement about the SIZE OF
+ * THE LIST rather than a count of something on it. Only these mint
+ * `pager:total`; "Total 3 errors" is a count and becomes `count:errors`, so a
+ * region cannot end up with two different `pager:total` values.
+ */
+const TOTAL_COLLECTION_NOUNS = new Set([
+  "entries",
+  "items",
+  "matches",
+  "records",
+  "results",
+  "rows",
+]);
+
 // Every pattern is anchored to the WHOLE trimmed text. A count phrase is the
 // entire content of its leaf; a sentence that merely contains a number ("We
 // have 31 people on the team.") is prose and must stay uncaptured.
@@ -551,6 +595,9 @@ const SHOWING_OF_RE = new RegExp(
   "i",
 );
 const TOTAL_COUNT_RE = new RegExp(String.raw`^total\s+(.+?)${NOUN_TAIL}$`, "i");
+// Deliberately has NO `i` flag: a capitalised trailing word is a name or a
+// proper noun ("5 Dr Smith"), not a count noun, and the case is the only
+// signal available at this length.
 const COUNT_NOUN_RE = /^(.+?)\s+([a-z][a-z-]*(?:\s+[a-z][a-z-]*)?)$/;
 
 /**
@@ -616,6 +663,21 @@ function labeledNumbers(
   return items;
 }
 
+/**
+ * Whether a trailing phrase is usable as a count label: one word, or a closed
+ * qualifier plus one word, and the head word must look like a plural or be a
+ * known non-plural count noun. Without the head-word test any lowercase token
+ * became a label, so "2 jane" produced `count:jane`.
+ */
+function isCountNoun(words: string[]): boolean {
+  if (words.length === 0 || words.length > 2) return false;
+  if (words.some((word) => PROSE_STOP_WORDS.has(word))) return false;
+  if (words.length === 2 && !COUNT_NOUN_QUALIFIERS.has(words[0])) return false;
+  const head = words[words.length - 1];
+  if (COUNT_NOUN_ALLOW.has(head)) return true;
+  return head.length > 2 && head.endsWith("s");
+}
+
 /** A trailing unit noun is accepted only when it is a noun, not prose. */
 function nounTailOk(tail: string | undefined): boolean {
   if (tail === undefined) return true;
@@ -632,7 +694,8 @@ function nounTailOk(tail: string | undefined): boolean {
  * Recognised, whole-text only (a trailing unit noun is allowed and ignored on
  * the `of` shapes):
  *   `{n} {noun}`            -> `count:<noun>`                  ("31 people")
- *   `Total {n} {noun}`      -> `pager:total`
+ *   `Total {n} {noun}`      -> `pager:total` for a collection noun, else
+ *                              `count:<noun>`
  *   `Page {a} of {b}`       -> `pager:page`, `pager:pages`
  *   `{a}-{b} of {n}`        -> `pager:range_start`, `pager:range_end`,
  *                              `pager:total` (also – — / "to", with an
@@ -684,21 +747,24 @@ export function parseProseCounts(
 
   // "Total 85 items" is a declared collection size. The trailing noun is
   // REQUIRED and the number may carry no currency unit, so a rendered
-  // "Total $84.00" stays out of the pager namespace entirely.
+  // "Total $84.00" stays out of the pager namespace entirely. Only a
+  // collection noun means the list's size; "Total 3 errors" is a count of
+  // something ON the list and must not become a second pager:total.
   const total = TOTAL_COUNT_RE.exec(trimmed);
   if (total && total[2] !== undefined && nounTailOk(total[2])) {
-    const parsed = labeledNumbers(
-      [[`${PAGER_LABEL_PREFIX}total`, total[1]]],
-      lang,
-    );
-    if (parsed && parsed[0].unit === undefined) return parsed;
+    const noun = total[2];
+    const collection = TOTAL_COLLECTION_NOUNS.has(noun);
+    const label = collection
+      ? `${PAGER_LABEL_PREFIX}total`
+      : `${COUNT_LABEL_PREFIX}${noun}`;
+    if (collection || isCountNoun(noun.split(" "))) {
+      const parsed = labeledNumbers([[label, total[1]]], lang);
+      if (parsed && parsed[0].unit === undefined) return parsed;
+    }
   }
 
   const count = COUNT_NOUN_RE.exec(trimmed);
-  if (count) {
-    const words = count[2].split(" ");
-    if (words.some((word) => PROSE_STOP_WORDS.has(word))) return null;
-    if (words.length === 2 && !COUNT_NOUN_QUALIFIERS.has(words[0])) return null;
+  if (count && isCountNoun(count[2].split(" "))) {
     return labeledNumbers(
       [[`${COUNT_LABEL_PREFIX}${count[2]}`, count[1]]],
       lang,
@@ -799,6 +865,33 @@ export function parsePagerControl(el: Element): UiNumItem | null {
 }
 
 /**
+ * The numbered-link pager: `<a aria-current="page">2</a>` among sibling page
+ * links. That style renders no "Page 2 of 7" sentence anywhere, so without
+ * this it stated its current page in a way nothing captured.
+ *
+ * Only the current page is read. The highest numbered link is NOT read as the
+ * page count: an elided pager ("1 2 3 … 12") shows a last link, a truncated
+ * one ("1 2 3 …") does not, and the two are indistinguishable here — guessing
+ * would feed a false "fewer pages than declared" straight into the detector
+ * this evidence exists for.
+ */
+export function parseCurrentPageLink(
+  el: Element,
+  lang: string | null = null,
+): UiNumItem | null {
+  if (el.getAttribute("aria-current") !== "page") return null;
+  const tag = el.tagName;
+  if (tag !== "A" && tag !== "BUTTON" && tag !== "LI" && tag !== "SPAN") {
+    return null;
+  }
+  if (el.closest("nav, ul, ol, [role='navigation']") === null) return null;
+  const parsed = parseNumericToken(el.textContent ?? "", lang);
+  if (!parsed || parsed.unit !== undefined) return null;
+  if (!Number.isInteger(parsed.value) || parsed.value < 1) return null;
+  return { label: `${PAGER_LABEL_PREFIX}page`, value: parsed.value };
+}
+
+/**
  * Scan visible text under `root` for labeled numeric tokens, grouped by
  * region. Pure DOM read — no mutation, no HTML capture.
  *
@@ -840,17 +933,21 @@ export function scanUiNumbers(
   // region of 51 and a region of 5,000 are different evidence problems.
   const tokenSeen = new Map<string, number>();
   const tokenKept = new Map<string, number>();
+  // Phrases are clipped rather than withheld, but the count past the cap is
+  // still recorded: a region that kept twenty of sixty counts must say so.
+  const phraseSeen = new Map<string, number>();
   const phraseKept = new Map<string, number>();
   for (const el of elements) {
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
-    // Three shapes produce items, in order: a pager control's enabled state, a
-    // leaf that IS a numeric token, and a leaf that is a short count phrase
-    // ("31 people", "Page 1 of 1"). The last two are mutually exclusive.
+    // Four shapes produce items, in order: a pager control's enabled state, a
+    // numbered pager's current-page link, a leaf that IS a numeric token, and
+    // a leaf that is a short count phrase ("31 people", "Page 1 of 1"). The
+    // last two are mutually exclusive.
     let produced: UiNumItem[] | null = null;
     let token = false;
-    const control = parsePagerControl(el);
+    const control = parsePagerControl(el) ?? parseCurrentPageLink(el, lang);
     if (control) {
       produced = [control];
     } else {
@@ -896,6 +993,7 @@ export function scanUiNumbers(
         if (already >= UI_NUM_MAX_ITEMS) continue;
         tokenKept.set(region, already + 1);
       } else {
+        phraseSeen.set(region, (phraseSeen.get(region) ?? 0) + 1);
         const already = phraseKept.get(region) ?? 0;
         if (already >= UI_NUM_MAX_PHRASE_ITEMS) continue;
         phraseKept.set(region, already + 1);
@@ -909,16 +1007,21 @@ export function scanUiNumbers(
   // control items are not part of that assumption and survive.
   const regions = new Map<string, UiNumItem[]>();
   const truncated: UiNumTruncatedRegion[] = [];
+  const phrasesCapped: UiNumTruncatedRegion[] = [];
   for (const [region, entries] of perRegion) {
     const seen = tokenSeen.get(region) ?? 0;
     const over = seen > UI_NUM_MAX_ITEMS;
     if (over) truncated.push({ region, seen });
+    const phrases = phraseSeen.get(region) ?? 0;
+    if (phrases > UI_NUM_MAX_PHRASE_ITEMS) {
+      phrasesCapped.push({ region, seen: phrases });
+    }
     const items = (
       over ? entries.filter((entry) => !entry.token) : entries
     ).map((entry) => entry.item);
     if (items.length > 0) regions.set(region, items);
   }
-  return { regions, truncated };
+  return { regions, truncated, phrasesCapped };
 }
 
 /**
@@ -1118,6 +1221,7 @@ function startUiNumbersCollector(
   // rescans every 500ms and would otherwise emit the same gap forever; the gap
   // is a statement about the region, so one is the whole truth.
   const reportedTruncated = new Set<string>();
+  const reportedPhraseCapped = new Set<string>();
   let observer: MutationObserver | undefined;
   // Assigned after observer setup; `let` so `disable` (defined first, callable
   // from the observer-setup catch) can release it without a TDZ reference.
@@ -1204,6 +1308,20 @@ function startUiNumbersCollector(
             surface: "browser",
             reason: "scan_budget_exceeded",
             droppedEventCount: seen,
+          }),
+        );
+      }
+      // A clipped phrase region keeps its first twenty counts, so unlike a
+      // withheld token region it still emits a snapshot. The gap is what says
+      // the snapshot is a sample rather than the whole region.
+      for (const { region, seen } of scan.phrasesCapped) {
+        if (reportedPhraseCapped.has(region)) continue;
+        reportedPhraseCapped.add(region);
+        bus.emit(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "scan_budget_exceeded",
+            droppedEventCount: seen - UI_NUM_MAX_PHRASE_ITEMS,
           }),
         );
       }
