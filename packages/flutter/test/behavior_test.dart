@@ -358,7 +358,10 @@ void main() {
       expect(url, contains('q=shoes'));
       expect(url, contains('page=2'));
       expect(url, isNot(contains('sk-live')));
-      expect(url, contains('%5BREDACTED%5D'));
+      // Literally, not percent encoded. Ingest matches on the marker string, so
+      // a `%5BREDACTED%5D` here reads as an ordinary value on the other side.
+      expect(url, contains('[REDACTED]'));
+      expect(url, 'https://api.example.com/search?q=shoes&api_key=[REDACTED]&page=2');
     });
 
     test('a non-URL keeps only its path, never its query', () {

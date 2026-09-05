@@ -1,5 +1,7 @@
 package ai.crumbtrail.sdk
 
+import java.net.URI
+
 object CrumbtrailSdk {
     const val NAME = "crumbtrail-kotlin"
     const val VERSION = "0.1.0"
@@ -239,14 +241,52 @@ class Crumbtrail(
         )
     }
 
+    /**
+     * The host Crumbtrail itself posts to, lowercased, or null when the endpoint
+     * is not URL shaped.
+     */
+    private val endpointHost: String? = try {
+        URI(config.endpoint).host?.lowercase()
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * Whether a network adapter should record this request.
+     *
+     * Requests to Crumbtrail's own ingest host are excluded, and that exclusion
+     * is not optional. Every adapter here hangs off a seam the host application
+     * also owns, and a host that gives Crumbtrail an OkHttp backed transport to
+     * share its certificate pinning would otherwise get event to flush to POST
+     * to intercepted to event. It amplifies rather than settling, because
+     * [flush] fires on batch size, so one captured request becomes the batch
+     * that posts it.
+     */
+    fun capturesRequestTo(url: String): Boolean {
+        if (!config.collectors.network) return false
+        val host = endpointHost ?: return true
+        val requestHost = try {
+            URI(url).host?.lowercase()
+        } catch (_: Exception) {
+            null
+        }
+        return requestHost != host
+    }
+
     /** Record a completed request. The URL goes through redaction first. */
     fun recordRequest(
         url: String,
         method: String,
         status: Int?,
         durationMs: Long,
-        source: String = "okhttp",
+        source: String = "manual",
         error: String? = null,
+        /**
+         * Which phase [durationMs] covers: `headers` or `body`. Left absent by
+         * default, because a manual caller measured whatever it measured and the
+         * SDK must not state a phase on its behalf.
+         */
+        durTo: String? = null,
     ) {
         addEvent(
             CrumbtrailEventKind.NETWORK,
@@ -256,7 +296,8 @@ class Crumbtrail(
                 "status" to JsonValue.num(status),
                 "ok" to JsonValue.bool(status?.let { it in 200..299 }),
                 "dur" to JsonValue.Num(durationMs),
-                "source" to JsonValue.Str(redactedDiagnosticText(source, 256) ?: "okhttp"),
+                "durTo" to JsonValue.str(durTo),
+                "source" to JsonValue.Str(redactedDiagnosticText(source, 256) ?: "manual"),
                 "error" to JsonValue.str(redactedDiagnosticText(error, 1_024)),
             ),
         )
