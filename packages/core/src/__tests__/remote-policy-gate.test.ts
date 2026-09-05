@@ -215,6 +215,71 @@ describe("the window between init() and the first capture policy", () => {
     expect(new Set(requests.map((event) => event.d?.id)).size).toBe(4);
   });
 
+
+  // The hold must never become a way for evidence to reach the wire after the
+  // host said no. A decision against capture discards it.
+  it("discards what it held when consent is refused", async () => {
+    const fetchStub = vi.fn().mockImplementation((input: unknown) => {
+      if (String(input).includes("/api/capture-config"))
+        return new Promise<Response>(() => {});
+      return Promise.resolve(appResponse());
+    });
+    globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+      consentMode: "explicit",
+    });
+
+    logger.mark("before-the-answer");
+    logger.consent(false);
+    await logger.stop();
+
+    expect(delivered(transport).filter((e) => e.k === "mark")).toHaveLength(0);
+  });
+
+  // Consent answered late is the other undecided window, and it resolves the
+  // same way: the first screen is still there when the answer arrives.
+  it("replays what it held when consent is granted", async () => {
+    const fetchStub = vi.fn().mockImplementation((input: unknown) => {
+      if (String(input).includes("/api/capture-config"))
+        return Promise.resolve(new Response(RECOGNIZED_POLICY));
+      return Promise.resolve(appResponse());
+    });
+    globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      network: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+      consentMode: "explicit",
+    });
+
+    await globalThis.fetch("/api/participants");
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    logger.consent(true);
+    await logger.stop();
+
+    const events = delivered(transport);
+    const forUrl = (kind: string) =>
+      events.filter(
+        (event) =>
+          event.k === kind && String(event.d?.url).includes("/api/participants"),
+      );
+    expect(forUrl("net.req")).toHaveLength(1);
+    expect(forUrl("net.res")).toHaveLength(1);
+    expect(forUrl("net.req")[0]?.d?.id).toBe(forUrl("net.res")[0]?.d?.id);
+  });
+
   it("opens the gate on the local config, and records the gap, when the config route never answers", async () => {
     const fetchStub = vi.fn().mockImplementation((input: unknown) => {
       if (String(input).includes("/api/capture-config"))

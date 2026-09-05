@@ -414,7 +414,10 @@ describe("probe dispatch rejects a parameterised probe request", () => {
     expect(probeCalls.map((call) => call.name)).toEqual(["storage.snapshot"]);
     expect(probeResults(transport)).toHaveLength(1);
     expect(JSON.stringify(transport.sent)).not.toContain(injected);
-    expect(JSON.stringify(transport.sent)).not.toContain("rm");
+    // A bare "rm" substring also matches "Darwin arm64" in the environment
+    // snapshot's user agent, which is capture doing its job. What must never
+    // appear is the command itself.
+    expect(JSON.stringify(transport.sent)).not.toMatch(/\brm\b/);
 
     await logger.stop();
   });
