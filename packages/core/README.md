@@ -930,6 +930,70 @@ unit}`. These power the display-arithmetic detector (subtotal + tax vs total)
 and the UI-vs-API divergence detector. It never captures raw DOM or HTML, only
 the short label and the parsed number.
 
+Two further shapes are read, because a list screen states its own counts in
+prose rather than as bare numbers. Both use a namespaced label, so a pager
+footer can never be mistaken for a rendered figure by a consumer that matches
+labels by word.
+
+First, a text node whose **whole** content is a short count phrase:
+
+| Rendered                                                              | Items                                                 |
+| --------------------------------------------------------------------- | ----------------------------------------------------- |
+| `31 people` (`{n} {noun}`)                                            | `count:people` = 31                                   |
+| `Total 85 items`                                                      | `pager:total` = 85                                    |
+| `Page 1 of 1`                                                         | `pager:page` = 1, `pager:pages` = 1                   |
+| `1-25 of 31 items` (also en/em dash, `to`, optional `Showing` prefix) | `pager:range_start`, `pager:range_end`, `pager:total` |
+| `Showing 25 of 138 results`                                           | `pager:shown` = 25, `pager:total` = 138               |
+
+A trailing unit noun is accepted and ignored. `Total {n} {noun}` mints
+`pager:total` only for a collection noun (items, results, records, rows,
+entries, matches); every other noun is a count of something on the list, so
+"Total 3 errors" reads as `count:errors` and a region cannot end up with two
+different `pager:total` values.
+
+The noun of a `{n} {noun}` count is one lowercase word, optionally preceded by
+one qualifier from a closed list (open, closed, new, unread, active, pending,
+total, matching), and it must look like a plural (end in "s") or be a known
+non-plural count noun (people, staff, children, feedback, data, personnel). So
+"12 open orders" and "31 people" are read, while "2 jane", "12 acme" and
+"5 Dr Smith" are not. The honest residual: this is a shape test, not a
+dictionary, so a lowercase word ending in "s" that happens to be a name
+("3 williams") can still become a label — the gate narrows the opening rather
+than closing it, and the opt-outs below are the answer when a screen renders
+counts beside names. A sentence that merely mentions a number ("We have 31
+people on the team.") is not a count and produces nothing.
+
+Second, a pager control's state: a `button` or `a` whose accessible name
+reduces to a pager word emits `{ label: "control:<word>", value: 1 | 0 }`, where
+the value is a boolean, 1 for actionable and 0 for disabled, not a count. The
+name is reduced rather than matched whole, so "Go to next page" and "Next Page"
+both read as `control:next` while "Next step in setup" is not a pager control.
+Disabled is read from the `disabled` attribute, `aria-disabled="true"`, a
+disabled class on the control or its wrapper, or an anchor with
+`tabindex="-1"`; `«`, `»`, `‹`, `›` and "Load more" are recognised too. A
+control whose state cannot be established emits no item rather than a confident
+`1`.
+
+A numbered-link pager states its position only in markup, so an element
+carrying `aria-current="page"` inside a `nav`, `ul` or `ol` contributes
+`pager:page`. The page COUNT is deliberately not inferred from the highest
+numbered link: an elided pager ("1 2 3 … 12") and a truncated one ("1 2 3 …")
+are indistinguishable, and a guess there would be a false shortfall.
+
+A control's word is all this collector knows. A bare Next or Previous button
+outside a pager — a form wizard, a carousel, a date picker — emits
+`control:next` or `control:previous` exactly as a pager does, so a consumer
+must not read `control:next = 0` as "there is no page two" unless the same
+region also carries pager evidence (`pager:pages`, `pager:total`, a range, or a
+`pager:page`).
+
+Count and control items are budgeted separately from rendered figures, at 20
+per region, so a chatty feed cannot push a region over the numeric-token cap
+and cause its currency tokens to be withheld. A region that holds more than 20
+is clipped to the first 20 and reported in the scan result's `phrasesCapped`,
+which raises a `capture_gap` for the region rather than letting a partial
+snapshot read as complete.
+
 This means numeric amounts shown on screen are captured together with their
 labels. Labels run through the redaction classifier, so PII-shaped labels
 (emails, tokens) and card-number-shaped values are dropped entirely. The honest
