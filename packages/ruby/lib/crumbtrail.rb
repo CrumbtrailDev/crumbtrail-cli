@@ -1,8 +1,11 @@
+require_relative 'crumbtrail/event'
 require_relative 'crumbtrail/body'
 require_relative 'crumbtrail/sender'
 
 module Crumbtrail
-  VERSION = '0.1.0'
+  EVENT_BUDGET = 200
+  BOUNDARY_KINDS = %w[backend.req.start backend.req.end backend.req.error].freeze
+
   class Context
     attr_reader :session_id, :request_id
     def initialize(session_id, request_id, sink)
@@ -11,23 +14,42 @@ module Crumbtrail
       @dropped = 0
       @sequence = 0
     end
-    def add(kind, data, time = (Time.now.to_f * 1000).to_i)
-      if @events.size < 200 || %w[backend.req.start backend.req.end backend.req.error].include?(kind)
-        @events << { t: time, k: kind, d: data.merge(requestId: @request_id, sessionId: @session_id) }
+    def add(kind, data, time = Crumbtrail.now)
+      if @events.size < EVENT_BUDGET || BOUNDARY_KINDS.include?(kind)
+        @events << Crumbtrail.event(time, kind, data.merge(requestId: @request_id, sessionId: @session_id))
       else
         @dropped += 1
       end
     end
-    def database(kind, data)
+    # Statement order is the order the application issued statements in, so both the sequence
+    # and the timestamp are taken before the statement runs. Stamping either at completion
+    # sorts a slow query after faster ones issued after it, and makes `seq` contradict `t`.
+    def next_sequence
       @sequence += 1
-      add(kind, data.merge(seq: @sequence, t: (Time.now.to_f * 1000).to_i))
+    end
+    def database(kind, data, sequence: nil, time: nil)
+      time ||= Crumbtrail.now
+      add(kind, data.merge(seq: sequence || next_sequence, t: time), time)
+    end
+    def gap(reason, dropped, surface, detail = nil)
+      data = { kind: 'capture_gap', surface: surface, reason: reason, requestId: @request_id,
+               sessionId: @session_id, droppedEventCount: dropped }
+      data[:detail] = detail if detail
+      Crumbtrail.event(Crumbtrail.now, 'capture_gap', data)
     end
     def flush
-      if @dropped > 0
-        @events << { t: (Time.now.to_f * 1000).to_i, k: 'capture_gap', d: { kind: 'capture_gap', surface: 'backend_request', reason: 'scan_budget_exceeded', requestId: @request_id, droppedEvents: @dropped } }
-      end
+      @events << gap('scan_budget_exceeded', @dropped, 'backend_request') if @dropped > 0
       @events.sort_by! { |event| [event[:t], event[:k] == 'backend.req.start' ? 0 : 1] }
-      @events.each_slice(20) { |events| @sink.enqueue(sessionId: @session_id, events: events) }
+      refused = 0
+      @events.each_slice(20) do |events|
+        refused += events.size unless @sink.enqueue(sessionId: @session_id, events: events)
+      end
+      # A batch the sink refused is a hole in the session. Declaring it costs one event; leaving
+      # it implicit lets a burst drop `backend.req.end` and leaves a request that never
+      # terminated looking exactly like a request that never happened.
+      if refused > 0
+        @sink.enqueue(sessionId: @session_id, events: [gap('buffer_overflow', refused, 'queue', 'sink queue full')])
+      end
     rescue StandardError
       nil
     ensure
@@ -50,6 +72,14 @@ module Crumbtrail
     attr_reader :bytes, :truncated, :complete
     def initialize(io)
       @io, @bytes, @truncated, @complete = io, ''.b, false, false
+      # Rack does not require the input stream to be rewindable, and application code branches
+      # on `respond_to?(:rewind)`. Advertising a method the wrapped stream does not have turns
+      # a working request into a NoMethodError this middleware introduced. `close` and `size`
+      # are delegated for the same reason: the wrapper must not remove capability from the
+      # object it replaces.
+      define_singleton_method(:rewind) { rewind! } if io.respond_to?(:rewind)
+      define_singleton_method(:close) { @io.close } if io.respond_to?(:close)
+      define_singleton_method(:size) { @io.size } if io.respond_to?(:size)
     end
     def keep(data)
       return data unless data
@@ -73,7 +103,8 @@ module Crumbtrail
       @io.each { |data| yield keep(data) }
       @complete = true
     end
-    def rewind
+    private
+    def rewind!
       result = @io.rewind
       @bytes.clear
       @truncated = false
@@ -86,15 +117,18 @@ module Crumbtrail
     def initialize(body, context, finish)
       @body, @context, @finish = body, context, finish
       @bytes, @truncated, @finished, @complete = ''.b, false, false, false
+      # Rack::Files answers `to_path` so the server can hand the descriptor to sendfile. Hiding
+      # it costs every static response its fast path. The bytes never pass through Ruby on that
+      # path, so the response body is honestly reported as missing rather than invented.
+      define_singleton_method(:to_path) { @body.to_path } if body.respond_to?(:to_path)
+      define_singleton_method(:to_ary) { buffered } if body.respond_to?(:to_ary)
     end
     def each
       return enum_for(:each) unless block_given?
       Crumbtrail.with_context(@context) do
         begin
           @body.each do |chunk|
-            remaining = Body::LIMIT - @bytes.bytesize
-            @bytes << chunk.b.byteslice(0, remaining)
-            @truncated ||= chunk.bytesize > remaining
+            keep(chunk)
             yield chunk
           end
           @complete = true
@@ -112,6 +146,19 @@ module Crumbtrail
       finish
     end
     private
+    def keep(chunk)
+      remaining = Body::LIMIT - @bytes.bytesize
+      @bytes << chunk.b.byteslice(0, remaining)
+      @truncated ||= chunk.bytesize > remaining
+    end
+    def buffered
+      chunks = Crumbtrail.with_context(@context) { @body.to_ary }
+      chunks.each { |chunk| keep(chunk) }
+      @complete = true
+      chunks
+    ensure
+      finish
+    end
     def finish(error = nil)
       @truncated = true if (error || !@complete) && !@bytes.empty?
       return if @finished
@@ -178,7 +225,7 @@ module Crumbtrail
       end
       input = Input.new(original) if original && Body.json?(env['CONTENT_TYPE'])
       env['rack.input'] = input if input
-      started, started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC), (Time.now.to_f * 1000).to_i
+      started, started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC), Crumbtrail.now
       base = { method: env['REQUEST_METHOD'], url: '/', route: '/', pathname: '/', service: @service,
                correlation: { status: 'linked', sessionIdSource: 'header', requestIdSource: 'header' } }
       status, headers, body = nil

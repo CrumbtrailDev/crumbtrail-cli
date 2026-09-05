@@ -37,6 +37,8 @@ func (s *memorySink) events() []Event {
 	}
 	return out
 }
+func captureAll(*http.Request) bool { return true }
+
 func request(body string) *http.Request {
 	r := httptest.NewRequest("POST", "https://example.com/api/quote?token=secret", strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
@@ -66,7 +68,7 @@ func TestLoopbackHTTPDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "go-test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "go-test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		input, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
@@ -156,7 +158,7 @@ func TestBodyPolicy(t *testing.T) {
 func TestTruncationInterfacesAndFailureIsolation(t *testing.T) {
 	sink := &memorySink{}
 	large := `{"data":"` + strings.Repeat("a", 20000) + `"}`
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := w.(http.Flusher); !ok {
 			t.Error("flusher lost")
 		}
@@ -175,7 +177,7 @@ func TestTruncationInterfacesAndFailureIsolation(t *testing.T) {
 	if find(t, sink, "backend.req.start")["requestBodyState"] != "truncated" || find(t, sink, "backend.req.end")["responseBodyState"] != "truncated" {
 		t.Fatal("missing truncation")
 	}
-	bad := Middleware(Options{panicSink{}, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
+	bad := Middleware(Options{Sink: panicSink{}, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
 	bad.ServeHTTP(httptest.NewRecorder(), request(""))
 }
 
@@ -185,7 +187,7 @@ func (panicSink) Enqueue(Batch) bool { panic("sink failed") }
 func TestPanicPreserved(t *testing.T) {
 	sink := &memorySink{}
 	original := errors.New("private")
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(original) }))
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(original) }))
 	func() {
 		defer func() {
 			if recover() != original {
@@ -198,7 +200,7 @@ func TestPanicPreserved(t *testing.T) {
 }
 func TestDefaultAndInvalidCorrelation(t *testing.T) {
 	sink := &memorySink{}
-	for _, options := range []Options{{Sink: sink}, {Sink: sink, ShouldCapture: func(*http.Request) bool { return true }}} {
+	for _, options := range []Options{{Sink: sink}, {Sink: sink, ShouldCapture: captureAll}} {
 		r := request("")
 		r.Header.Set("x-crumbtrail-request-id", "invalid\n")
 		Middleware(options)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })).ServeHTTP(httptest.NewRecorder(), r)
@@ -229,11 +231,11 @@ func TestSenderTLSRetryAndClose(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	sender, err := NewSender(SenderConfig{server.URL, "test-key", server.Client()})
+	sender, err := NewSender(SenderConfig{Endpoint: server.URL, Key: "test-key", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sender.Enqueue(Batch{"session", []Event{{1, "backend.req.end", map[string]any{"requestId": "request"}}}}) {
+	if !sender.Enqueue(Batch{"session", []Event{newEvent(1, "backend.req.end", map[string]any{"requestId": "request"})}}) {
 		t.Fatal("enqueue failed")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -265,7 +267,7 @@ func contractJSON(s *memorySink) []byte {
 
 func TestPanicAfterWriteKeepsStatus(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(202)
 		io.WriteString(w, "partial")
 		panic("private failure")
@@ -278,7 +280,7 @@ func TestPanicAfterWriteKeepsStatus(t *testing.T) {
 }
 func TestConcurrentContextsStaySeparate(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(time.Millisecond); io.WriteString(w, "ok") }))
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(time.Millisecond); io.WriteString(w, "ok") }))
 	var group sync.WaitGroup
 	for _, id := range []string{"request-one", "request-two"} {
 		group.Add(1)
@@ -304,7 +306,7 @@ func TestSenderDoesNotFollowRedirect(t *testing.T) {
 	defer destination.Close()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, destination.URL, 307) }))
 	defer server.Close()
-	sender, err := NewSender(SenderConfig{server.URL, "key", server.Client()})
+	sender, err := NewSender(SenderConfig{Endpoint: server.URL, Key: "key", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,9 +323,9 @@ func TestSenderDoesNotFollowRedirect(t *testing.T) {
 
 func TestEventLimitPreservesBoundaries(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for i := 0; i < 250; i++ {
-			recordSQL(r.Context(), "sqlite", "SELECT 1", time.Now(), nil, nil)
+			beginSQL(r.Context(), "sqlite").finish("SELECT 1", nil, nil)
 		}
 		io.WriteString(w, "ok")
 	}))
@@ -331,7 +333,7 @@ func TestEventLimitPreservesBoundaries(t *testing.T) {
 	find(t, sink, "backend.req.start")
 	find(t, sink, "backend.req.end")
 	gap := find(t, sink, "capture_gap")
-	if gap["droppedEvents"] != 50 {
+	if gap["droppedEventCount"] != 50 {
 		t.Fatal(gap)
 	}
 	if len(sink.events()) != 203 {
@@ -347,7 +349,7 @@ type readerOnly struct{ io.Reader }
 
 func TestReaderFromPreservedAndCaptured(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := w.(io.ReaderFrom); !ok {
 			t.Error("ReaderFrom lost")
 		}
@@ -367,7 +369,7 @@ func TestReaderFromPreservedAndCaptured(t *testing.T) {
 func TestPartialRequestDoesNotInventOperand(t *testing.T) {
 	for _, length := range []int64{4, -1} {
 		sink := &memorySink{}
-		handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			one := make([]byte, 1)
 			r.Body.Read(one)
 			io.WriteString(w, "ok")
@@ -386,7 +388,7 @@ func TestDuplicateCorrelationRejected(t *testing.T) {
 		sink := &memorySink{}
 		r := request("")
 		r.Header.Add(header, "second-valid-identity")
-		Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })).ServeHTTP(httptest.NewRecorder(), r)
+		Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })).ServeHTTP(httptest.NewRecorder(), r)
 		if len(sink.events()) != 0 {
 			t.Fatal("ambiguous request captured")
 		}
@@ -396,7 +398,7 @@ func TestOnlyMatchedRouteTemplateCaptured(t *testing.T) {
 	sink := &memorySink{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/users/{email}", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(mux)
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(mux)
 	r := request("")
 	r.URL.Path = "/api/users/private@example.com"
 	handler.ServeHTTP(httptest.NewRecorder(), r)
@@ -410,7 +412,7 @@ func TestOnlyMatchedRouteTemplateCaptured(t *testing.T) {
 	sink = &memorySink{}
 	r = request("")
 	r.URL.Path = "/token/secret-path-value"
-	Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), r)
+	Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), r)
 	if find(t, sink, "backend.req.start")["url"] != "/" {
 		t.Fatal("unmatched raw path recorded")
 	}
@@ -418,7 +420,7 @@ func TestOnlyMatchedRouteTemplateCaptured(t *testing.T) {
 
 func TestShortDeclaredResponseWithheld(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", "4")
 		io.WriteString(w, "1")
@@ -435,7 +437,7 @@ func TestShortDeclaredResponseWithheld(t *testing.T) {
 }
 func TestHeadDeclaredLengthDoesNotInventTruncation(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", "4")
 	}))
@@ -450,7 +452,7 @@ func TestHeadDeclaredLengthDoesNotInventTruncation(t *testing.T) {
 
 func TestRequestEOFDoesNotOverrideDeclaredLength(t *testing.T) {
 	sink := &memorySink{}
-	handler := Middleware(Options{sink, "test", func(*http.Request) bool { return true }})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.ReadAll(r.Body) }))
+	handler := Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.ReadAll(r.Body) }))
 	r := request("1")
 	r.ContentLength = 4
 	handler.ServeHTTP(httptest.NewRecorder(), r)

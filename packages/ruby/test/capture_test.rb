@@ -141,7 +141,7 @@ class CaptureTest < Minitest::Test
     assert_equal 203, @sink.events.size
     assert @sink.events.any? { |e| e[:k] == 'backend.req.start' }
     assert @sink.events.any? { |e| e[:k] == 'backend.req.end' }
-    assert_equal 50, @sink.events.find { |e| e[:k] == 'capture_gap' }[:d][:droppedEvents]
+    assert_equal 50, @sink.events.find { |e| e[:k] == 'capture_gap' }[:d][:droppedEventCount]
   end
   def test_hijack_capability_does_not_disable_ordinary_requests
     request = env.merge('rack.hijack?' => true, 'rack.hijack' => -> { raise 'not hijacking' })
@@ -182,7 +182,7 @@ class CaptureTest < Minitest::Test
       stream.flush
       :complete
     end
-    app = Rack::Lint.new(middleware(->(_) { [201, {}, callback] }))
+    app = Rack::Lint.new(middleware(Rack::Lint.new(->(_) { [201, {}, callback] })))
     status, _, body = app.call(env)
     assert_equal 201, status
     refute body.respond_to?(:each)

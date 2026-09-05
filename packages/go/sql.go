@@ -20,10 +20,34 @@ func WrapDB(db *sql.DB, engine string) (*DB, error) {
 	}
 	return &DB{db, engine}, nil
 }
-func recordSQL(ctx context.Context, engine, query string, start time.Time, result sql.Result, err error) {
+
+// sqlSpan holds what is known when a statement is issued. Both the sequence and the event
+// timestamp are taken here rather than at completion: stamping either at completion sorts a
+// slow query after faster ones issued after it, and leaves seq contradicting t.
+type sqlSpan struct {
+	c      *captureContext
+	engine string
+	seq    int
+	at     int64
+	start  time.Time
+}
+
+func beginSQL(ctx context.Context, engine string) sqlSpan {
+	span := sqlSpan{engine: engine, start: time.Now()}
 	defer func() { _ = recover() }()
 	c, _ := ctx.Value(contextKey{}).(*captureContext)
 	if c == nil {
+		return span
+	}
+	span.c = c
+	span.seq = c.nextSequence()
+	span.at = span.start.UnixMilli()
+	return span
+}
+
+func (s sqlSpan) finish(query string, result sql.Result, err error) {
+	defer func() { _ = recover() }()
+	if s.c == nil {
 		return
 	}
 	op := "other"
@@ -43,11 +67,9 @@ func recordSQL(ctx context.Context, engine, query string, start time.Time, resul
 			rows = count
 		}
 	}
-	c.mu.Lock()
-	c.seq++
-	seq := c.seq
-	c.mu.Unlock()
-	data := map[string]any{"engine": engine, "op": op, "table": nil, "shape": "[statement omitted]", "rowCount": rows, "rowEvidence": "not_captured", "seq": seq, "t": start.UnixMilli(), "durationMs": float64(time.Since(start).Microseconds()) / 1000}
+	data := map[string]any{"engine": s.engine, "op": op, "table": nil, "shape": "[statement omitted]",
+		"rowCount": rows, "rowEvidence": "not_captured", "seq": s.seq, "t": s.at,
+		"durationMs": float64(time.Since(s.start).Microseconds()) / 1000}
 	kind := "db.statement"
 	if err != nil {
 		kind = "db.error"
@@ -55,39 +77,39 @@ func recordSQL(ctx context.Context, engine, query string, start time.Time, resul
 		data["code"] = nil
 		data["errorName"] = "database_error"
 	}
-	c.add(kind, data, start.UnixMilli())
+	s.c.add(kind, data, s.at)
 }
+
 func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	start := time.Now()
+	span := beginSQL(ctx, d.engine)
 	result, err := d.DB.ExecContext(ctx, query, args...)
-	recordSQL(ctx, d.engine, query, start, result, err)
+	span.finish(query, result, err)
 	return result, err
 }
 func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	start := time.Now()
+	span := beginSQL(ctx, d.engine)
 	rows, err := d.DB.QueryContext(ctx, query, args...)
-	recordSQL(ctx, d.engine, query, start, nil, err)
+	span.finish(query, nil, err)
 	return rows, err
 }
 
 // Row preserves QueryRow's deferred error semantics. Its capture completes at Scan.
 type Row struct {
-	row           *sql.Row
-	ctx           context.Context
-	engine, query string
-	started       time.Time
+	row   *sql.Row
+	span  sqlSpan
+	query string
 }
 
 func (r *Row) Scan(dest ...any) error {
 	err := r.row.Scan(dest...)
-	recordSQL(r.ctx, r.engine, r.query, r.started, nil, err)
+	r.span.finish(r.query, nil, err)
 	return err
 }
 func (r *Row) Err() error { return r.row.Err() }
 func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	start := time.Now()
+	span := beginSQL(ctx, d.engine)
 	row := d.DB.QueryRowContext(ctx, query, args...)
-	return &Row{row, ctx, d.engine, query, start}
+	return &Row{row, span, query}
 }
 
 type Tx struct {
@@ -104,32 +126,32 @@ func (d *DB) BeginTx(ctx context.Context, options *sql.TxOptions) (*Tx, error) {
 	return &Tx{tx, ctx, d.engine}, nil
 }
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	start := time.Now()
+	span := beginSQL(ctx, t.engine)
 	result, err := t.Tx.ExecContext(ctx, query, args...)
-	recordSQL(ctx, t.engine, query, start, result, err)
+	span.finish(query, result, err)
 	return result, err
 }
 func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	start := time.Now()
+	span := beginSQL(ctx, t.engine)
 	rows, err := t.Tx.QueryContext(ctx, query, args...)
-	recordSQL(ctx, t.engine, query, start, nil, err)
+	span.finish(query, nil, err)
 	return rows, err
 }
 func (t *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	start := time.Now()
+	span := beginSQL(ctx, t.engine)
 	row := t.Tx.QueryRowContext(ctx, query, args...)
-	return &Row{row, ctx, t.engine, query, start}
+	return &Row{row, span, query}
 }
 func (t *Tx) Commit() error {
-	start := time.Now()
+	span := beginSQL(t.ctx, t.engine)
 	err := t.Tx.Commit()
-	recordSQL(t.ctx, t.engine, "COMMIT", start, nil, err)
+	span.finish("COMMIT", nil, err)
 	return err
 }
 func (t *Tx) Rollback() error {
-	start := time.Now()
+	span := beginSQL(t.ctx, t.engine)
 	err := t.Tx.Rollback()
-	recordSQL(t.ctx, t.engine, "ROLLBACK", start, nil, err)
+	span.finish("ROLLBACK", nil, err)
 	return err
 }
 
@@ -153,19 +175,19 @@ func (t *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 	return &Stmt{stmt, t.engine, query}, nil
 }
 func (s *Stmt) ExecContext(ctx context.Context, args ...any) (sql.Result, error) {
-	start := time.Now()
+	span := beginSQL(ctx, s.engine)
 	result, err := s.Stmt.ExecContext(ctx, args...)
-	recordSQL(ctx, s.engine, s.query, start, result, err)
+	span.finish(s.query, result, err)
 	return result, err
 }
 func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*sql.Rows, error) {
-	start := time.Now()
+	span := beginSQL(ctx, s.engine)
 	rows, err := s.Stmt.QueryContext(ctx, args...)
-	recordSQL(ctx, s.engine, s.query, start, nil, err)
+	span.finish(s.query, nil, err)
 	return rows, err
 }
 func (s *Stmt) QueryRowContext(ctx context.Context, args ...any) *Row {
-	start := time.Now()
+	span := beginSQL(ctx, s.engine)
 	row := s.Stmt.QueryRowContext(ctx, args...)
-	return &Row{row, ctx, s.engine, s.query, start}
+	return &Row{row, span, s.query}
 }

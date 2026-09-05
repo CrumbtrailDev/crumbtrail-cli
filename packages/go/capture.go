@@ -15,11 +15,41 @@ import (
 	"github.com/felixge/httpsnoop"
 )
 
-type Event struct {
-	T int64          `json:"t"`
-	K string         `json:"k"`
-	D map[string]any `json:"d"`
+// Version of this SDK, reported on every event.
+const Version = "0.1.0"
+
+// SchemaVersion and Platform are required of every SDK that is not built on crumbtrail-core.
+// Without them ingest defaults each event to platform "web", and no reader can tell a Go
+// service's request apart from a browser's.
+const SchemaVersion = 1
+const Platform = "go"
+
+// SDK names the producer of an event.
+type SDK struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
 }
+
+var sdkDescriptor = SDK{Name: "crumbtrail-go", Version: Version}
+
+type Event struct {
+	T             int64          `json:"t"`
+	K             string         `json:"k"`
+	D             map[string]any `json:"d"`
+	SchemaVersion int            `json:"schemaVersion"`
+	Platform      string         `json:"platform"`
+	SDK           SDK            `json:"sdk"`
+	// Capabilities and Target complete the wire envelope. This SDK never populates them; they
+	// exist so the wire contract fixtures can be exercised through the real serializer rather
+	// than through a copy of it.
+	Capabilities []string       `json:"capabilities,omitempty"`
+	Target       map[string]any `json:"target,omitempty"`
+}
+
+func newEvent(t int64, kind string, data map[string]any) Event {
+	return Event{T: t, K: kind, D: data, SchemaVersion: SchemaVersion, Platform: Platform, SDK: sdkDescriptor}
+}
+
 type Batch struct {
 	SessionID string  `json:"sessionId"`
 	Events    []Event `json:"events"`
@@ -29,6 +59,12 @@ type Options struct {
 	Sink          Sink
 	Service       string
 	ShouldCapture func(*http.Request) bool
+	// Route returns the matched route template for a request, such as "/api/orders/{id}".
+	// Only net/http.ServeMux on Go 1.22 and later populates http.Request.Pattern, so under
+	// chi, gin, echo or gorilla/mux this callback is the only way the route is known. Return
+	// the empty string when there is no template. Never return a path holding real parameter
+	// values: the raw path is deliberately never captured.
+	Route func(*http.Request) string
 }
 type contextKey struct{}
 type captureContext struct {
@@ -39,18 +75,40 @@ type captureContext struct {
 }
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+var validTemplate = regexp.MustCompile(`^/[a-zA-Z0-9_{}:.* /-]*$`)
+
+const eventBudget = 200
 
 func (c *captureContext) add(kind string, data map[string]any, t int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.events) >= 200 && kind != "backend.req.start" && kind != "backend.req.end" && kind != "backend.req.error" {
+	if len(c.events) >= eventBudget && kind != "backend.req.start" && kind != "backend.req.end" && kind != "backend.req.error" {
 		c.dropped++
 		return
 	}
 	data["requestId"] = c.request
 	data["sessionId"] = c.session
-	c.events = append(c.events, Event{t, kind, data})
+	c.events = append(c.events, newEvent(t, kind, data))
 }
+
+// nextSequence and the statement timestamp are both taken when a statement is issued rather
+// than when it completes, so a slow query keeps its place in the order the application ran it.
+func (c *captureContext) nextSequence() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seq++
+	return c.seq
+}
+
+func (c *captureContext) gap(reason string, dropped int, surface, detail string) Event {
+	data := map[string]any{"kind": "capture_gap", "surface": surface, "reason": reason,
+		"requestId": c.request, "sessionId": c.session, "droppedEventCount": dropped}
+	if detail != "" {
+		data["detail"] = detail
+	}
+	return newEvent(time.Now().UnixMilli(), "capture_gap", data)
+}
+
 func (c *captureContext) flush(sink Sink) {
 	defer func() { _ = recover() }()
 	c.mu.Lock()
@@ -59,7 +117,7 @@ func (c *captureContext) flush(sink Sink) {
 	dropped := c.dropped
 	c.mu.Unlock()
 	if dropped > 0 {
-		events = append(events, Event{time.Now().UnixMilli(), "capture_gap", map[string]any{"kind": "capture_gap", "surface": "backend_request", "reason": "scan_budget_exceeded", "requestId": c.request, "droppedEvents": dropped}})
+		events = append(events, c.gap("scan_budget_exceeded", dropped, "backend_request", ""))
 	}
 	sort.SliceStable(events, func(i, j int) bool {
 		if events[i].T == events[j].T {
@@ -67,10 +125,19 @@ func (c *captureContext) flush(sink Sink) {
 		}
 		return events[i].T < events[j].T
 	})
+	refused := 0
 	for len(events) > 0 {
 		n := min(20, len(events))
-		sink.Enqueue(Batch{c.session, events[:n]})
+		if !sink.Enqueue(Batch{c.session, events[:n]}) {
+			refused += n
+		}
 		events = events[n:]
+	}
+	// A batch the sink refused is a hole in the session. Declaring it costs one event; leaving
+	// it implicit lets a burst drop backend.req.end and leaves a request that never terminated
+	// looking exactly like a request that never happened.
+	if refused > 0 {
+		sink.Enqueue(Batch{c.session, []Event{c.gap("buffer_overflow", refused, "queue", "sink queue full")}})
 	}
 }
 
@@ -94,6 +161,21 @@ func (b *bodyReader) keep(p []byte) {
 	b.bytes = append(b.bytes, p[:min(remaining, len(p))]...)
 	b.truncated = b.truncated || len(p) > remaining
 }
+
+// responseAccumulator collects the bytes written to the response. It is deliberately not a
+// bodyReader: that type embeds an io.ReadCloser, and a write side accumulator built from one
+// carries a nil reader that panics the first time anything calls Read on it.
+type responseAccumulator struct {
+	bytes     []byte
+	truncated bool
+}
+
+func (a *responseAccumulator) keep(p []byte) {
+	remaining := bodyLimit - len(a.bytes)
+	a.bytes = append(a.bytes, p[:min(remaining, len(p))]...)
+	a.truncated = a.truncated || len(p) > remaining
+}
+
 func eligible(options Options, r *http.Request) (result bool) {
 	defer func() {
 		if recover() != nil {
@@ -107,8 +189,25 @@ func singleIdentity(headers http.Header, name string) bool {
 	values := headers.Values(name)
 	return len(values) == 1 && validID.MatchString(values[0])
 }
-func routeTemplate(r *http.Request) string {
-	pattern := r.Pattern
+
+// routeTemplate prefers the framework's own answer through Options.Route, because only
+// net/http.ServeMux on Go 1.22 and later sets http.Request.Pattern. Under any third party
+// router the pattern is empty and every request would otherwise report "/".
+func routeTemplate(options Options, r *http.Request) (template string) {
+	defer func() {
+		if recover() != nil {
+			template = "/"
+		}
+	}()
+	if options.Route != nil {
+		if value := options.Route(r); value != "" {
+			return normalizeTemplate(value)
+		}
+	}
+	return normalizeTemplate(r.Pattern)
+}
+
+func normalizeTemplate(pattern string) string {
 	if len(pattern) > 512 {
 		return "/"
 	}
@@ -118,7 +217,7 @@ func routeTemplate(r *http.Request) string {
 	if slash := strings.IndexByte(pattern, '/'); slash >= 0 {
 		pattern = pattern[slash:]
 	}
-	if !strings.HasPrefix(pattern, "/") {
+	if !strings.HasPrefix(pattern, "/") || !validTemplate.MatchString(pattern) {
 		return "/"
 	}
 	return pattern
@@ -141,11 +240,11 @@ func Middleware(options Options) func(http.Handler) http.Handler {
 				input = &bodyReader{ReadCloser: r.Body}
 				r.Body = input
 			}
-			output := &bodyReader{}
+			output := &responseAccumulator{}
 			status := 200
 			wroteHeader := false
 			base := func() map[string]any {
-				route := routeTemplate(r)
+				route := routeTemplate(options, r)
 				return map[string]any{"method": r.Method, "url": route, "pathname": route, "route": route, "service": options.Service, "correlation": map[string]any{"status": "linked", "sessionIdSource": "header", "requestIdSource": "header"}}
 			}
 			wrapped := httpsnoop.Wrap(w, httpsnoop.Hooks{
@@ -167,6 +266,11 @@ func Middleware(options Options) func(http.Handler) http.Handler {
 						return n, err
 					}
 				},
+				// Hooking ReadFrom costs the sendfile fast path: os.File to TCP responses that
+				// the kernel would have copied without entering user space are copied here in
+				// 32 KiB chunks instead. That is the price of the response body being observed
+				// at all on this path, and it is paid only for requests that are already
+				// eligible for capture.
 				ReadFrom: func(_ httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
 					return func(reader io.Reader) (int64, error) {
 						n, err := io.Copy(writerOnly{writer: captureWriter{w, output, &wroteHeader}}, reader)
@@ -238,7 +342,7 @@ func (w writerOnly) Write(p []byte) (int, error) { return w.writer.Write(p) }
 
 type captureWriter struct {
 	w      http.ResponseWriter
-	output *bodyReader
+	output *responseAccumulator
 	wrote  *bool
 }
 
