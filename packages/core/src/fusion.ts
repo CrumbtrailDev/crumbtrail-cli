@@ -708,10 +708,16 @@ function evidenceValuesEqual(
   if (Object.is(left, right)) return true;
   if (typeof left !== typeof right || left === null || right === null)
     return false;
-  if (typeof left !== "object" || typeof right !== "object") return false;
+  if (typeof left !== "object" || typeof right !== "object") {
+    return typeof left === "string" ||
+      typeof left === "number" ||
+      typeof left === "boolean"
+      ? false
+      : undefined;
+  }
 
   const prior = seen.get(left);
-  if (prior) return prior === right ? true : undefined;
+  if (prior) return undefined;
   seen.set(left, right);
 
   if (Array.isArray(left) || Array.isArray(right)) {
@@ -723,6 +729,14 @@ function evidenceValuesEqual(
     }
     return true;
   }
+
+  const leftPrototype = Object.getPrototypeOf(left);
+  const rightPrototype = Object.getPrototypeOf(right);
+  if (
+    (leftPrototype !== Object.prototype && leftPrototype !== null) ||
+    (rightPrototype !== Object.prototype && rightPrototype !== null)
+  )
+    return undefined;
 
   const leftRecord = left as Record<string, unknown>;
   const rightRecord = right as Record<string, unknown>;
