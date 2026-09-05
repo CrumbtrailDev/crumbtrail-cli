@@ -20,6 +20,7 @@ import { installEarlyCapture, uninstallEarlyCapture } from "../early-capture";
 import {
   CAPTURE_GAP_EVENT_KIND,
   DEFAULT_CONFIG,
+  PRESET_PASSIVE,
   type BugEvent,
   type CrumbtrailConfig,
 } from "../types";
@@ -171,6 +172,84 @@ describe("the window between init() and the first capture policy", () => {
     const logger = Crumbtrail.init({
       ...QUIET,
       network: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+    });
+
+    pending.get("/held/api/disputes")?.(appResponse());
+    await inFlight;
+
+    // Issued by the app's first render, after init and before the policy: one
+    // that settles inside the window and one that settles after it.
+    await globalThis.fetch("/api/me/notifications");
+    const acrossPolicy = globalThis.fetch("/held/api/search");
+
+    answerConfig?.();
+    await configAnswer;
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    pending.get("/held/api/search")?.(appResponse());
+    await acrossPolicy;
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    await logger.stop();
+
+    const events = delivered(transport);
+    const requests = events.filter((event) => event.k === "net.req");
+    const responses = events.filter((event) => event.k === "net.res");
+    const appUrl = (event: BugEvent) => String(event.d?.url);
+
+    expect(requests.map(appUrl).sort()).toEqual(responses.map(appUrl).sort());
+    for (const url of [
+      "/api/participants",
+      "/held/api/disputes",
+      "/api/me/notifications",
+      "/held/api/search",
+    ]) {
+      const request = requests.find((event) => appUrl(event).includes(url));
+      const response = responses.find((event) => appUrl(event).includes(url));
+      expect(request, `net.req for ${url}`).toBeDefined();
+      expect(response, `net.res for ${url}`).toBeDefined();
+      expect(request?.d?.id).toBe(response?.d?.id);
+      expect(request?.d?.requestId).toBe(response?.d?.requestId);
+      expect(typeof request?.d?.requestId).toBe("string");
+    }
+    expect(new Set(requests.map((event) => event.d?.id)).size).toBe(4);
+  });
+
+  // Same first-screen loss, but through the config an installed app actually
+  // ships: `PRESET_PASSIVE` merged with `remoteConfig: true`, not a hand
+  // built QUIET config that disables every other collector. Matches the
+  // plan's A2 proof (docs/progress/incentiveflow-dogfood-fix-plan.md) that
+  // four `net.req`/`net.res` pairs, ids 1 to 4, survive the admission window
+  // under the preset IncentiveFlow and every other passive-mode app use.
+  it("records both halves of every first screen request under PRESET_PASSIVE with remoteConfig", async () => {
+    let answerConfig: (() => void) | undefined;
+    const configAnswer = new Promise<Response>((resolve) => {
+      answerConfig = () => resolve(new Response(RECOGNIZED_POLICY));
+    });
+    const pending = new Map<string, (response: Response) => void>();
+    const fetchStub = vi.fn().mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.includes("/api/capture-config")) return configAnswer;
+      if (url.includes("/held/"))
+        return new Promise<Response>((resolve) => {
+          pending.set(url, resolve);
+        });
+      return Promise.resolve(appResponse());
+    });
+    globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
+
+    installEarlyCapture();
+    // Settled before init: drained from the early queue.
+    await globalThis.fetch("/api/participants");
+    // Still on the wire at init: delivered through the early late sink.
+    const inFlight = globalThis.fetch("/held/api/disputes");
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...PRESET_PASSIVE,
       transportInstance: transport,
       httpEndpoint: "https://api.crumbtrail.test",
       httpAuthToken: "ctkey_live",
