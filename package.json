@@ -31,6 +31,8 @@
     "dev:unlink": "node scripts/dev-harness/link.mjs unlink",
     "dev:status": "node scripts/dev-harness/link.mjs status",
     "test:dotnet": "dotnet test packages/dotnet/Crumbtrail.AspNetCore.Tests",
+    "test:ruby": "cd packages/ruby && bundle exec ruby -Ilib -Itest -e 'Dir.glob(\"test/*_test.rb\").sort.each { |f| require File.expand_path(f) }'",
+    "test:go": "cd packages/go && go test ./...",
     "pack:dotnet": "dotnet pack packages/dotnet/Crumbtrail.AspNetCore -o .local-packs/dotnet"
   },
   "devDependencies": {

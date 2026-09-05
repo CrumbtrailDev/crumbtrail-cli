@@ -90,7 +90,7 @@ of them.
 | `k` | string | yes | Event kind (see below) |
 | `d` | object | yes | Kind specific payload. May be empty, never null. |
 | `schemaVersion` | integer | no | Currently `1`. Absent means 1. Native SDKs **must** send it. |
-| `platform` | string | no | `web`, `react-native`, `ios`, `android`, `flutter`, `webview`, `node`. Absent means `web`. Native SDKs **must** send it. |
+| `platform` | string | no | `web`, `react-native`, `ios`, `android`, `flutter`, `webview`, `node`, `dotnet`, `ruby`, `go`. Absent means `web`. Native SDKs **must** send it. |
 | `sdk` | object | no | `{ name, version }`. Native SDKs **must** send both. |
 | `capabilities` | string[] | no | Capability names this SDK has active |
 | `target` | object | no | Normalised UI target (see below) |
@@ -103,6 +103,14 @@ back to `webview` only when the host platform is genuinely unknown. Filtering a
 session to one OS is load bearing: the two mobile WebViews disagree about
 storage eviction, back navigation and media autoplay, and a large share of
 hybrid bugs live on exactly one of them.
+
+A server side SDK has no OS to report that a reader would act on, so it reports
+its **runtime** instead: `node`, `dotnet`, `ruby`, `go`. The distinction a
+reader needs there is which language produced the event, because that decides
+which stack traces, which redaction policy and which SDK release notes apply.
+
+Ingest rejects a batch whose `platform` is outside this list, so a new value is
+added to the consumer allow list and deployed before any SDK sends it.
 
 ### Event kinds
 

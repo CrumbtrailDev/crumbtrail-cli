@@ -10,8 +10,25 @@ class CaptureTest < Minitest::Test
   class Sink
     attr_reader :batches
     def initialize; @batches = []; end
-    def enqueue(batch); @batches << batch; end
+    def enqueue(batch); @batches << batch; true; end
     def events; @batches.flat_map { |batch| batch[:events] }; end
+  end
+  # A full sender queue refuses. The gap batch is accepted so the hole can still be declared.
+  class RefusingSink < Sink
+    def enqueue(batch)
+      super
+      batch[:events].size == 1 && batch[:events].first[:k] == 'capture_gap'
+    end
+  end
+  # Rack does not require an input stream to be rewindable or sized, and many servers supply
+  # one that is neither.
+  class BareInput
+    def initialize(string); @io = StringIO.new(string); @closed = false; end
+    def read(*args); @io.read(*args); end
+    def gets(*args); @io.gets(*args); end
+    def each(&block); @io.each(&block); end
+    def close; @closed = true; end
+    def closed?; @closed; end
   end
   def setup
     @sink = Sink.new
@@ -233,6 +250,53 @@ class CaptureTest < Minitest::Test
     assert_equal 'missing', @sink.events.last[:d][:responseBodyState]
     refute @sink.events.last[:d][:responseBodyTruncated]
   end
+  def test_refused_sink_declares_the_hole
+    @sink = RefusingSink.new
+    consume(middleware(->(_) { [200, {}, ['ok']] }).call(env))
+    gap = @sink.events.find { |e| e[:k] == 'capture_gap' }
+    refute_nil gap, 'a refused batch left the session with a silent hole'
+    assert_equal 'buffer_overflow', gap[:d][:reason]
+    assert_equal 'queue', gap[:d][:surface]
+    assert_equal 2, gap[:d][:droppedEventCount]
+  end
+  def test_input_wrapper_only_advertises_what_the_stream_has
+    payload = '{"amount":18.75}'
+    bare = BareInput.new(payload)
+    seen = nil
+    consume(middleware(lambda { |e| seen = e['rack.input']; seen.read; [200, {}, ['ok']] }).call(env.merge('rack.input' => bare, 'CONTENT_LENGTH' => payload.bytesize.to_s)))
+    refute seen.respond_to?(:rewind), 'the wrapper advertises a rewind the wrapped stream cannot do'
+    refute seen.respond_to?(:size), 'the wrapper advertises a size the wrapped stream does not have'
+    assert seen.respond_to?(:close), 'the wrapper dropped close'
+    seen.close
+    assert bare.closed?, 'close was not delegated to the wrapped stream'
+    assert_equal 18.75, JSON.parse(@sink.events.first[:d][:body])['amount']
+  end
+  def test_input_wrapper_delegates_size_and_rewind
+    io = StringIO.new('{"amount":18.75}')
+    seen = nil
+    consume(middleware(lambda { |e| seen = e['rack.input']; seen.read; [200, {}, ['ok']] }).call(env.merge('rack.input' => io, 'CONTENT_LENGTH' => io.size.to_s)))
+    assert seen.respond_to?(:rewind)
+    assert_equal io.size, seen.size
+  end
+  def test_response_body_keeps_the_sendfile_path
+    file = Object.new
+    def file.each; yield 'ignored'; end
+    def file.to_path; '/tmp/asset.json'; end
+    _, _, body = middleware(->(_) { [200, { 'content-type' => 'application/json' }, file] }).call(env)
+    assert_equal '/tmp/asset.json', body.to_path
+    body.close
+    # The bytes never pass through Ruby on that path, so the body is reported missing, not invented.
+    assert_equal 'missing', @sink.events.last[:d][:responseBodyState]
+  end
+  def test_response_body_keeps_to_ary_and_still_captures
+    chunks = ['{"total":37.5}']
+    arrayed = Object.new
+    arrayed.define_singleton_method(:each) { |&block| chunks.each(&block) }
+    arrayed.define_singleton_method(:to_ary) { chunks }
+    _, _, body = middleware(->(_) { [200, { 'content-type' => 'application/json' }, arrayed] }).call(env)
+    assert_equal chunks, body.to_ary
+    assert_equal 37.5, JSON.parse(@sink.events.last[:d][:responseBody])['total']
+  end
   def test_sender_rejects_unsafe_endpoints
     %w[http://localhost https://user:pass@example.com https://example.com/?key=x].each do |endpoint|
       assert_raises(ArgumentError) { Crumbtrail::Sender.new(endpoint: endpoint, key: 'key') }
@@ -288,6 +352,12 @@ class SenderTest < Minitest::Test
       assert_includes requests.first[0], 'POST /api/events HTTP/1.1'
       assert_includes requests.first[0], 'Authorization: Bearer test-key'
       assert_equal 'session', JSON.parse(requests.first[1])['sessionId']
+      # The 404 is permanent, so the second request is the gap that declares the loss, not a
+      # repeat of a batch the cloud has already said it will never accept.
+      gap = JSON.parse(requests.last[1])['events'].first
+      assert_equal 'capture_gap', gap['k']
+      assert_equal 'delivery_failed', gap['d']['reason']
+      assert_equal 'HTTP 404', gap['d']['detail']
       refute sender.enqueue(sessionId: 'session', events: [])
     end
   ensure

@@ -13,6 +13,7 @@ module Crumbtrail
     # delivery failure rather than passed through as an invented classification.
     SHED_REASONS = %w[kill_switch sessions_per_hour bytes_per_day rate_limited_ingest
                       rate_limited_session_start trial_expired payment_failed upgrade_required].freeze
+    EVENTS_PATH = '/api/events'.freeze
     ATTEMPTS = 4
     MAX_SHED_SECONDS = 300
     MAX_RESPONSE_BYTES = 4096
@@ -119,7 +120,7 @@ module Crumbtrail
 
     def post(payload)
       uri = @endpoint.dup
-      uri.path = '/api/events'
+      uri.path = EVENTS_PATH
       request = Net::HTTP::Post.new(uri)
       request['Authorization'] = "Bearer #{@key}"
       request['Content-Type'] = 'application/json'
