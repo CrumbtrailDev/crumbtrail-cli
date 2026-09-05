@@ -2,6 +2,7 @@ using Crumbtrail;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 namespace Crumbtrail.Tests;
@@ -9,7 +10,8 @@ public sealed class EntityFrameworkTests
 {
     private sealed class Sink : ICaptureSink { public void Enqueue(CaptureBatch batch) { } }
     public sealed class Probe { public int Id {get;set;} public decimal Amount {get;set;} public string Password {get;set;}=""; }
-    private sealed class ProbeDb(DbContextOptions<ProbeDb> options):DbContext(options)
+    // Public so the DI container can construct it in the registration test.
+    public sealed class ProbeDb(DbContextOptions<ProbeDb> options):DbContext(options)
     {
         public DbSet<Probe> Probes=>Set<Probe>();
     }
@@ -107,6 +109,52 @@ public sealed class EntityFrameworkTests
         Assert.Empty(capture.Events); db.ChangeTracker.Clear();
         db.Add(new Probe { Amount = 20 }); await db.SaveChangesAsync();
         Assert.Single(capture.Events, e => e.k == "db.diff");
+    }
+
+    [Fact]
+    public async Task Abandoned_transaction_releases_its_images_for_a_later_commit()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:"); await connection.OpenAsync();
+        var capture = new CaptureContext(); capture.Start("ses_test", "req_test");
+        using var changes = new CapturedChanges(capture, NullLogger<CapturedChanges>.Instance);
+        await using var db = new ProbeDb(new DbContextOptionsBuilder<ProbeDb>().UseSqlite(connection)
+            .AddInterceptors(new CaptureSaveChanges(changes), new CaptureTransactions(changes)).Options);
+        await db.Database.EnsureCreatedAsync();
+        // Three rounds of 100 rows exceed the 200 image budget for a scope, so a
+        // later committed transaction is dropped unless dispose releases them.
+        for (var round = 0; round < 3; round++)
+        {
+            // No Commit call: the transaction is disposed while rows are pending.
+            await using var abandoned = await db.Database.BeginTransactionAsync();
+            db.AddRange(Enumerable.Range(0, 100).Select(_ => new Probe { Amount = round }));
+            await db.SaveChangesAsync();
+            db.ChangeTracker.Clear();
+        }
+        Assert.Empty(capture.Events);
+        await using (var tx = await db.Database.BeginTransactionAsync())
+        { db.Add(new Probe { Amount = 99 }); await db.SaveChangesAsync(); await tx.CommitAsync(); }
+        var row = Assert.Single(capture.Events, e => e.k == "db.diff");
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(row.d));
+        Assert.Equal(99, document.RootElement.GetProperty("after").GetProperty("Amount").GetDecimal());
+        Assert.DoesNotContain(capture.Events, e => e.k == "capture_gap");
+    }
+
+    [Fact]
+    public async Task Entity_framework_registration_alone_builds_a_working_context()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:"); await connection.OpenAsync();
+        var services = new ServiceCollection();
+        services.AddCrumbtrailEntityFramework();
+        services.AddDbContext<ProbeDb>((sp, options) => options.UseSqlite(connection).AddCrumbtrail(sp));
+        await using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+        var capture = scope.ServiceProvider.GetRequiredService<CaptureContext>();
+        capture.Start("ses_test", "req_test");
+        var db = scope.ServiceProvider.GetRequiredService<ProbeDb>();
+        await db.Database.EnsureCreatedAsync();
+        db.Add(new Probe { Amount = 10 }); await db.SaveChangesAsync();
+        Assert.Contains(capture.Events, e => e.k == "db.diff");
+        Assert.Contains(capture.Events, e => e.k == "db.statement");
     }
 
     private sealed class SensitiveKey

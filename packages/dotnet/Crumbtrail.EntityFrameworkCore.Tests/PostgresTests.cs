@@ -35,7 +35,9 @@ public sealed class PostgresTests
         var target = new NpgsqlConnectionStringBuilder(adminString) { Database = database, Pooling = false }.ConnectionString;
         try
         {
-            var services = new ServiceCollection(); services.AddLogging(); services.AddScoped<CaptureContext>();
+            // AddCrumbtrailEntityFramework is the only Crumbtrail registration an
+            // application makes, so it has to stand alone here too.
+            var services = new ServiceCollection();
             services.AddCrumbtrailEntityFramework();
             services.AddDbContext<Db>((sp, options) => options.UseNpgsql(target).AddCrumbtrail(sp));
             using var provider = services.BuildServiceProvider(); using var scope = provider.CreateScope();

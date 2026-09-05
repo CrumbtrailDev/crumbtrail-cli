@@ -135,4 +135,8 @@ public sealed class CaptureTransactions(CapturedChanges changes) : DbTransaction
     public override void TransactionRolledBack(DbTransaction transaction, TransactionEndEventData data) => changes.Complete(data.TransactionId,false);
     public override Task TransactionRolledBackAsync(DbTransaction transaction, TransactionEndEventData data, CancellationToken ct = default)
     { changes.Complete(data.TransactionId,false); return Task.CompletedTask; }
+    // An abandoned transaction never reaches commit or rollback, so its images
+    // are unreachable. Releasing them at dispose keeps them from holding the
+    // per-scope image budget against a later transaction that does commit.
+    public override void TransactionDisposed(DbTransaction transaction, TransactionEndEventData data) => changes.Complete(data.TransactionId,false);
 }

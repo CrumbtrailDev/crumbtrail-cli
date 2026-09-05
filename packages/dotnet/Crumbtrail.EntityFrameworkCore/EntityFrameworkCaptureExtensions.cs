@@ -7,6 +7,11 @@ public static class EntityFrameworkCaptureExtensions
 {
     public static IServiceCollection AddCrumbtrailEntityFramework(this IServiceCollection services)
     {
+        // CapturedChanges takes a logger and every interceptor takes the scoped
+        // capture context, so an application that registers only EF capture must
+        // still get a working DbContext.
+        services.AddLogging();
+        services.TryAddScoped<CaptureContext>();
         services.TryAddScoped<CapturedChanges>();
         services.TryAddScoped<CaptureSaveChanges>();
         services.TryAddScoped<CaptureTransactions>();
