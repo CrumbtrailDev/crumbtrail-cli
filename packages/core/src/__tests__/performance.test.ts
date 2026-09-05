@@ -93,6 +93,169 @@ describe("performanceCollector", () => {
     expect(events[0].d.initiatorType).toBe("fetch");
   });
 
+  describe("self-traffic exclusion", () => {
+    it("drops resource entries for the configured httpEndpoint", async () => {
+      const performanceCollector = await loadCollector();
+      performanceCollector(bus, {
+        ...DEFAULT_CONFIG,
+        httpEndpoint: "https://app.crumbtrail.ai",
+      });
+
+      const resourceObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "resource",
+      );
+
+      resourceObserver!.simulateEntries([
+        {
+          entryType: "resource",
+          name: "https://app.crumbtrail.ai/api/events",
+          duration: 12,
+          transferSize: 200,
+          initiatorType: "fetch",
+        },
+      ]);
+
+      bus.flush();
+      expect(events.filter((e) => e.k === "perf")).toHaveLength(0);
+    });
+
+    it("keeps resource entries for a different origin, even with the same path", async () => {
+      const performanceCollector = await loadCollector();
+      performanceCollector(bus, {
+        ...DEFAULT_CONFIG,
+        httpEndpoint: "https://app.crumbtrail.ai",
+      });
+
+      const resourceObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "resource",
+      );
+
+      resourceObserver!.simulateEntries([
+        {
+          entryType: "resource",
+          name: "https://example.com/api/events",
+          duration: 40,
+          transferSize: 900,
+          initiatorType: "fetch",
+        },
+      ]);
+
+      bus.flush();
+      const perf = events.filter((e) => e.k === "perf");
+      expect(perf).toHaveLength(1);
+      expect(perf[0].d.name).toBe("https://example.com/api/events");
+    });
+
+    it("drops nothing when no httpEndpoint is configured", async () => {
+      const performanceCollector = await loadCollector();
+      performanceCollector(bus, { ...DEFAULT_CONFIG, httpEndpoint: "" });
+
+      const resourceObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "resource",
+      );
+
+      resourceObserver!.simulateEntries([
+        {
+          entryType: "resource",
+          name: "https://example.com/api/events",
+          duration: 12,
+          transferSize: 200,
+          initiatorType: "fetch",
+        },
+      ]);
+
+      bus.flush();
+      expect(events.filter((e) => e.k === "perf")).toHaveLength(1);
+    });
+
+    it("never throws on a relative or malformed resource name", async () => {
+      const performanceCollector = await loadCollector();
+      performanceCollector(bus, {
+        ...DEFAULT_CONFIG,
+        httpEndpoint: "https://app.crumbtrail.ai",
+      });
+
+      const resourceObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "resource",
+      );
+
+      expect(() =>
+        resourceObserver!.simulateEntries([
+          {
+            entryType: "resource",
+            name: "/relative/path",
+            duration: 1,
+            transferSize: 1,
+            initiatorType: "fetch",
+          },
+          {
+            entryType: "resource",
+            name: "not a url at all",
+            duration: 1,
+            transferSize: 1,
+            initiatorType: "fetch",
+          },
+          {
+            entryType: "resource",
+            name: "",
+            duration: 1,
+            transferSize: 1,
+            initiatorType: "fetch",
+          },
+          {
+            entryType: "resource",
+            name: undefined,
+            duration: 1,
+            transferSize: 1,
+            initiatorType: "fetch",
+          },
+        ]),
+      ).not.toThrow();
+
+      bus.flush();
+      // None of these matched the own-endpoint origin, so all are kept.
+      expect(events.filter((e) => e.k === "perf")).toHaveLength(4);
+    });
+
+    it("drops configEndpoint entries on a second origin, keeps an application entry on the same path elsewhere", async () => {
+      // A self hosted config service can live on a different origin than
+      // httpEndpoint, so its poll has to be excluded independently rather than
+      // assumed to share httpEndpoint's origin.
+      const performanceCollector = await loadCollector();
+      performanceCollector(bus, {
+        ...DEFAULT_CONFIG,
+        httpEndpoint: "https://app.crumbtrail.ai",
+        configEndpoint: "https://config.example-selfhost.com/capture-config",
+      });
+
+      const resourceObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "resource",
+      );
+
+      resourceObserver!.simulateEntries([
+        {
+          entryType: "resource",
+          name: "https://config.example-selfhost.com/capture-config",
+          duration: 5,
+          transferSize: 300,
+          initiatorType: "fetch",
+        },
+        {
+          entryType: "resource",
+          name: "https://app.example.com/capture-config",
+          duration: 20,
+          transferSize: 500,
+          initiatorType: "fetch",
+        },
+      ]);
+
+      bus.flush();
+      const perf = events.filter((e) => e.k === "perf");
+      expect(perf).toHaveLength(1);
+      expect(perf[0].d.name).toBe("https://app.example.com/capture-config");
+    });
+  });
+
   it("caps perf events per session and records the shedding as a capture gap", async () => {
     // A page that polls or loops emits without bound. Observed for real at
     // 10,299 entries in one session, which buried the network requests that
