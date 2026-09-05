@@ -621,7 +621,49 @@ effect on the next upload whatever the client is running. Set `remoteConfig` to
 says. It is fail closed but bounded: capture waits up to five seconds for the
 first policy response, then falls back to this call and records a
 `policy_unavailable` gap, so a host that does not serve the route costs that
-wait on first load rather than the session. Point `configEndpoint` somewhere
+wait on first load rather than the session.
+
+Nothing leaves the page during that wait, and nothing is thrown away either.
+Events captured before the policy answers are held in memory and released once
+it does, in the order they happened and with their original timestamps, so the
+requests that render the first screen keep their full request family rather
+than arriving as a response with no request behind it. A family contains its
+`net.req`, `net.res` or `net.err`, and any `net.req.file` descriptions. It is
+either released together or dropped together if the arriving policy excludes
+the URL, turns network capture off, or the hold has already evicted its start.
+The hold is bounded at 2,000 events or 4 MiB of serialized event data and drops
+the oldest first, recording a `buffer_overflow` gap counting what the cap cost.
+Events the arriving policy drops are counted separately, under a
+`policy_tightened` gap, because the two say opposite things about a deployment:
+one says the hold was too small for the page, the other says the policy did its
+job.
+
+Release is not a replay of what was captured, it is a re-ask under the policy
+that just arrived. A held event is dropped when its collector is now off, when
+its URL now matches `excludeUrls`, or when the session was shed by the sample
+rate the policy carried; its headers are dropped when the policy turns header
+capture off; its bodies are re-redacted under the policy's `denyFields`,
+redaction mode and size caps, along with the parsed copy of a response body in
+`d.bodyMeta`, which would otherwise carry the cleartext the deny rule was aimed
+at; an input value becomes a placeholder when the policy sets
+`captureInputValues: false`; and a DOM snapshot, click, input, keystroke or
+clipboard event is dropped outright when the policy tightened masking, because
+the content it holds was rendered under the looser rule from a DOM that is gone
+by release. Two details in that list are easy to get backwards and are not:
+`excludeUrls` matches the URL the application asked for, held beside the event
+rather than on it, since every query value is redacted before an event is built;
+and a WebSocket frame or worker message is re-capped at its own ceiling rather
+than at the network body limit. A held event can lose detail or lose itself on
+release. It can never gain reach.
+
+A decision against capture empties the hold without sending anything:
+`stop()`, a `killSwitch`, `consent(false)`, a page hide that ends the session,
+or Global Privacy Control. GPC counts as a decision under the default
+`consentMode: "implicit"`, so a suppressed visitor holds nothing waiting for a
+consent call that is never coming. Under `consentMode: "required"` it does not,
+because the host is expected to answer and may answer yes: the first screen
+stays in page memory, unsent, and reaches the wire only if `consent(true)`
+arrives. Point `configEndpoint` somewhere
 else only for a self hosted config service.
 
 When an ingest key is present, the SDK also registers one runtime identity with

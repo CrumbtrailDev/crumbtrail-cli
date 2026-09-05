@@ -1,4 +1,8 @@
-import { EventBus } from "./event-bus";
+import {
+  EventBus,
+  type EmitContext,
+  type RequestAdmissionScope,
+} from "./event-bus";
 import { RingBuffer } from "./ring-buffer";
 import type {
   AddBugEventOptions,
@@ -76,7 +80,7 @@ import { visibilityCollector } from "./collectors/visibility";
 import { clipboardCollector } from "./collectors/clipboard";
 import { cookieCollector } from "./collectors/cookie";
 import { storageCollector } from "./collectors/storage";
-import { networkCollector } from "./collectors/network";
+import { networkCollector, shouldExclude } from "./collectors/network";
 import { performanceCollector } from "./collectors/performance";
 import { heartbeatCollector } from "./collectors/heartbeat";
 import { uiNumbersCollector } from "./collectors/ui-numbers";
@@ -104,6 +108,14 @@ import {
   setRedactionKeepFields,
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
+import {
+  COLLECTOR_EVENT_KINDS,
+  isResourceFailureEvent,
+  readMaskingState,
+  reapplyPolicyToHeldEvent,
+  type HeldEvent,
+  type MaskingState,
+} from "./admission-hold";
 import {
   CRUMBTRAIL_SDK_VERSION,
   readApplicationReleaseIdentity,
@@ -136,6 +148,85 @@ import {
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
+/**
+ * Ceiling on events held while admission is undecided. The window is normally
+ * one config round trip, so this is a guard against a policy route that never
+ * answers rather than a working limit; what it discards is declared as a
+ * `capture_gap` when the gate finally opens.
+ */
+const MAX_PENDING_ADMISSION_EVENTS = 2_000;
+
+/**
+ * Byte ceiling on the same hold, because the count alone does not bound it.
+ *
+ * Under `consentMode: "required"` the hold waits for a `consent()` call that
+ * may never come, and 2,000 events is a small number when one of them is a DOM
+ * snapshot capped at 256 KB. 4 MiB is roughly the largest first screen worth
+ * keeping and well under what a page can spare; past it the oldest events go,
+ * counted as `buffer_overflow` like any other cap.
+ */
+const MAX_PENDING_ADMISSION_BYTES = 4_194_304;
+
+/**
+ * Size of one held event, for the byte ceiling above.
+ *
+ * `JSON.stringify` is what the transport will do to this event anyway, so it
+ * measures the thing being bounded rather than a proxy for it. A payload that
+ * cannot be serialized is counted at zero: it will not reach the wire either,
+ * and a throw here would lose an event to a measurement.
+ */
+function estimateHeldEventBytes(event: BugEvent): number {
+  try {
+    const serialized = JSON.stringify(event);
+    if (serialized === undefined) return 0;
+    // TextEncoder is present in every supported browser. The fallback keeps an
+    // unusual older host bounded rather than failing capture while it waits.
+    return typeof TextEncoder === "function"
+      ? new TextEncoder().encode(serialized).byteLength
+      : serialized.length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Only collector-created request families carry this scope. An explicit event
+ * can retain its own `d.sessionId` across rotation without being reclassified
+ * as a network capture attempt, and a resource failure belongs to errors.
+ */
+function isNetworkRequestFamilyEvent(
+  event: BugEvent,
+  requestScope: RequestAdmissionScope | undefined,
+): boolean {
+  return (
+    requestScope !== undefined &&
+    !isResourceFailureEvent(event) &&
+    (COLLECTOR_EVENT_KINDS.network as readonly string[]).includes(event.k)
+  );
+}
+
+/** The unredacted URL when the emitter retained it, otherwise its event copy. */
+function requestUrlForAdmission(
+  event: BugEvent,
+  context?: EmitContext,
+): string | undefined {
+  if (context?.rawUrl !== undefined) return context.rawUrl;
+  const url = event.d?.url;
+  return typeof url === "string" ? url : undefined;
+}
+
+/**
+ * A request scope only ever gets stricter. In particular, an overflowing
+ * start remains an overflow even if a later policy also excludes its URL.
+ */
+function dropRequestScope(
+  scope: RequestAdmissionScope | undefined,
+  reason: "overflow" | "policy",
+): void {
+  if (!scope || scope.disposition === "dropped") return;
+  scope.disposition = "dropped";
+  scope.dropReason = reason;
+}
 import { buildMaskedDomSnapshot, maskText } from "./masking";
 import { CAPTURE_GAP_EVENT_KIND } from "./types";
 
@@ -354,6 +445,19 @@ const REMOTE_COLLECTOR_KEYS = [
 ] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
 
 type RemoteCollectorKey = (typeof REMOTE_COLLECTOR_KEYS)[number];
+
+/**
+ * Every switch the policy can flip has to mean something when the admission
+ * hold releases events under it, or turning that collector off leaves its held
+ * events to ship anyway. This assignment is the only thing that catches a new
+ * switch added here and not there: it fails to compile until
+ * `COLLECTOR_EVENT_KINDS` covers the key.
+ */
+const _collectorKindsCoverEverySwitch: Record<
+  RemoteCollectorKey,
+  readonly string[]
+> = COLLECTOR_EVENT_KINDS;
+void _collectorKindsCoverEverySwitch;
 
 /**
  * Collectors a switch can stop mid-session but cannot start again.
@@ -602,6 +706,33 @@ export class Crumbtrail {
    * to be decided. See `CollectorContext.whenCaptureAdmitted`.
    */
   private admissionWaiters: Array<(admitted: boolean) => void> = [];
+  /**
+   * Events emitted while admission was still UNDECIDED, kept until it is.
+   *
+   * Refusing them outright destroys evidence that cannot be produced again, and
+   * it does so asymmetrically: a request that starts before the capture policy
+   * lands and answers after it keeps its `net.res` and loses its `net.req`, so
+   * the session shows a response with no call behind it. The window is the
+   * standard configuration — `remoteConfig: true` is what the installer writes
+   * — and it covers exactly the requests that render the first screen.
+   *
+   * Held only while the answer is genuinely pending. A denial (`stop()`, kill
+   * switch, `consent(false)`, Global Privacy Control) drops the events without
+   * ever transporting them, which is the same outcome refusing them had.
+   */
+  private pendingAdmissionEvents: HeldEvent[] = [];
+  /** Events the hold discarded to stay under its caps, as one `capture_gap`. */
+  private pendingAdmissionDropped = 0;
+  /** Running total of the held events' sizes, kept under the byte ceiling. */
+  private pendingAdmissionBytes = 0;
+  /**
+   * The masking switches in force when the hold started. A policy that tightens
+   * them cannot be applied retroactively to content already rendered into an
+   * event, so the release pass drops those events instead of guessing.
+   */
+  private pendingAdmissionMasking?: MaskingState;
+  /** Guards against a released event being re-held by its own emit. */
+  private releasingAdmissionHold = false;
   private samplingShed: boolean;
   private samplingGapEmitted = false;
   /** Bounded so an endpoint that is refusing everything cannot storm the bus. */
@@ -910,7 +1041,9 @@ export class Crumbtrail {
     bus.setMaxBufferedEvents(config.ringBufferMaxEvents);
     bus.start(config.flushIntervalMs, config.flushBufferSize);
 
-    bus.setAdmissionPredicate((event) => instance.shouldAdmitEvent(event));
+    bus.setAdmissionPredicate((event, context) =>
+      instance.shouldAdmitEvent(event, context),
+    );
 
     // Severity flush: error-class events must not wait out the batch interval —
     // an error captured in the final seconds before tab close would otherwise
@@ -1780,6 +1913,12 @@ export class Crumbtrail {
     if (!wasShed && this.samplingShed) {
       this.bus.clear();
       this.ringBuffer.clear();
+      // The hold is the third place events rest, and it holds the first screen.
+      // A visitor this policy just shed must not upload it.
+      this.pendingAdmissionEvents = [];
+      this.pendingAdmissionDropped = 0;
+      this.pendingAdmissionBytes = 0;
+      this.pendingAdmissionMasking = undefined;
       this.emitSamplingGapIfNeeded();
     }
   }
@@ -2165,6 +2304,30 @@ export class Crumbtrail {
       // gate first would make the subscriber discard the final batch.
       this.applicationExpectations.stop();
       this.bus.flush();
+      // Anything still held belongs to the session that is ending. Carrying it
+      // past the close would replay pre-suspend events, with pre-suspend
+      // timestamps, into the new session `resumeFromLifecycle` mints. The
+      // discard is declared: this session is still sending, so it can say what
+      // it lost rather than ending with a first screen that never existed.
+      const discarded =
+        this.pendingAdmissionEvents.length + this.pendingAdmissionDropped;
+      this.pendingAdmissionEvents = [];
+      this.pendingAdmissionDropped = 0;
+      this.pendingAdmissionBytes = 0;
+      this.pendingAdmissionMasking = undefined;
+      if (discarded > 0) {
+        // Queued rather than emitted: the bus gate closes on the next line, so
+        // an emit here would be refused. The deferred queue is sent by this
+        // close, before `endSession`.
+        this.deferredDeliveryGaps.push(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "session_ended_unanswered",
+            droppedEventCount: discarded,
+            sessionId: this.sessionId,
+          }),
+        );
+      }
       this.lifecycleClosing = true;
       this.expirePersistedVisit();
       try {
@@ -2389,8 +2552,36 @@ export class Crumbtrail {
     return this.sessionMetadataWrite;
   }
 
-  private shouldAdmitEvent(event: BugEvent): boolean {
-    if (!this.canTransport()) return false;
+  private shouldAdmitEvent(event: BugEvent, context?: EmitContext): boolean {
+    const requestScope = context?.requestScope;
+    // An event can arrive after the gate opened even though its own request
+    // start was rejected while it was closed. The scope makes that terminal
+    // follow the start instead of becoming an orphaned net.res or net.err.
+    if (requestScope?.disposition === "dropped") return false;
+    if (!this.canTransport()) {
+      if (this.isAdmissionUndecided()) this.holdForAdmission(event, context);
+      return false;
+    }
+    if (isNetworkRequestFamilyEvent(event, requestScope)) {
+      const rawUrl = requestUrlForAdmission(event, context);
+      if (
+        this.config.network === false ||
+        (rawUrl !== undefined && shouldExclude(rawUrl, this.config))
+      ) {
+        dropRequestScope(requestScope, "policy");
+        return false;
+      }
+      // A terminal with no admitted parent is unsafe to infer. This normally
+      // means the parent was evicted before release, but it also closes any
+      // unusual emitter ordering without letting half a request through.
+      if (requestScope?.disposition === "undecided") {
+        if (event.k !== "net.req") {
+          dropRequestScope(requestScope, "policy");
+          return false;
+        }
+        requestScope.disposition = "admitted";
+      }
+    }
     if (this.isFlightRecorderTerminal()) return false;
     if (!this.samplingShed) return true;
     return event.k === CAPTURE_GAP_EVENT_KIND;
@@ -2576,7 +2767,193 @@ export class Crumbtrail {
    * every consent-gated app. Only an explicit `consent(false)` decides against.
    */
   private isCaptureDenied(): boolean {
-    return this.stopped || this.killSwitch || this.explicitConsent === false;
+    if (this.stopped || this.killSwitch || this.explicitConsent === false)
+      return true;
+    // Global Privacy Control is an answer, not a pending question: a suppressed
+    // session would otherwise hold evidence forever, waiting for a consent call
+    // the host has already been told not to make.
+    //
+    // Except under `consentMode: "required"`, where the host is expected to
+    // answer and may still answer yes. Destroying the early queue on the first
+    // poll would take the first screen away from every consent-gated app,
+    // which is the loss this hold exists to prevent. Those events rest in page
+    // memory and reach the wire only if consent is granted.
+    return (
+      this.explicitConsent === undefined &&
+      this.config.consentMode !== "required" &&
+      Boolean(this.config.respectGpc) &&
+      hasGlobalPrivacyControl()
+    );
+  }
+
+  /**
+   * Is capture still waiting for an answer, as opposed to running or refused?
+   *
+   * True only while the remote capture policy is in flight or explicit consent
+   * has not been given yet — the two states that resolve later in the same
+   * session. A closing or suspended lifecycle is not one of them: those events
+   * belong to a session that is ending, and holding them would replay them into
+   * a session that has already been finalized.
+   */
+  private isAdmissionUndecided(): boolean {
+    if (this.inert || this.lifecycleClosing || this.lifecycleSuspended)
+      return false;
+    if (this.isCaptureDenied()) return false;
+    return !this.remotePolicyReady || !this.consentGranted;
+  }
+
+  /** Parks one event until {@link settleAdmissionWaiters} decides its fate. */
+  private holdForAdmission(event: BugEvent, context?: EmitContext): void {
+    // A shed session records nothing but the gap that says it was shed, so
+    // there is nothing here worth holding for it.
+    if (this.samplingShed && event.k !== CAPTURE_GAP_EVENT_KIND) return;
+    // An event the release pass just emitted must never fall back into the
+    // hold it came out of.
+    if (this.releasingAdmissionHold) return;
+    this.pendingAdmissionMasking ??= readMaskingState(this.config);
+    // The raw URL rides on the hold entry, never on the event: it exists so the
+    // release pass can match `excludeUrls` against what the application asked
+    // for rather than against the redacted copy, and it is dropped with the
+    // entry.
+    const bytes = estimateHeldEventBytes(event);
+    this.pendingAdmissionEvents.push({
+      event,
+      bytes,
+      ...(context?.rawUrl !== undefined ? { rawUrl: context.rawUrl } : {}),
+      ...(context?.requestScope !== undefined
+        ? { requestScope: context.requestScope }
+        : {}),
+    });
+    this.pendingAdmissionBytes += bytes;
+    // Oldest first, matching the bus buffer: the events nearest whatever opens
+    // the gate are the ones a reader is looking for. Both ceilings evict the
+    // same way, so one loop serves them. The byte ceiling never empties the
+    // hold: one event over the limit is kept rather than losing the newest
+    // thing that happened.
+    while (
+      this.pendingAdmissionEvents.length > MAX_PENDING_ADMISSION_EVENTS ||
+      (this.pendingAdmissionBytes > MAX_PENDING_ADMISSION_BYTES &&
+        this.pendingAdmissionEvents.length > 1)
+    ) {
+      const evicted = this.pendingAdmissionEvents.shift();
+      if (!evicted) break;
+      this.pendingAdmissionBytes -= evicted.bytes;
+      this.pendingAdmissionDropped += 1;
+      // A terminal that arrives after the gate must not survive the request
+      // start this cap just removed. The scope belongs only to this request and
+      // is never put onto an event or retained by the bus.
+      dropRequestScope(evicted.requestScope, "overflow");
+    }
+  }
+
+  /**
+   * Empties the hold. Admitted events are re-emitted in the order they were
+   * held, which is the order they were captured in among themselves, with their
+   * original timestamps, so a request and its response sit where they happened
+   * rather than where the policy landed. It says nothing about where they sit
+   * relative to events captured after the gate opened, which are already out.
+   */
+  private releasePendingAdmissionEvents(admitted: boolean): void {
+    const held = this.pendingAdmissionEvents;
+    let overflowDropped = this.pendingAdmissionDropped;
+    let policyDropped = 0;
+    const heldMasking =
+      this.pendingAdmissionMasking ?? readMaskingState(this.config);
+    this.pendingAdmissionEvents = [];
+    this.pendingAdmissionDropped = 0;
+    this.pendingAdmissionBytes = 0;
+    this.pendingAdmissionMasking = undefined;
+    if (!admitted || held.length === 0) return;
+
+    // The policy that just opened the gate may also have narrowed what may be
+    // captured. Rebuild every event first, then decide the fate of each held
+    // request start before any terminal or file event can be released. A later
+    // net.res/net.err reuses that scope after the gate, so it follows the start
+    // even though it is no longer in this array.
+    const released = held.map((entry) => ({
+      entry,
+      event: reapplyPolicyToHeldEvent(entry.event, this.config, {
+        heldMasking,
+        samplingShed: this.samplingShed,
+        ...(entry.rawUrl !== undefined ? { rawUrl: entry.rawUrl } : {}),
+      }),
+    }));
+    for (const { entry, event } of released) {
+      const scope = entry.requestScope;
+      if (entry.event.k === "net.req" && scope?.disposition === "undecided") {
+        if (event) scope.disposition = "admitted";
+        else dropRequestScope(scope, "policy");
+      }
+    }
+
+    // Nothing bypasses admission: the same predicate that gates a live event
+    // gates a released one. A scope dropped by overflow accounts every held
+    // member under that cap, while a scope dropped by the policy accounts under
+    // `policy_tightened` rather than turning a request family into halves.
+    this.releasingAdmissionHold = true;
+    try {
+      for (const { entry, event } of released) {
+        const scope = entry.requestScope;
+        if (scope?.disposition === "dropped") {
+          if (scope.dropReason === "overflow") overflowDropped += 1;
+          else policyDropped += 1;
+          continue;
+        }
+        if (!event) {
+          dropRequestScope(scope, "policy");
+          policyDropped += 1;
+          continue;
+        }
+        // A child without an admitted parent is unsafe to infer. This is
+        // normally impossible because the request start is emitted first, but
+        // failing closed also protects a custom EventBus emitter order.
+        if (
+          isNetworkRequestFamilyEvent(entry.event, scope) &&
+          scope?.disposition === "undecided"
+        ) {
+          dropRequestScope(scope, "policy");
+          policyDropped += 1;
+          continue;
+        }
+        const context: EmitContext | undefined =
+          entry.rawUrl !== undefined || scope !== undefined
+            ? {
+                ...(entry.rawUrl !== undefined ? { rawUrl: entry.rawUrl } : {}),
+                ...(scope !== undefined ? { requestScope: scope } : {}),
+              }
+            : undefined;
+        if (!this.bus.emit(event, context)) {
+          if (scope?.dropReason === "overflow") overflowDropped += 1;
+          else policyDropped += 1;
+        }
+      }
+    } finally {
+      this.releasingAdmissionHold = false;
+    }
+
+    // Two reasons, two records. They mean opposite things about a deployment:
+    // the cap firing says the hold was too small for the page, the policy pass
+    // dropping events says the policy did its job.
+    if (overflowDropped > 0) {
+      this.bus.emit(
+        buildCaptureGapEvent({
+          surface: "browser",
+          reason: "buffer_overflow",
+          droppedEventCount: overflowDropped,
+          sessionId: this.sessionId,
+        }),
+      );
+    }
+    if (policyDropped > 0) {
+      this.bus.emit(
+        buildCaptureGapEvent({
+          surface: "browser",
+          reason: "policy_tightened",
+          droppedEventCount: policyDropped,
+          sessionId: this.sessionId,
+        }),
+      );
+    }
   }
 
   private runAdmissionWaiter(
@@ -2596,12 +2973,15 @@ export class Crumbtrail {
    * queue held rather than discarded.
    */
   private settleAdmissionWaiters(): void {
-    if (this.admissionWaiters.length === 0) return;
     const admitted = this.canTransport();
     if (!admitted && !this.isCaptureDenied()) return;
+    // Waiters first: they hold the pre-init early queue, which is older than
+    // anything the bus held, so releasing it first keeps the emitted order
+    // chronological.
     const waiters = this.admissionWaiters;
     this.admissionWaiters = [];
     for (const waiter of waiters) this.runAdmissionWaiter(waiter, admitted);
+    this.releasePendingAdmissionEvents(admitted);
   }
 
   private clearRemotePolicyTimer(): void {

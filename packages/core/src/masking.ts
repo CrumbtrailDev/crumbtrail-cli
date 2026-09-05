@@ -180,17 +180,16 @@ function sanitizePathFragment(value: string): string {
   return value.replace(
     PATH_ATTRIBUTE_SEGMENT_RE,
     (match, name: string, attributeValue: string) => {
-      const quote = attributeValue.length >= 2 &&
+      const quote =
+        attributeValue.length >= 2 &&
         (attributeValue.startsWith('"') || attributeValue.startsWith("'")) &&
         attributeValue.endsWith(attributeValue[0])
-        ? attributeValue[0]
-        : undefined;
+          ? attributeValue[0]
+          : undefined;
       const inner =
         quote === undefined
           ? attributeValue
-          : attributeValue
-              .slice(1, -1)
-              .replace(/\\(["'\\])/g, '$1');
+          : attributeValue.slice(1, -1).replace(/\\(["'\\])/g, "$1");
       const safe = sanitizeIdentifierFragment(inner);
       if (safe === inner) return match;
       return quote === undefined

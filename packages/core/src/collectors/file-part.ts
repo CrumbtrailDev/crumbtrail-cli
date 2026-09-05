@@ -1,6 +1,6 @@
 import { computeRedactedShape, type RedactedValueShape } from "../redaction";
 import { extractFileExtension } from "../utils";
-import type { EventBus } from "../event-bus";
+import type { EmitContext, EventBus } from "../event-bus";
 
 /**
  * The parts of a `File`/`Blob` this module needs. Kept minimal (rather than
@@ -39,9 +39,7 @@ export interface FileSniffTask {
 const MIME_TOKEN_RE = "[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}";
 const STRICT_MIME_RE = new RegExp(`^${MIME_TOKEN_RE}/${MIME_TOKEN_RE}$`);
 
-export function validateDeclaredMimeType(
-  type: unknown,
-): string | undefined {
+export function validateDeclaredMimeType(type: unknown): string | undefined {
   if (typeof type !== "string") return undefined;
   if (type.length === 0 || type.length > 255) return undefined;
   return STRICT_MIME_RE.test(type) ? type : undefined;
@@ -117,7 +115,11 @@ export function describeFilePartSync(
 }
 
 /** First N bytes of a magic-number table, matched at a fixed offset. */
-function matchBytes(head: Uint8Array, offset: number, bytes: number[]): boolean {
+function matchBytes(
+  head: Uint8Array,
+  offset: number,
+  bytes: number[],
+): boolean {
   if (head.length < offset + bytes.length) return false;
   for (let i = 0; i < bytes.length; i++) {
     if (head[offset + i] !== bytes[i]) return false;
@@ -135,7 +137,8 @@ function matchAscii(head: Uint8Array, offset: number, text: string): boolean {
 
 function asciiAt(head: Uint8Array, offset: number, length: number): string {
   let text = "";
-  for (let i = 0; i < length; i++) text += String.fromCharCode(head[offset + i] ?? 0);
+  for (let i = 0; i < length; i++)
+    text += String.fromCharCode(head[offset + i] ?? 0);
   return text;
 }
 
@@ -187,7 +190,9 @@ export interface FileDimensions {
 }
 
 /** PNG: an 8 byte signature, then the IHDR chunk carries width/height as big-endian uint32s. */
-export function parsePngDimensions(head: Uint8Array): FileDimensions | undefined {
+export function parsePngDimensions(
+  head: Uint8Array,
+): FileDimensions | undefined {
   if (head.length < 24 || !matchAscii(head, 12, "IHDR")) return undefined;
   const width = readUint32BE(head, 16);
   const height = readUint32BE(head, 20);
@@ -195,7 +200,9 @@ export function parsePngDimensions(head: Uint8Array): FileDimensions | undefined
 }
 
 /** GIF: a 6 byte header, then the Logical Screen Descriptor carries little-endian uint16s. */
-export function parseGifDimensions(head: Uint8Array): FileDimensions | undefined {
+export function parseGifDimensions(
+  head: Uint8Array,
+): FileDimensions | undefined {
   if (head.length < 10) return undefined;
   const width = head[6] | (head[7] << 8);
   const height = head[8] | (head[9] << 8);
@@ -209,7 +216,9 @@ export function parseGifDimensions(head: Uint8Array): FileDimensions | undefined
  * into its first bitstream bytes; `VP8 ` (lossy) is a raw VP8 keyframe with a
  * 3-byte start code before 14-bit width/height fields.
  */
-export function parseWebpDimensions(head: Uint8Array): FileDimensions | undefined {
+export function parseWebpDimensions(
+  head: Uint8Array,
+): FileDimensions | undefined {
   if (head.length < 16) return undefined;
   const fourCC = asciiAt(head, 12, 4);
   if (fourCC === "VP8X") {
@@ -250,8 +259,11 @@ export function parseWebpDimensions(head: Uint8Array): FileDimensions | undefine
  * is skipped by its own declared length rather than assumed away, so a
  * leading Exif block does not hide the dimensions behind it.
  */
-export function parseJpegDimensions(bytes: Uint8Array): FileDimensions | undefined {
-  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
+export function parseJpegDimensions(
+  bytes: Uint8Array,
+): FileDimensions | undefined {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8)
+    return undefined;
   let offset = 2;
   while (offset + 1 < bytes.length) {
     if (bytes[offset] !== 0xff) {
@@ -308,9 +320,12 @@ export async function sniffFile(file: FilePartLike): Promise<FileSniffResult> {
   const sniffedType = detectSniffedType(head);
   if (!sniffedType) return {};
   const result: FileSniffResult = { sniffedType };
-  if (sniffedType === "image/png") Object.assign(result, parsePngDimensions(head));
-  else if (sniffedType === "image/gif") Object.assign(result, parseGifDimensions(head));
-  else if (sniffedType === "image/webp") Object.assign(result, parseWebpDimensions(head));
+  if (sniffedType === "image/png")
+    Object.assign(result, parsePngDimensions(head));
+  else if (sniffedType === "image/gif")
+    Object.assign(result, parseGifDimensions(head));
+  else if (sniffedType === "image/webp")
+    Object.assign(result, parseWebpDimensions(head));
   else if (sniffedType === "image/jpeg") {
     try {
       const scan = new Uint8Array(
@@ -346,6 +361,13 @@ export function emitFilePartEvents(
   requestId: number,
   formData: Iterable<[string, unknown]>,
   requestTime: number,
+  /**
+   * The parent request's admission context, passed to the bus and never
+   * written onto the event. A file part carries no URL of its own, so it needs
+   * the parent's raw URL and request scope to follow an arriving exclusion or
+   * an overflowed parent rather than releasing beside a dropped upload.
+   */
+  requestContext: EmitContext,
 ): void {
   let tasks: FileSniffTask[];
   try {
@@ -361,17 +383,20 @@ export function emitFilePartEvents(
       sync = {};
     }
     const emit = (sniffed: FileSniffResult) => {
-      bus.emit({
-        t: requestTime,
-        k: "net.req.file",
-        d: {
-          id: requestId,
-          field: task.field,
-          index: task.index,
-          ...sync,
-          ...sniffed,
+      bus.emit(
+        {
+          t: requestTime,
+          k: "net.req.file",
+          d: {
+            id: requestId,
+            field: task.field,
+            index: task.index,
+            ...sync,
+            ...sniffed,
+          },
         },
-      });
+        requestContext,
+      );
     };
     sniffFile(task.file)
       .then(emit)

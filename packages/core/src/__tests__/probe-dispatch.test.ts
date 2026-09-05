@@ -185,9 +185,7 @@ async function settle(): Promise<void> {
 }
 
 function probeResults(transport: Transport): BugEvent[] {
-  return transport.sent.filter(
-    (event) => event.k === PROBE_RESULT_EVENT_KIND,
-  );
+  return transport.sent.filter((event) => event.k === PROBE_RESULT_EVENT_KIND);
 }
 
 beforeEach(() => {
@@ -226,8 +224,9 @@ describe("probe dispatch from the config poll", () => {
     const { logger } = startWithPollPayload({ probes: ["storage.snapshot"] });
     await settle();
 
-    const call = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } })
-      .mock.calls[0];
+    const call = (
+      globalThis.fetch as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0];
     expect((call[1] as RequestInit).cache).toBe("no-store");
 
     await logger.stop();
@@ -309,7 +308,11 @@ describe("probe dispatch from the config poll", () => {
       probes: ["network.inflight"],
     });
     logger.registerStateProvider("network.pending", () => [
-      { method: "GET", url: "https://api.example.com/orders?token=abc", ageMs: 1200 },
+      {
+        method: "GET",
+        url: "https://api.example.com/orders?token=abc",
+        ageMs: 1200,
+      },
     ]);
     await settle();
 
@@ -414,7 +417,10 @@ describe("probe dispatch rejects a parameterised probe request", () => {
     expect(probeCalls.map((call) => call.name)).toEqual(["storage.snapshot"]);
     expect(probeResults(transport)).toHaveLength(1);
     expect(JSON.stringify(transport.sent)).not.toContain(injected);
-    expect(JSON.stringify(transport.sent)).not.toContain("rm");
+    // A bare "rm" substring also matches "Darwin arm64" in the environment
+    // snapshot's user agent, which is capture doing its job. What must never
+    // appear is the command itself.
+    expect(JSON.stringify(transport.sent)).not.toMatch(/\brm\b/);
 
     await logger.stop();
   });
@@ -517,16 +523,15 @@ describe("probe dispatch ordering against the remote policy", () => {
 
 describe("probe dispatch interruption mid run", () => {
   it("halts a run already in flight when the caller stops polling", async () => {
-    let stop: (() => void) | undefined;
-    // Runs between the first probe and the second, which is the only window where a stop can be
-    // the thing that halts the run rather than arriving after it finished anyway.
-    onProbeDispatch = (_name, index) => {
-      if (index === 0) stop?.();
-    };
     const started = startManualPolling([
       { ...POLICY, probes: [...PROBE_NAMES] },
     ]);
-    stop = started.stop;
+    const stop = started.stop;
+    // Runs between the first probe and the second, which is the only window where a stop can be
+    // the thing that halts the run rather than arriving after it finished anyway.
+    onProbeDispatch = (_name, index) => {
+      if (index === 0) stop();
+    };
     await settle();
 
     expect(probeCalls).toHaveLength(1);

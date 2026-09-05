@@ -1,7 +1,59 @@
 import type { BugEvent } from "./types";
 
+/**
+ * What the emitter knows that the built event no longer carries.
+ *
+ * `d.url` has already been through `redactUrl` by the time an event reaches
+ * the bus, so an admission rule written against a value that redaction
+ * replaced cannot match the event's own copy. A request scope also lets a
+ * start, terminal and file parts share the same admission outcome while a
+ * remote policy is resolving. The scope's original session id is copied onto
+ * an event only when that event lacks one, so a rotated session can still send
+ * the whole request family to its origin. Raw URLs and admission state stay in
+ * context and never reach taps, buffers, transports, or the ring buffer.
+ */
+export type RequestAdmissionDisposition = "undecided" | "admitted" | "dropped";
+
+/**
+ * Mutable state owned by one network request and shared only through
+ * {@link EmitContext}. It deliberately carries no URL or event data.
+ */
+export interface RequestAdmissionScope {
+  disposition: RequestAdmissionDisposition;
+  /** Keeps an overflow outcome from being relabelled as a policy drop. */
+  dropReason?: "overflow" | "policy";
+  /** Session active when this request began, retained for late family members. */
+  sessionId?: string;
+}
+
+export interface EmitContext {
+  rawUrl?: string;
+  requestScope?: RequestAdmissionScope;
+}
+
+export interface EmitOptions extends EmitContext {
+  bypassAdmission?: boolean;
+}
+
 /** Matches the ring buffer's default ceiling; `Crumbtrail.init()` sets the real one. */
 const DEFAULT_MAX_BUFFERED_EVENTS = 50_000;
+
+function bindRequestSession(
+  event: BugEvent,
+  options: EmitOptions | undefined,
+): BugEvent {
+  const sessionId = options?.requestScope?.sessionId;
+  if (
+    typeof sessionId !== "string" ||
+    sessionId.length === 0 ||
+    event.d.sessionId !== undefined
+  )
+    return event;
+  return {
+    ...event,
+    d: { ...event.d, sessionId },
+  };
+}
 
 export class EventBus {
   private listeners: Array<(events: BugEvent[]) => void> = [];
@@ -10,7 +62,10 @@ export class EventBus {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private paused = false;
   private flushBufferSize = 100;
-  private admissionPredicate: (event: BugEvent) => boolean = () => true;
+  private admissionPredicate: (
+    event: BugEvent,
+    context?: EmitContext,
+  ) => boolean = () => true;
   /**
    * Ceiling on events waiting for a flush. It only ever bites while the host
    * holds `pause()` — nothing flushes then, not the size trigger and not the
@@ -19,22 +74,23 @@ export class EventBus {
   private maxBufferedEvents = DEFAULT_MAX_BUFFERED_EVENTS;
   private droppedFromBuffer = 0;
 
-  emit(event: BugEvent, options?: { bypassAdmission?: boolean }): boolean {
+  emit(event: BugEvent, options?: EmitOptions): boolean {
+    const emitted = bindRequestSession(event, options);
     if (!options?.bypassAdmission) {
       try {
-        if (!this.admissionPredicate(event)) return false;
+        if (!this.admissionPredicate(emitted, options)) return false;
       } catch {
         return false;
       }
     }
     for (const tap of this.taps) {
       try {
-        tap(event);
+        tap(emitted);
       } catch {
         // A misbehaving tap must never break event capture.
       }
     }
-    this.buffer.push(event);
+    this.buffer.push(emitted);
     if (this.buffer.length > this.maxBufferedEvents) {
       // Oldest first: after a long pause the events worth keeping are the ones
       // nearest whatever the reader is looking for.
@@ -73,7 +129,9 @@ export class EventBus {
    * Controls admission before taps, batches, subscribers, and the ring buffer see an event.
    * Privacy and capture policy use this boundary so denied events never rest locally.
    */
-  setAdmissionPredicate(predicate: (event: BugEvent) => boolean): void {
+  setAdmissionPredicate(
+    predicate: (event: BugEvent, context?: EmitContext) => boolean,
+  ): void {
     this.admissionPredicate = predicate;
   }
 

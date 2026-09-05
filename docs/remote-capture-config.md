@@ -90,6 +90,45 @@ cannot ratchet a limit back up one step at a time.
 | `consentMode` / `consent.mode` | `"implicit"` \| `"required"` | settable  | Explicit consent blocks all buffering until `consent(true)`.                 |
 | `respectGpc`                   | boolean                      | settable  | Treat Global Privacy Control as required consent.                            |
 
+### What happens to events captured before this response arrives
+
+Capture is closed until the first policy lands, and events emitted in that
+window are held in memory rather than discarded, then released once the answer
+arrives. A request issued before the policy and answered after it keeps its
+full family together: `net.req`, `net.res` or `net.err`, and any
+`net.req.file` descriptions are all released or all dropped. This prevents a
+first screen from recording a response or file detail with no request behind
+it.
+
+Release re-asks the policy questions against the events it held, because they
+were built under the local config:
+
+| The response says                     | What happens to a held event                                                                                                                    |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `collectors.<name>: false`            | Events of that collector are dropped.                                                                                                           |
+| `network.excludeUrls`                 | A held request family for a matching URL is dropped. Matched against the URL the application asked for, not the redacted copy on the event.     |
+| `network.captureHeaders: false`       | `d.hdrs` is removed.                                                                                                                            |
+| `network.maxBodySize`                 | Bodies over the new cap become a `payload_too_large` summary. WebSocket frames and worker messages keep their own smaller ceilings.             |
+| `redaction.denyFields`                | Bodies are re-redacted under the added names, and the parsed response view in `d.bodyMeta` is rebuilt from the result.                          |
+| `redaction.mode`                      | Bodies are re-redacted under the named mode.                                                                                                    |
+| `redaction.captureInputValues: false` | A held input value becomes a placeholder.                                                                                                       |
+| `masking.*` tightened                 | Held `dom.snap`, `clk`, `inp`, `key` and `clip` events are dropped, not re-masked. They carry text rendered from a DOM that is gone by release. |
+| `sampling.captureSampleRate` sheds    | The whole hold is discarded.                                                                                                                    |
+| `killSwitch: true`                    | The whole hold is discarded.                                                                                                                    |
+
+Drops are counted in a `capture_gap`, so a session says what release cost it.
+Events the policy dropped are reported under reason `policy_tightened`, and
+events the hold discarded to stay under its 2,000 event or 4 MiB cap under
+`buffer_overflow`. They mean opposite things: one says the policy worked, the
+other says the hold was too small for the page. The cap drops the oldest first;
+when it evicts a request start, later members of that request family are also
+dropped.
+
+Global Privacy Control ends the wait rather than extending it: under the default
+`consentMode: "implicit"` a GPC visitor's hold is discarded on the first poll,
+because no consent call is coming. Under `consentMode: "required"` the hold is
+kept, unsent, until `consent(true)` or `consent(false)` answers.
+
 ## Reference: sampling and flight recorder
 
 | Field                                                                                                                    | Type       | Direction | Effect                                                                |
