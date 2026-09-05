@@ -136,6 +136,13 @@ import {
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
+/**
+ * Ceiling on events held while admission is undecided. The window is normally
+ * one config round trip, so this is a guard against a policy route that never
+ * answers rather than a working limit; what it discards is declared as a
+ * `capture_gap` when the gate finally opens.
+ */
+const MAX_PENDING_ADMISSION_EVENTS = 2_000;
 import { buildMaskedDomSnapshot, maskText } from "./masking";
 import { CAPTURE_GAP_EVENT_KIND } from "./types";
 
@@ -602,6 +609,23 @@ export class Crumbtrail {
    * to be decided. See `CollectorContext.whenCaptureAdmitted`.
    */
   private admissionWaiters: Array<(admitted: boolean) => void> = [];
+  /**
+   * Events emitted while admission was still UNDECIDED, kept until it is.
+   *
+   * Refusing them outright destroys evidence that cannot be produced again, and
+   * it does so asymmetrically: a request that starts before the capture policy
+   * lands and answers after it keeps its `net.res` and loses its `net.req`, so
+   * the session shows a response with no call behind it. The window is the
+   * standard configuration — `remoteConfig: true` is what the installer writes
+   * — and it covers exactly the requests that render the first screen.
+   *
+   * Held only while the answer is genuinely pending. A denial (`stop()`, kill
+   * switch, `consent(false)`, Global Privacy Control) drops the events without
+   * ever transporting them, which is the same outcome refusing them had.
+   */
+  private pendingAdmissionEvents: BugEvent[] = [];
+  /** Events the hold's own cap discarded, reported as one `capture_gap`. */
+  private pendingAdmissionDropped = 0;
   private samplingShed: boolean;
   private samplingGapEmitted = false;
   /** Bounded so an endpoint that is refusing everything cannot storm the bus. */
@@ -2390,7 +2414,10 @@ export class Crumbtrail {
   }
 
   private shouldAdmitEvent(event: BugEvent): boolean {
-    if (!this.canTransport()) return false;
+    if (!this.canTransport()) {
+      if (this.isAdmissionUndecided()) this.holdForAdmission(event);
+      return false;
+    }
     if (this.isFlightRecorderTerminal()) return false;
     if (!this.samplingShed) return true;
     return event.k === CAPTURE_GAP_EVENT_KIND;
@@ -2576,7 +2603,73 @@ export class Crumbtrail {
    * every consent-gated app. Only an explicit `consent(false)` decides against.
    */
   private isCaptureDenied(): boolean {
-    return this.stopped || this.killSwitch || this.explicitConsent === false;
+    if (this.stopped || this.killSwitch || this.explicitConsent === false)
+      return true;
+    // Global Privacy Control is an answer, not a pending question. Without this
+    // a suppressed session would hold evidence waiting for a consent call the
+    // host has already been told not to make.
+    return (
+      this.explicitConsent === undefined &&
+      Boolean(this.config.respectGpc) &&
+      hasGlobalPrivacyControl()
+    );
+  }
+
+  /**
+   * Is capture still waiting for an answer, as opposed to running or refused?
+   *
+   * True only while the remote capture policy is in flight or explicit consent
+   * has not been given yet — the two states that resolve later in the same
+   * session. A closing or suspended lifecycle is not one of them: those events
+   * belong to a session that is ending, and holding them would replay them into
+   * a session that has already been finalized.
+   */
+  private isAdmissionUndecided(): boolean {
+    if (this.inert || this.lifecycleClosing || this.lifecycleSuspended)
+      return false;
+    if (this.isCaptureDenied()) return false;
+    return !this.remotePolicyReady || !this.consentGranted;
+  }
+
+  /** Parks one event until {@link settleAdmissionWaiters} decides its fate. */
+  private holdForAdmission(event: BugEvent): void {
+    // A shed session records nothing but the gap that says it was shed, so
+    // there is nothing here worth holding for it.
+    if (this.samplingShed && event.k !== CAPTURE_GAP_EVENT_KIND) return;
+    this.pendingAdmissionEvents.push(event);
+    const overflow =
+      this.pendingAdmissionEvents.length - MAX_PENDING_ADMISSION_EVENTS;
+    if (overflow > 0) {
+      // Oldest first, matching the bus buffer: the events nearest whatever
+      // opened the gate are the ones a reader is looking for.
+      this.pendingAdmissionEvents.splice(0, overflow);
+      this.pendingAdmissionDropped += overflow;
+    }
+  }
+
+  /**
+   * Empties the hold. Admitted events are re-emitted in the order they were
+   * captured, with their original timestamps, so a request and its response sit
+   * where they happened rather than where the policy landed.
+   */
+  private releasePendingAdmissionEvents(admitted: boolean): void {
+    const held = this.pendingAdmissionEvents;
+    const dropped = this.pendingAdmissionDropped;
+    this.pendingAdmissionEvents = [];
+    this.pendingAdmissionDropped = 0;
+    if (!admitted || held.length === 0) return;
+    for (const event of held) this.bus.emit(event, { bypassAdmission: true });
+    if (dropped > 0) {
+      this.bus.emit(
+        buildCaptureGapEvent({
+          surface: "browser",
+          reason: "buffer_overflow",
+          droppedEventCount: dropped,
+          sessionId: this.sessionId,
+        }),
+        { bypassAdmission: true },
+      );
+    }
   }
 
   private runAdmissionWaiter(
@@ -2596,12 +2689,15 @@ export class Crumbtrail {
    * queue held rather than discarded.
    */
   private settleAdmissionWaiters(): void {
-    if (this.admissionWaiters.length === 0) return;
     const admitted = this.canTransport();
     if (!admitted && !this.isCaptureDenied()) return;
+    // Waiters first: they hold the pre-init early queue, which is older than
+    // anything the bus held, so releasing it first keeps the emitted order
+    // chronological.
     const waiters = this.admissionWaiters;
     this.admissionWaiters = [];
     for (const waiter of waiters) this.runAdmissionWaiter(waiter, admitted);
+    this.releasePendingAdmissionEvents(admitted);
   }
 
   private clearRemotePolicyTimer(): void {
