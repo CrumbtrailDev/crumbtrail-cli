@@ -593,7 +593,7 @@ function rankEvidence(symptom: Symptom, items: EvidenceItem[]): EvidenceItem[] {
  * Pure, deterministic, never throws. Ordered by confidence desc.
  */
 function classifyHypotheses(
-  symptom: Symptom,
+  _symptom: Symptom,
   evidence: EvidenceItem[],
   intent: IntentSignal[],
 ): Hypothesis[] {
@@ -636,8 +636,10 @@ function classifyHypotheses(
     });
   }
 
-  // 3. environment — unexplained env-lane evidence.
-  const envEvidence = unexplained.filter((item) => item.lane === "env");
+  // 3. environment — unexplained comparative env-lane evidence.
+  const envEvidence = unexplained.filter(
+    (item) => item.lane === "env" && hasComparativeChange(item),
+  );
   if (envEvidence.length > 0) {
     hypotheses.push({
       kind: "environment",
@@ -647,8 +649,10 @@ function classifyHypotheses(
     });
   }
 
-  // 4. client-side — browser-lane evidence.
-  const browserEvidence = unexplained.filter((item) => item.lane === "browser");
+  // 4. client-side — comparative browser-lane evidence.
+  const browserEvidence = unexplained.filter(
+    (item) => item.lane === "browser" && hasComparativeChange(item),
+  );
   if (browserEvidence.length > 0) {
     hypotheses.push({
       kind: "client-side",
@@ -658,18 +662,7 @@ function classifyHypotheses(
     });
   }
 
-  // 5. latent — no evidence at all, but a non-empty symptom.
-  if (evidence.length === 0 && symptom.title.trim().length > 0) {
-    hypotheses.push({
-      kind: "latent",
-      confidence: 0.3,
-      rationale:
-        "no behavior change captured; likely a long-standing/latent issue or missing instrumentation",
-      evidenceIds: [],
-    });
-  }
-
-  // 6. inconclusive — nothing else emitted.
+  // 5. inconclusive — nothing else emitted.
   if (hypotheses.length === 0) {
     hypotheses.push({
       kind: "inconclusive",
