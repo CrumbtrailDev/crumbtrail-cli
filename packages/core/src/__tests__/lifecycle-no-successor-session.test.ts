@@ -38,6 +38,16 @@ function pageEvent(
   return event;
 }
 
+type BusEvent = { k?: string; d?: { label?: string } };
+
+function batchEvents(call: unknown[]): BusEvent[] {
+  return call[0] as BusEvent[];
+}
+
+function isAppSwitchMark(event: BusEvent): boolean {
+  return event.k === "mark" && event.d?.label === "after app switch";
+}
+
 function startedIds(transport: ReturnType<typeof makeTransport>): string[] {
   return transport.startSession.mock.calls.map((call) => call[0] as string);
 }
@@ -169,6 +179,81 @@ describe("teardown opens no successor session", () => {
     expect(logger.getSessionId()).toBe(visit);
     await logger.stop();
     expect(endedIds(transport)).toEqual([visit]);
+  });
+
+  it("resumes when a persisted pageshow follows a nonpersisted pagehide", async () => {
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: transport as never,
+      flushIntervalMs: 100_000,
+      sessionPersistence: "memory",
+    });
+    await settle();
+    const visit = logger.getSessionId();
+
+    // iOS Safari announces teardown with a nonpersisted pagehide on documents
+    // that survive, then shows the same document again. A latch that never
+    // cleared would leave the SDK dark for the rest of the visit.
+    window.dispatchEvent(pageEvent("pagehide", false));
+    await settle();
+    expect(endedIds(transport)).toEqual([visit]);
+
+    window.dispatchEvent(pageEvent("pageshow", true));
+    await settle();
+    logger.mark("after app switch");
+    await settle();
+
+    const resumed = logger.getSessionId();
+    expect(resumed).not.toBe(visit);
+    expect(startedIds(transport)).toEqual([visit, resumed]);
+    await logger.stop();
+    expect(endedIds(transport)).toEqual([visit, resumed]);
+
+    // `sendEvents` carries no session id: the transport is bound to whichever
+    // session is current, so the mark belongs to the resumed one exactly when
+    // its batch leaves after that session started and does not go out on the
+    // `sendSessionEvents` path, which is how a late event reaches the session
+    // it was recorded under instead.
+    const resumeOrder =
+      transport.startSession.mock.invocationCallOrder[
+        startedIds(transport).indexOf(resumed)
+      ];
+    const markBatchOrder = transport.sendEvents.mock.calls
+      .map((call, index) => ({ events: batchEvents(call), index }))
+      .filter(({ events }) => events.some(isAppSwitchMark))
+      .map(({ index }) => transport.sendEvents.mock.invocationCallOrder[index]);
+    expect(markBatchOrder).toHaveLength(1);
+    expect(markBatchOrder[0]).toBeGreaterThan(resumeOrder);
+    expect(
+      transport.sendSessionEvents.mock.calls.some((call) =>
+        (call[1] as BusEvent[]).some(isAppSwitchMark),
+      ),
+    ).toBe(false);
+  });
+
+  it("resumes when a nonpersisted pageshow follows a nonpersisted pagehide", async () => {
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: transport as never,
+      flushIntervalMs: 100_000,
+      sessionPersistence: "memory",
+    });
+    await settle();
+    const visit = logger.getSessionId();
+
+    // WebKit restores a backgrounded document with `persisted` false, so the
+    // flag cannot decide whether the page is alive. Being shown at all does.
+    window.dispatchEvent(pageEvent("pagehide", false));
+    await settle();
+    window.dispatchEvent(pageEvent("pageshow", false));
+    await settle();
+    logger.mark("after app switch");
+    await settle();
+
+    const resumed = logger.getSessionId();
+    expect(resumed).not.toBe(visit);
+    expect(startedIds(transport)).toEqual([visit, resumed]);
+    await logger.stop();
   });
 
   it("starts a fresh visit when a hidden page returns", async () => {

@@ -128,8 +128,10 @@ batches are delivered with a lifecycle safe request. A page entering the back
 forward cache keeps its session open, so returning to it does not lose the rest
 of the visit. A page that was sent to the background and then becomes visible
 again starts a new session. A page that is being unloaded does not: its last
-session is the last one that instance opens, so a reload leaves one session
-behind rather than one real session and one empty successor. Set
+session is the last one the page opens, so a reload leaves one session behind
+rather than one real session and one empty successor. A page that turns out to
+have survived, such as an iOS Safari tab coming back from an app switch, fires
+`pageshow` and resumes under a new session. Set
 `endOnPageHide: false` only when your application owns session boundaries and
 will call `stop()` itself.
 
