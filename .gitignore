@@ -140,3 +140,7 @@ worktrees/
 
 # Deep Build plan and decision log. Local only, matches the main repo.
 .deep-build/
+
+# Ruby package: a library resolves its dependencies at install time.
+packages/ruby/Gemfile.lock
+packages/ruby/.bundle/
