@@ -1,5 +1,5 @@
+import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
 import 'package:http/http.dart' as http;
-import 'crumbtrail.dart';
 
 /// Records time to response headers without reading either body.
 /// Closing this wrapper closes [inner]. Register one wrapper per client.
@@ -10,7 +10,9 @@ class CrumbtrailClient extends http.BaseClient {
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    if (!crumbtrail.config.collectors.network) return inner.send(request);
+    // Includes the ingest host check: a wrapper placed around the client
+    // Crumbtrail's own transport uses would otherwise record its own delivery.
+    if (!crumbtrail.capturesRequestTo(request.url)) return inner.send(request);
     final clock = Stopwatch()..start();
     void record(int? status, [String? error]) {
       try {
@@ -21,6 +23,9 @@ class CrumbtrailClient extends http.BaseClient {
           durationMs: clock.elapsedMilliseconds,
           source: 'http',
           error: error,
+          // `send` returns as soon as the response head is available, so this
+          // number never contains body download or decoding.
+          durTo: 'headers',
         );
       } catch (_) {
         // Capture failures must not change the application's HTTP result.

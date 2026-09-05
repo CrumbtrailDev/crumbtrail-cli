@@ -1,5 +1,6 @@
 package ai.crumbtrail.sdk
 
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -77,5 +78,66 @@ class OkHttpInterceptorTest {
             assertFalse(transport.events.any { it.kind == "net" })
             logger.stop()
         }
+    }
+
+    private fun shortCircuit(code: Int = 200) = Interceptor {
+        okhttp3.Response.Builder().request(it.request()).protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(code).message("OK").body("ok".toResponseBody()).build()
+    }
+
+    @Test fun `a non-IO failure is still recorded and still rethrown`() {
+        // A downstream interceptor throwing IllegalStateException ends the call
+        // as visibly as an IOException does. Recording only IOException left the
+        // session showing a request that started and never finished.
+        val transport = NetworkTransport()
+        val logger = logger(transport)
+        val failure = IllegalStateException("token=secret")
+        val client = OkHttpClient.Builder()
+            .addInterceptor(CrumbtrailOkHttpInterceptor(logger))
+            .addInterceptor { throw failure }
+            .build()
+        assertSame(failure, assertFailsWith<IllegalStateException> {
+            client.newCall(Request.Builder().url("https://example.com").build()).execute()
+        })
+        logger.flush()
+        val event = transport.events.single { it.kind == "net" }.data.toJson()
+        assertTrue(event.contains("IllegalStateException"))
+        assertFalse(event.contains("secret"))
+        logger.stop()
+    }
+
+    @Test fun `requests to the ingest host are not captured`() {
+        // Otherwise a host that shares an OkHttp client with Crumbtrail's own
+        // transport gets event to flush to POST to intercepted to event, and it
+        // amplifies because flush fires on batch size.
+        val transport = NetworkTransport()
+        val logger = logger(transport)
+        val client = OkHttpClient.Builder()
+            .addInterceptor(CrumbtrailOkHttpInterceptor(logger))
+            .addInterceptor(shortCircuit())
+            .build()
+        client.newCall(Request.Builder().url("https://ingest.example.com/v1/events").build()).execute().close()
+        client.newCall(Request.Builder().url("https://example.com/v1/events").build()).execute().close()
+        logger.flush()
+        val urls = transport.events.filter { it.kind == "net" }.map { it.data.toJson() }
+        assertEquals(1, urls.size, "expected only the application request, got $urls")
+        assertTrue(urls.single().contains("https://example.com/v1/events"))
+        logger.stop()
+    }
+
+    @Test fun `the event says which phase its duration covers`() {
+        // `dur` means time to response headers here and time through the
+        // buffered body in the Dio adapter. Without `durTo` the two are one
+        // number under one kind and nothing downstream can tell them apart.
+        val transport = NetworkTransport()
+        val logger = logger(transport)
+        val client = OkHttpClient.Builder()
+            .addInterceptor(CrumbtrailOkHttpInterceptor(logger))
+            .addInterceptor(shortCircuit())
+            .build()
+        client.newCall(Request.Builder().url("https://example.com/api").build()).execute().close()
+        logger.flush()
+        assertTrue(transport.events.single { it.kind == "net" }.data.toJson().contains("\"durTo\":\"headers\""))
+        logger.stop()
     }
 }

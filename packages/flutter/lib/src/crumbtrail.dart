@@ -378,6 +378,10 @@ class Crumbtrail with WidgetsBindingObserver {
     required int durationMs,
     String source = 'manual',
     String? error,
+    /// Which phase [durationMs] covers: `headers` or `body`. Left absent by
+    /// default, because a manual caller measured whatever it measured and the
+    /// SDK must not state a phase on its behalf.
+    String? durTo,
   }) {
     addEvent(
       CrumbtrailEventKind.network,
@@ -387,10 +391,38 @@ class Crumbtrail with WidgetsBindingObserver {
         'status': status,
         'ok': status == null ? null : status >= 200 && status < 300,
         'dur': durationMs,
+        'durTo': durTo,
         'source': source,
         'error': error,
       }),
     );
+  }
+
+  /// The host Crumbtrail itself posts to, lowercased, or null when the endpoint
+  /// is not URL shaped.
+  late final String? _endpointHost = () {
+    try {
+      final host = Uri.parse(config.endpoint).host;
+      return host.isEmpty ? null : host.toLowerCase();
+    } on FormatException {
+      return null;
+    }
+  }();
+
+  /// Whether a network adapter should record this request.
+  ///
+  /// Requests to Crumbtrail's own ingest host are excluded, and that exclusion
+  /// is not optional. Every adapter hangs off a seam the host application also
+  /// owns, and a host that hands Crumbtrail a Dio backed transport to share its
+  /// certificate pinning would otherwise get event to flush to POST to
+  /// intercepted to event. It amplifies rather than settling, because a flush
+  /// fires on batch size, so one captured request becomes the batch that posts
+  /// it.
+  bool capturesRequestTo(Uri url) {
+    if (!config.collectors.network) return false;
+    final endpointHost = _endpointHost;
+    if (endpointHost == null) return true;
+    return url.host.toLowerCase() != endpointHost;
   }
 
   // MARK: error handlers

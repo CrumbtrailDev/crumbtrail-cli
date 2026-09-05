@@ -12,9 +12,19 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # The ONLY runtime dependency, and it is a first-party flutter.dev package.
+  # Session continuity across cold starts needs durable storage, and making that
+  # opt-in would mean every launch opens a new session by default — turning a
+  # user's week of intermittent reports into unrelated one-event sessions.
+  # Device and OS facts come from dart:io instead of device_info_plus, so that
+  # is one dependency rather than three.
+  #
+  # The HTTP capture adapters live in crumbtrail_flutter_http and
+  # crumbtrail_flutter_dio for the same reason. Dart has no compileOnly, so
+  # declaring package:http and dio here would make every consumer resolve both,
+  # and an app pinned to dio 4 could not `pub get` a capture adapter it never
+  # enabled.
   shared_preferences: ^2.3.0
-  http: ^1.2.0
-  dio: ^5.7.0
 
 dev_dependencies:
   flutter_test:
