@@ -132,6 +132,89 @@ describe("the window between init() and the first capture policy", () => {
     expect(String(early[0]?.d?.url)).toContain("/api/orders");
   });
 
+
+  // The dogfood shape: an application that imports `crumbtrail-core/early`,
+  // initializes with `remoteConfig: true`, and loads its first screen while the
+  // capture policy is still in flight. Three of the four requests came back as
+  // `net.res` with no `net.req` and one vanished entirely, because the request
+  // half was emitted into a bus that was still refusing events and the response
+  // half arrived after the policy opened it. A half recorded request is worse
+  // than none: the reader sees a response with no call behind it.
+  it("records both halves of every request issued while the policy is in flight", async () => {
+    let answerConfig: (() => void) | undefined;
+    const configAnswer = new Promise<Response>((resolve) => {
+      answerConfig = () => resolve(new Response(RECOGNIZED_POLICY));
+    });
+    const pending = new Map<string, (response: Response) => void>();
+    const fetchStub = vi.fn().mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.includes("/api/capture-config")) return configAnswer;
+      if (url.includes("/held/"))
+        return new Promise<Response>((resolve) => {
+          pending.set(url, resolve);
+        });
+      return Promise.resolve(appResponse());
+    });
+    globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
+
+    installEarlyCapture();
+    // Settled before init: drained from the early queue.
+    await globalThis.fetch("/api/participants");
+    // Still on the wire at init: delivered through the early late sink.
+    const inFlight = globalThis.fetch("/held/api/disputes");
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      network: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+    });
+
+    pending.get("/held/api/disputes")?.(appResponse());
+    await inFlight;
+
+    // Issued by the app's first render, after init and before the policy: one
+    // that settles inside the window and one that settles after it.
+    await globalThis.fetch("/api/me/notifications");
+    const acrossPolicy = globalThis.fetch("/held/api/search");
+
+    answerConfig?.();
+    await configAnswer;
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    pending.get("/held/api/search")?.(appResponse());
+    await acrossPolicy;
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    await logger.stop();
+
+    const events = delivered(transport);
+    const requests = events.filter((event) => event.k === "net.req");
+    const responses = events.filter((event) => event.k === "net.res");
+    const appUrl = (event: BugEvent) => String(event.d?.url);
+
+    expect(requests.map(appUrl).sort()).toEqual(
+      responses.map(appUrl).sort(),
+    );
+    for (const url of [
+      "/api/participants",
+      "/held/api/disputes",
+      "/api/me/notifications",
+      "/held/api/search",
+    ]) {
+      const request = requests.find((event) => appUrl(event).includes(url));
+      const response = responses.find((event) => appUrl(event).includes(url));
+      expect(request, `net.req for ${url}`).toBeDefined();
+      expect(response, `net.res for ${url}`).toBeDefined();
+      expect(request?.d?.id).toBe(response?.d?.id);
+      expect(request?.d?.requestId).toBe(response?.d?.requestId);
+      expect(typeof request?.d?.requestId).toBe("string");
+    }
+    expect(new Set(requests.map((event) => event.d?.id)).size).toBe(4);
+  });
+
   it("opens the gate on the local config, and records the gap, when the config route never answers", async () => {
     const fetchStub = vi.fn().mockImplementation((input: unknown) => {
       if (String(input).includes("/api/capture-config"))
