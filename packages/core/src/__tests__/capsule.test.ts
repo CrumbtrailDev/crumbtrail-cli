@@ -37,6 +37,8 @@ function richBundle(): RankedBundle {
       kind: "net.status",
       brief: "POST /api/checkout returned 500",
       ref: { requestId: "req_abc", sig: "checkout-500" },
+      before: 200,
+      after: 500,
     }),
     evidenceItem({
       id: "db-1",
