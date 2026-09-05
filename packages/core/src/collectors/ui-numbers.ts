@@ -18,6 +18,13 @@ import { subscribeNavCommit } from "../nav-signal";
  * compact `ui.num` snapshots so backend detectors can check display arithmetic
  * (subtotal + tax vs total) and UI↔API divergence. No raw DOM/HTML is ever
  * captured — only short labels and parsed numbers.
+ *
+ * Three shapes reach an item: a leaf whose entire text is a numeric token, a
+ * leaf whose entire text is a short count phrase ("31 people", "Page 1 of 1"),
+ * and a pager control's enabled/disabled state. The last two exist because a
+ * list screen states its own pagination in prose and in a disabled button, so
+ * a token-only reading saw nothing at all on the page where the count was the
+ * whole story. `UI_NUM_EVENT_KIND` in types.ts documents the emitted shapes.
  */
 
 /** DOM settle debounce for mutation-triggered scans. */
@@ -433,6 +440,178 @@ function isLeaf(el: Element): boolean {
 }
 
 /**
+ * Longest leaf text still considered a rendered count phrase. A list header
+ * renders "31 people" or "Page 1 of 1"; anything longer is running prose and
+ * is not read at all.
+ */
+const MAX_PROSE_TEXT_LENGTH = 64;
+
+/**
+ * Function words that turn a trailing phrase into a sentence fragment rather
+ * than a noun. Without them "3 items in your cart" would label a count with a
+ * slice of running prose ("items in your").
+ */
+const PROSE_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "has",
+  "have",
+  "in",
+  "into",
+  "is",
+  "it",
+  "its",
+  "my",
+  "of",
+  "on",
+  "or",
+  "our",
+  "that",
+  "the",
+  "their",
+  "there",
+  "this",
+  "to",
+  "was",
+  "were",
+  "with",
+  "you",
+  "your",
+]);
+
+// Every pattern is anchored to the WHOLE trimmed text. A count phrase is the
+// entire content of its leaf; a sentence that merely contains a number ("We
+// have 31 people on the team.") is prose and must stay uncaptured.
+const PAGE_OF_RE = /^page\s+(.+?)\s+of\s+(.+?)$/i;
+const RANGE_DASH_OF_RE = /^(?:showing\s+)?(.+?)\s*[-–—]\s*(.+?)\s+of\s+(.+?)$/i;
+const RANGE_TO_OF_RE = /^(?:showing\s+)?(.+?)\s+to\s+(.+?)\s+of\s+(.+?)$/i;
+const SHOWING_OF_RE = /^showing\s+(.+?)\s+of\s+(.+?)$/i;
+const COUNT_NOUN_RE = /^(.+?)\s+([a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,2})$/;
+
+/** Label prefix that marks a pager control state rather than a count. */
+export const PAGER_CONTROL_LABEL_PREFIX = "control:";
+
+/** Accessible texts that identify a pager control, lowercased. */
+const PAGER_CONTROL_TEXTS = new Set([
+  "previous",
+  "prev",
+  "next",
+  "newer",
+  "older",
+  "first",
+  "last",
+]);
+
+function labeledNumbers(
+  parts: Array<[label: string, raw: string]>,
+  lang: string | null,
+): UiNumItem[] | null {
+  const items: UiNumItem[] = [];
+  for (const [label, raw] of parts) {
+    const parsed = parseNumericToken(raw, lang);
+    if (!parsed) return null;
+    const item: UiNumItem = { label, value: parsed.value };
+    if (parsed.unit) item.unit = parsed.unit;
+    items.push(item);
+  }
+  return items;
+}
+
+/**
+ * Parse a short rendered count phrase into labeled numbers. The labels come
+ * only from the phrase's own noun or from the pattern's fixed words, never
+ * from surrounding text, so nothing but a number and a short noun leaves the
+ * page.
+ *
+ * Recognised, whole-text only:
+ *   `{n} {noun}`            -> {noun: n}                      ("31 people")
+ *   `Page {a} of {b}`       -> {page: a, pages: b}
+ *   `{a}-{b} of {n}`        -> {range_start, range_end, total} (also – — / "to",
+ *                              with an optional "Showing " prefix)
+ *   `Showing {a} of {n}`    -> {shown: a, total: n}
+ */
+export function parseProseCounts(
+  text: string,
+  lang: string | null = null,
+): UiNumItem[] | null {
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  if (!trimmed || trimmed.length > MAX_PROSE_TEXT_LENGTH) return null;
+
+  const page = PAGE_OF_RE.exec(trimmed);
+  if (page) {
+    return labeledNumbers(
+      [
+        ["page", page[1]],
+        ["pages", page[2]],
+      ],
+      lang,
+    );
+  }
+
+  const range = RANGE_DASH_OF_RE.exec(trimmed) ?? RANGE_TO_OF_RE.exec(trimmed);
+  if (range) {
+    return labeledNumbers(
+      [
+        ["range_start", range[1]],
+        ["range_end", range[2]],
+        ["total", range[3]],
+      ],
+      lang,
+    );
+  }
+
+  const showing = SHOWING_OF_RE.exec(trimmed);
+  if (showing) {
+    return labeledNumbers(
+      [
+        ["shown", showing[1]],
+        ["total", showing[2]],
+      ],
+      lang,
+    );
+  }
+
+  const count = COUNT_NOUN_RE.exec(trimmed);
+  if (count) {
+    const noun = count[2];
+    if (noun.split(" ").some((word) => PROSE_STOP_WORDS.has(word))) return null;
+    return labeledNumbers([[noun, count[1]]], lang);
+  }
+  return null;
+}
+
+/**
+ * Pager control state for a `button`/`a` whose accessible text is one of the
+ * pager words. The item is `{ label: "control:<text>", value: 1 | 0 }`, where 1
+ * means the control is actionable and 0 means it is disabled — a boolean, not
+ * a count, distinguished from every other item by the `control:` prefix.
+ * "Next is disabled on page one" is what separates a client that knows about
+ * page two from one that does not, and it is not a number anywhere on screen.
+ */
+export function parsePagerControl(el: Element): UiNumItem | null {
+  const tag = el.tagName;
+  if (tag !== "BUTTON" && tag !== "A") return null;
+  const text = (el.getAttribute("aria-label") ?? el.textContent ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!PAGER_CONTROL_TEXTS.has(text)) return null;
+  const disabled =
+    el.hasAttribute("disabled") ||
+    el.getAttribute("aria-disabled") === "true" ||
+    (el as HTMLButtonElement).disabled === true;
+  return { label: `${PAGER_CONTROL_LABEL_PREFIX}${text}`, value: disabled ? 0 : 1 };
+}
+
+/**
  * Scan visible text under `root` for labeled numeric tokens, grouped by
  * region. Pure DOM read — no mutation, no HTML capture.
  *
@@ -469,35 +648,53 @@ export function scanUiNumbers(
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
-    const renderedDay = parseRenderedIsoDay(el);
-    if (!isLeaf(el) && renderedDay === null) continue;
-    const parsed =
-      renderedDay === null
-        ? parseNumericToken(el.textContent ?? "", lang)
-        : { value: renderedDay, unit: "iso-day" };
-    if (!parsed) continue;
+    // Three shapes produce items, in order: a pager control's enabled state, a
+    // leaf that IS a numeric token, and a leaf that is a short count phrase
+    // ("31 people", "Page 1 of 1"). The last two are mutually exclusive.
+    let produced: UiNumItem[] | null = null;
+    const control = parsePagerControl(el);
+    if (control) {
+      produced = [control];
+    } else {
+      const renderedDay = parseRenderedIsoDay(el);
+      const leaf = isLeaf(el);
+      if (!leaf && renderedDay === null) continue;
+      const parsed =
+        renderedDay === null
+          ? parseNumericToken(el.textContent ?? "", lang)
+          : { value: renderedDay, unit: "iso-day" };
+      if (parsed) {
+        const label = resolveLabel(el);
+        if (!label) continue;
+        const item: UiNumItem = { label, value: parsed.value };
+        if (parsed.unit) item.unit = parsed.unit;
+        produced = [item];
+      } else if (leaf) {
+        produced = parseProseCounts(el.textContent ?? "", lang);
+      }
+    }
+    if (!produced || produced.length === 0) continue;
     if (isHiddenElement(el)) continue;
-    const label = resolveLabel(el);
-    if (!label) continue;
     // Deny/PII label or PAN-shaped value: drop the item entirely — never a
     // `[REDACTED]`-labeled value.
-    if (isDeniedLabel(label, denyFields)) continue;
-    if (isDeniedNumericValue(parsed.value)) continue;
+    const kept = produced.filter(
+      (item) =>
+        !isDeniedLabel(item.label, denyFields) &&
+        !isDeniedNumericValue(item.value),
+    );
+    if (kept.length === 0) continue;
 
     const region = regionIdentifier(regionContainer(el, root));
-    seenPerRegion.set(region, (seenPerRegion.get(region) ?? 0) + 1);
     let items = regions.get(region);
     if (!items) {
       items = [];
       regions.set(region, items);
     }
-    if (items.length >= UI_NUM_MAX_ITEMS) continue;
-    const item: UiNumItem = {
-      label,
-      value: parsed.value,
-    };
-    if (parsed.unit) item.unit = parsed.unit;
-    items.push(item);
+    for (const item of kept) {
+      seenPerRegion.set(region, (seenPerRegion.get(region) ?? 0) + 1);
+      if (items.length >= UI_NUM_MAX_ITEMS) continue;
+      items.push(item);
+    }
   }
 
   // Withhold every over-cap region before returning: what the caller receives

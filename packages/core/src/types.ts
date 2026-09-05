@@ -250,6 +250,33 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
  * Canonical event kind for a labeled on-screen numeric snapshot (`k:'ui.num'`).
  * Payload: `{ region, items: [{ label, value, unit? }] }` — labels and parsed
  * numbers only, never raw DOM/HTML.
+ *
+ * An item is one of two things, told apart by its label:
+ *
+ * 1. **A count.** `label` is the on-screen label or the noun of a rendered
+ *    count phrase, `value` the parsed number. Beyond a leaf whose entire text
+ *    is a numeric token, four whole-text phrase shapes are read, and their
+ *    labels are RESERVED — they mean exactly this and nothing else:
+ *      - `{n} {noun}` ("31 people")        -> `{ label: noun, value: n }`
+ *      - `Page {a} of {b}`                 -> `page` = a, `pages` = b
+ *      - `{a}-{b} of {n}` (also – — / "to",
+ *        with an optional "Showing" prefix) -> `range_start`, `range_end`, `total`
+ *      - `Showing {a} of {n}`              -> `shown` = a, `total` = n
+ *    The noun is one to three lowercase words; no label is ever taken from
+ *    surrounding prose, and a sentence that merely contains a number produces
+ *    nothing.
+ *
+ * 2. **A pager control's state.** `label` is `control:<text>` where `<text>` is
+ *    the control's lowercased accessible text, one of `previous`, `prev`,
+ *    `next`, `newer`, `older`, `first` or `last`. `value` is BOOLEAN, not a
+ *    count: `1` means the control is actionable, `0` means it is disabled
+ *    (the `disabled` attribute or `aria-disabled="true"`). A reader that sums
+ *    or compares these as quantities is misreading them; the `control:` prefix
+ *    is what marks the difference. `unit` is never set on a control item.
+ *
+ * A control item is emitted for every such control that is visible, whatever
+ * its state, so "no `control:next` item" means no pager control was on screen,
+ * never "Next was enabled".
  */
 export const UI_NUM_EVENT_KIND = "ui.num" as const;
 
