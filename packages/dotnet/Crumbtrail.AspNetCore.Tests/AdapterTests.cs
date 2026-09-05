@@ -23,6 +23,8 @@ public sealed class AdapterTests
         Assert.Equal(200, capture.Events.Count); Assert.Equal(50, capture.DroppedEvents);
         var wire = JsonSerializer.Serialize(capture.Events);
         Assert.Contains("hmac-sha256:", wire); Assert.DoesNotContain("private-key", wire); Assert.DoesNotContain("private-value", wire);
+        // A generic wrapper does not know which cache it observes.
+        Assert.Contains("\"driver\":\"unknown\"", wire);
     }
 
     [Fact]

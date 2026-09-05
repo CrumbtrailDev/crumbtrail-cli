@@ -4,7 +4,10 @@ using System.Text;
 
 namespace Crumbtrail;
 
-public sealed class CaptureCache(CaptureContext capture)
+// The wrapper observes whatever cache the application hands it, so the driver
+// name is the caller's to state. It defaults to "unknown" rather than claiming
+// Redis.
+public sealed class CaptureCache(CaptureContext capture, string driver = "unknown")
 {
     private static readonly byte[] HashKey = RandomNumberGenerator.GetBytes(32);
     public async Task<T> Observe<T>(string op, string key, Func<Task<T>> action, Func<T, bool>? hit = null, double? ttlMs = null)
@@ -25,7 +28,7 @@ public sealed class CaptureCache(CaptureContext capture)
         if (!capture.Active) return;
         try
         {
-            capture.Add("cache", new { driver = "redis", adapter = "manual", op = op is "get" or "set" or "delete" or "exists" or "expire" or "increment" ? op : "other",
+            capture.Add("cache", new { driver, adapter = "manual", op = op is "get" or "set" or "delete" or "exists" or "expire" or "increment" ? op : "other",
                 key = "hmac-sha256:" + Convert.ToHexString(HMACSHA256.HashData(HashKey, Encoding.UTF8.GetBytes(key))).ToLowerInvariant(),
                 requestId = capture.RequestId, outcome, hit, ttlMs = ttlMs is >= 0 && double.IsFinite(ttlMs.Value) ? ttlMs : null, errorName,
                 durationMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds });

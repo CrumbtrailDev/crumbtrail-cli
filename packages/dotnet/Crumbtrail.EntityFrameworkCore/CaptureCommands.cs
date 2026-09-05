@@ -32,9 +32,14 @@ public sealed class CaptureCommands(CaptureContext capture) : DbCommandIntercept
             }
             if (sql[i] == '$')
             {
-                var tag = Regex.Match(rest.ToString(), @"^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$");
-                if (tag.Success)
-                { var end = sql.IndexOf(tag.Value, i + tag.Length, StringComparison.Ordinal); if (end < 0) return "[statement omitted]"; i = end + tag.Length; output.Append('?'); continue; }
+                var tagLength = DollarTag(rest);
+                if (tagLength > 0)
+                {
+                    var tag = sql.Substring(i, tagLength);
+                    var end = sql.IndexOf(tag, i + tagLength, StringComparison.Ordinal);
+                    if (end < 0) return "[statement omitted]";
+                    i = end + tagLength; output.Append('?'); continue;
+                }
             }
             if (sql[i] == '\'')
             {
@@ -52,16 +57,88 @@ public sealed class CaptureCommands(CaptureContext capture) : DbCommandIntercept
             }
             if (char.IsAsciiDigit(sql[i]) || "@:$".Contains(sql[i]))
             {
-                var token = Regex.Match(rest.ToString(), @"^(?:[@:$][A-Za-z0-9_]+|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?[\d_]+)?)");
-                if (token.Success) { output.Append('?'); i += token.Length; continue; }
+                var tokenLength = Literal(rest);
+                if (tokenLength > 0) { output.Append('?'); i += tokenLength; continue; }
             }
             if (char.IsAsciiLetter(sql[i]) || sql[i] == '_')
-            { var word = Regex.Match(rest.ToString(), @"^[A-Za-z_][A-Za-z0-9_]*").Value; output.Append(word.ToLowerInvariant() is "true" or "false" or "null" ? "?" : word); i += word.Length; continue; }
+            {
+                var word = rest[..Identifier(rest)];
+                if (word.Equals("true", StringComparison.OrdinalIgnoreCase) || word.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+                    word.Equals("null", StringComparison.OrdinalIgnoreCase)) output.Append('?');
+                else output.Append(word);
+                i += word.Length; continue;
+            }
             if (char.IsWhiteSpace(sql[i]) || "(),.*=<>!+-/%:;[]|&?".Contains(sql[i])) { output.Append(sql[i++]); continue; }
             return "[statement omitted]";
         }
         var shape = Regex.Replace(output.ToString(), @"\s+", " ").Trim();
         return shape.Length <= 2048 ? shape : "[statement omitted]";
+    }
+
+    // Scanned over spans rather than matched with Regex: Shape runs on the
+    // request path, and a per-token Regex.Match on rest.ToString() copied the
+    // remainder of the statement for every token.
+    private static int Identifier(ReadOnlySpan<char> rest)
+    {
+        if (rest.Length == 0 || !(char.IsAsciiLetter(rest[0]) || rest[0] == '_')) return 0;
+        var length = 1;
+        while (length < rest.Length && (char.IsAsciiLetterOrDigit(rest[length]) || rest[length] == '_')) length++;
+        return length;
+    }
+
+    // $$ or $tag$, the PostgreSQL dollar quote opener.
+    private static int DollarTag(ReadOnlySpan<char> rest)
+    {
+        if (rest.Length < 2 || rest[0] != '$') return 0;
+        var length = 1 + Identifier(rest[1..]);
+        return length < rest.Length && rest[length] == '$' ? length + 1 : 0;
+    }
+
+    private static bool RadixDigit(char value, int radix) => radix switch
+    {
+        16 => char.IsAsciiHexDigit(value),
+        8 => value is >= '0' and <= '7',
+        _ => value is '0' or '1',
+    };
+
+    // A bind name (@p0, :p0, $1) or a numeric literal in any of the accepted bases.
+    private static int Literal(ReadOnlySpan<char> rest)
+    {
+        if (rest.Length == 0) return 0;
+        if (rest[0] is '@' or ':' or '$')
+        {
+            var bind = 1;
+            while (bind < rest.Length && (char.IsAsciiLetterOrDigit(rest[bind]) || rest[bind] == '_')) bind++;
+            return bind > 1 ? bind : 0;
+        }
+        if (!char.IsAsciiDigit(rest[0])) return 0;
+        if (rest.Length > 2 && rest[0] == '0')
+        {
+            var radix = rest[1] switch { 'x' or 'X' => 16, 'o' or 'O' => 8, 'b' or 'B' => 2, _ => 0 };
+            if (radix > 0)
+            {
+                var based = 2;
+                while (based < rest.Length && (rest[based] == '_' || RadixDigit(rest[based], radix))) based++;
+                if (based > 2) return based;
+            }
+        }
+        var length = 1;
+        while (length < rest.Length && (char.IsAsciiDigit(rest[length]) || rest[length] == '_')) length++;
+        if (length < rest.Length && rest[length] == '.')
+        {
+            var fraction = length + 1;
+            while (fraction < rest.Length && (char.IsAsciiDigit(rest[fraction]) || rest[fraction] == '_')) fraction++;
+            if (fraction > length + 1) length = fraction;
+        }
+        if (length < rest.Length && rest[length] is 'e' or 'E')
+        {
+            var exponent = length + 1;
+            if (exponent < rest.Length && rest[exponent] is '+' or '-') exponent++;
+            var digits = exponent;
+            while (digits < rest.Length && (char.IsAsciiDigit(rest[digits]) || rest[digits] == '_')) digits++;
+            if (digits > exponent) length = digits;
+        }
+        return length;
     }
 
     private void Record(DbCommand command, CommandEndEventData data, int? rows = null, Exception? error = null)

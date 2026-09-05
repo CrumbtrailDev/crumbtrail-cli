@@ -88,7 +88,8 @@ builder.Services.AddDbContext<AppDbContext>((services, options) =>
     options.UseNpgsql(connectionString).AddCrumbtrail(services));
 ```
 
-The adapter resolves the same scoped `CaptureContext` as HTTP capture. It emits
+The adapter resolves the same scoped `CaptureContext` as HTTP capture, and
+registers one itself when an application uses EF capture without it. It emits
 query shape, duration, affected row count when available, and SQLSTATE error
 category. SQL parameter values and database error messages are withheld. SQL
 containing backslashes is omitted because PostgreSQL session settings change
@@ -97,7 +98,8 @@ how string escapes are interpreted.
 Tracked `SaveChanges` operations emit redacted before and after images only
 after a successful save or an observed explicit transaction commit. Bulk SQL
 and `ExecuteUpdate` provide command evidence without row images. Explicit
-rollback discards pending images. Savepoint rollback discards uncertain images
+rollback discards pending images. A transaction disposed without a commit
+releases its images. Savepoint rollback discards uncertain images
 and emits a capture gap. Ambient `TransactionScope` and explicitly enlisted transaction row images are unsupported
 and emit a capture gap. Transactions committed outside EF interception cannot
 produce confirmed row images. Scoped disposal releases pending snapshots.
@@ -125,7 +127,8 @@ random process key, so repeated keys can correlate within that process but
 not across processes or restarts. Operation names are limited to `get`, `set`,
 `delete`, `exists`, `expire` and `increment`. Other names become `other`.
 Optional `ttlMs` accepts finite nonnegative milliseconds. No cache client is
-patched automatically.
+patched automatically. The recorded `driver` reads `unknown` unless the
+application names its cache: `new CaptureCache(capture, "redis")`.
 
 ## Observe background jobs
 
