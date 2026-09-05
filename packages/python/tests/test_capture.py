@@ -32,7 +32,9 @@ def capture():
 @pytest.mark.parametrize("raw,state", [
     (b'', 'missing'), (b'{', 'invalid'), (b'{"amount":18.75,"currency":"CAD"}', 'captured'),
     (b'{"password":"secret","amount":18.75}', 'redacted'),
-    (b'{"amount":1,"amount":2}', 'invalid'), (b'{"bad.key":1}', 'invalid'),
+    (b'{"amount":1,"amount":2}', 'invalid'), (b'{"bad key":1}', 'invalid'),
+    (b'{"user-id":1,"api.version":2}', 'captured'),
+    (b'{"lat":43.6532,"lng":-79.3832}', 'redacted'), (b'{"latency":12,"platform":"web"}', 'captured'),
     (b'{"value":NaN}', 'invalid'), (b'[' * 1000, 'invalid'),
     (b'x' * 16385, 'truncated'), (json.dumps([1] * 41).encode(), 'invalid'),
     (b'{"accountNumber":1234}', 'redacted'), (b'{"value":4111111111111111}', 'redacted'), (b'{"value":4111111111111111.0}', 'redacted'),

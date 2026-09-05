@@ -1,7 +1,10 @@
 """Query metadata without SQL text, parameters, result rows or exception messages."""
+import logging
 import re
 import time
 from .core import current_capture, now
+
+log = logging.getLogger("crumbtrail")
 
 
 def _record(capture, sql, engine, start, rows=None, error=None):
@@ -19,7 +22,7 @@ def _record(capture, sql, engine, start, rows=None, error=None):
             payload.update(code=None, category="unknown", errorName=type(error).__name__)
         capture.add("db.error" if error else "db.statement", payload)
     except Exception:
-        pass
+        log.debug("Crumbtrail: could not record a database statement", exc_info=True)
 
 
 def instrument_sqlalchemy(engine):

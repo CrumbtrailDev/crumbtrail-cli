@@ -1,5 +1,9 @@
 """Transparent stream tees: capture never pre-reads or consumes application input."""
+import logging
+
 from .core import current_capture
+
+log = logging.getLogger("crumbtrail")
 
 
 class _Input:
@@ -70,6 +74,7 @@ class WSGIMiddleware:
                 value = self.route(environ)
                 return value if isinstance(value, str) and len(value) <= 2048 else "/"
             except Exception:
+                log.debug("Crumbtrail: route resolution raised, reporting /", exc_info=True)
                 return "/"
 
         original_input = environ["wsgi.input"]
@@ -78,13 +83,19 @@ class WSGIMiddleware:
 
         def wrapped_start(status, headers, exc_info=None):
             write = start_response(status, headers, exc_info)
-            capture.status = int(status.split(" ", 1)[0])
-            capture.response_headers(headers)
+            try:
+                capture.status = int(str(status).split(" ", 1)[0])
+                capture.response_headers(headers)
+            except Exception:
+                log.debug("Crumbtrail: could not read the response status line or headers", exc_info=True)
 
             def wrapped_write(chunk):
                 result = write(chunk)
                 capture.response_started = True
-                capture.keep_response(chunk)
+                try:
+                    capture.keep_response(chunk)
+                except Exception:
+                    log.debug("Crumbtrail: could not retain a written response chunk", exc_info=True)
                 return result
             return wrapped_write
 
@@ -115,9 +126,12 @@ class WSGIMiddleware:
                     if self.iterator is None:
                         self.iterator = iter(iterable)
                     chunk = next(self.iterator)
-                    capture.keep_response(chunk)
                     if chunk:
                         capture.response_started = True
+                    try:
+                        capture.keep_response(chunk)
+                    except Exception:
+                        log.debug("Crumbtrail: could not retain a yielded response chunk", exc_info=True)
                     return chunk
                 except StopIteration:
                     capture.response_complete = True

@@ -32,7 +32,7 @@ def test_retries_registration_race_and_drains():
     def open(request, timeout):
         requests.append(request)
         if len(requests) < 3:
-            raise urllib.error.HTTPError(request.full_url, 404, 'Not found', {}, io.BytesIO())
+            raise urllib.error.HTTPError(request.full_url, 503, 'Unavailable', {}, io.BytesIO())
         return Response()
     sender._http.open = open
     with patch('crumbtrail.core.time.sleep'):
