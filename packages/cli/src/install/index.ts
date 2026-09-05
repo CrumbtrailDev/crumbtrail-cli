@@ -377,21 +377,23 @@ export function buildAgentPrompt(
       `Register builder.Services.AddCrumbtrail(CaptureOptions.FromEnvironment(${JSON.stringify(serviceName)}) with { ShouldCapture = ... });`,
       "Add using Crumbtrail. Select eligible routes from this application's code and exclude authentication routes.",
       "Register app.UseCrumbtrail() after routing and before endpoints execute.",
-      "For EF9, restore Crumbtrail.EntityFrameworkCore 0.1.0 from the same verified package source.",
-      "Register AddCrumbtrailEntityFramework(), then AddCrumbtrail(services) on the existing DbContextOptionsBuilder after UseNpgsql or the actual provider.",
-      "Use the maintained CaptureCache.Observe and CaptureJob.RunAsync helpers for existing cache operations and jobs. Keep tenant authorization and job identity decisions in the application.",
-      "Read packages/dotnet/README.md in the SDK repository for adapter registration and transaction limits.",
       "Keep existing OpenTelemetry exporters. They do not supply native JSON request evidence.",
       "Verify build, unchanged application bytes, skipped auth routes, and correlated backend.req.start and backend.req.end events.",
       "If the package cannot restore or eligible routes cannot be established, report the missing step and stop.",
     ].join("\n");
   }
 
-  const nativeSetup = nativeCaptureSetup(stack, endpoint, serviceName);
+  const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
+
+  // Null for every stack today: no native backend package is published, so the
+  // OTLP prompt below stays the one this wizard hands out. See native-owned.ts.
+  const nativeSetup = nativeCaptureSetup(stack, endpoint, serviceName, {
+    keyEnv: otlpKeyEnv,
+    hasExplicitServiceName,
+  });
   if (nativeSetup) return nativeSetup;
 
   if (kind === "otlp") {
-    const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
     return [
       "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
       "do not refactor or touch anything else, then verify the build still passes.",

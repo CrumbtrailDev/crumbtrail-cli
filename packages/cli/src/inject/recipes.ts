@@ -2531,25 +2531,20 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
     },
   );
   const nativeGuidePath = path.join(input.cwd, "CRUMBTRAIL_NATIVE_SETUP.md");
-  const nativeGuide = nativeCaptureSetup(stack!, endpoint, serviceName);
+  // Null for every stack today: no native backend package is published. See
+  // native-owned.ts. The guide rides along with the tracing edits when it exists
+  // at all, and never on its own: a fully wired project must still report
+  // "already set up" rather than recreating a file the reader deleted.
+  const nativeGuide = nativeCaptureSetup(stack!, endpoint, serviceName, {
+    keyEnv: "CRUMBTRAIL_KEY",
+    hasExplicitServiceName: true,
+  });
   const existingNativeGuide = io.readFile(nativeGuidePath);
   if (
     processes > 0 &&
     configured === processes &&
     dependencyEdit.content === requirements
   ) {
-    if (nativeGuide && existingNativeGuide == null) {
-      return {
-        recipe: input.recipe,
-        kind: "create",
-        targetPath: nativeGuidePath,
-        content: `# Configure native backend evidence\n\n${nativeGuide}\n`,
-        keyEnvVar: "CRUMBTRAIL_KEY",
-        warnings: [
-          "Tracing is configured. Native evidence requires separate package registration.",
-        ],
-      };
-    }
     const plan = skipPlan(input);
     plan.keyEnvVar = "CRUMBTRAIL_KEY";
     return plan;
@@ -2594,7 +2589,11 @@ function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
     warnings: [
       "Crumbtrail will add Python OpenTelemetry dependencies and wrap the Procfile web and worker commands with zero code instrumentation.",
       "Python automatic instrumentation currently exports traces. Metrics and logs remain off.",
-      "JSON body and database evidence require the maintained native package. Follow CRUMBTRAIL_NATIVE_SETUP.md or the package README. Trace delivery does not verify native capture.",
+      ...(nativeGuide && existingNativeGuide == null
+        ? [
+            "JSON body and database evidence require the maintained native package. Follow CRUMBTRAIL_NATIVE_SETUP.md or the package README. Trace delivery does not verify native capture.",
+          ]
+        : []),
     ],
   };
 }

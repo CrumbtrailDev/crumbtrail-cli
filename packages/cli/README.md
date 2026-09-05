@@ -487,16 +487,18 @@ For local package verification, append `--source /path/to/local/nuget`.
 
 ### Native backend evidence
 
-Python, Rails and Go setup guidance selects maintained native packages and
-requires a released artifact or an explicitly configured local package source.
-The generated guide preserves OpenTelemetry configuration and separately
-explains native route selection, correlation, registration and shutdown.
-Python Procfile setup adds `CRUMBTRAIL_NATIVE_SETUP.md` when that file is absent.
-An existing instructions file is never replaced. Automatic tracing does not
-install or verify native body capture.
+Python, Rails and Go have no native package the CLI can install today. Nothing
+is published to PyPI, RubyGems or the Go module proxy, so those stacks get the
+OpenTelemetry guidance, which configures trace export and neither installs nor
+verifies JSON body capture or database evidence.
 
-The .NET guide additionally names the maintained EF, cache and job adapters.
-Native query metadata for Python, Ruby and Go omits SQL text, parameters, rows
-and transaction diffs. Package documentation lists the supported framework and
-database paths. Native package publication and a CLI release are required before
-these source changes are available through the published installer.
+The registration guidance for those packages is written but gated off in
+`src/native-owned.ts` until each artifact is published. When it turns on, the
+generated guide preserves existing OpenTelemetry configuration and separately
+explains route selection, correlation, registration and shutdown; Python
+Procfile setup adds `CRUMBTRAIL_NATIVE_SETUP.md` alongside the tracing edits when
+that file is absent, and never replaces an existing one.
+
+.NET is the exception: `Crumbtrail.AspNetCore` lives in this repository and its
+guidance covers ASP.NET Core HTTP request and response evidence. It still needs
+NuGet publication and a CLI release before a customer can restore it.

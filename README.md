@@ -35,12 +35,12 @@ single home on its own platform's registry. Three of them are built and tested
 here but not released yet, so the status column is the one to read first: the
 setup wizard will not wire an app against a package it cannot resolve.
 
-| SDK                                                   | Registry                                                                                   | Status                |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
-| [`Crumbtrail` (Swift)](packages/swift)                | Swift Package Manager. Native iOS, macOS and tvOS. No dependencies.                        | Not published yet     |
-| [`tauri-plugin-crumbtrail`](packages/tauri/rust)      | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published             |
-| [`ai.crumbtrail:crumbtrail-kotlin`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet     |
-| [`crumbtrail_flutter`](packages/flutter)              | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet     |
+| SDK                                                  | Registry                                                                                   | Status            |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------- |
+| [`Crumbtrail` (Swift)](packages/swift)               | Swift Package Manager. Native iOS, macOS and tvOS. No dependencies.                        | Not published yet |
+| [`tauri-plugin-crumbtrail`](packages/tauri/rust)     | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published         |
+| [`ai.crumbtrail:crumbtrail-kotlin`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet |
+| [`crumbtrail_flutter`](packages/flutter)             | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet |
 
 ## Quick start
 
@@ -262,21 +262,17 @@ publication before customers can restore it from the public feed.
 
 ### Maintained native adapters
 
-Native backend packages own request capture and event delivery. Register them
-on eligible application routes instead of copying capture implementations:
+One native backend package exists here today:
 
-| Package | Registration and evidence |
-| --- | --- |
-| [.NET](packages/dotnet) | ASP.NET Core HTTP, EF9 changes, cache observation and job lifecycle |
-| [Python](packages/python) | WSGI, ASGI, Flask, Django WSGI and SQLAlchemy query metadata |
-| [Ruby](packages/ruby) | Rack, Rails and ActiveRecord query metadata |
-| [Go](packages/go) | `net/http` and `database/sql` context methods |
-| [Kotlin](packages/kotlin) | Maintained OkHttp application interceptor |
-| [Flutter](packages/flutter) | Maintained `http` wrapper and Dio interceptor |
+| Package                 | Registration and evidence                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------------------------- |
+| [.NET](packages/dotnet) | ASP.NET Core HTTP request and response evidence, with redaction and delivery owned by the package |
 
-These source integrations require their native package release or a verified
-local package source. The CLI emits registration guidance that tells the setup agent to stop when
-the package source or eligible routes cannot be established. Python automatic
-OpenTelemetry setup remains tracing only. Python, Ruby and Go database adapters
-omit SQL text, bind values, result rows and transaction diffs. Mobile adapters
-record network metadata and leave bodies and correlation headers untouched.
+Register it on eligible application routes instead of copying its capture
+implementation into the application. It is built and tested here but not on
+NuGet yet, so the setup wizard does not wire an app against it.
+
+Python, Ruby and Go native packages are in development on their own branches and
+are not part of this repository yet. Until each one is published, the CLI sends
+those stacks down the OpenTelemetry path, which sends traces only: it does not
+install or verify JSON body capture or database evidence.

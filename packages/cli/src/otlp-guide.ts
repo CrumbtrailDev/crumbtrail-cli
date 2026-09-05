@@ -37,7 +37,21 @@ export interface OtlpGuideInput {
    * the exact string to replace.
    */
   keyPlaceholder?: string;
+  /**
+   * Environment variable the surrounding plan uses for the ingest key, so a
+   * native block in this guide names the same one as the files written beside
+   * it. Defaults to the native package's own variable.
+   */
+  keyEnv?: string;
+  /**
+   * True when `agentPrompt` already is the native setup block, so it is not
+   * printed a second time under its own heading.
+   */
+  agentPromptIsNativeSetup?: boolean;
 }
+
+/** The stand-in `buildAgentPrompt` uses when no service name was resolved. */
+const APP_NAME_PLACEHOLDER = "<your-app-name>";
 
 export function renderOtlpGuide(input: OtlpGuideInput): string {
   // The guide used to open with "this service is already provisioned and has
@@ -51,11 +65,22 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
   const mint = input.mintUrl
     ? `Mint one at ${input.mintUrl} and paste it in.`
     : "Mint one on the Setup page of your Crumbtrail dashboard and paste it in.";
+  // Null for every stack today: no native backend package is published, so this
+  // guide keeps its OTLP shape. See native-owned.ts.
   const nativeSetup = nativeCaptureSetup(
     input.stack,
     input.endpoint,
     input.serviceName,
+    {
+      ...(input.keyEnv ? { keyEnv: input.keyEnv } : {}),
+      hasExplicitServiceName: input.serviceName !== APP_NAME_PLACEHOLDER,
+    },
   );
+  // The agent prompt is the native block whenever buildAgentPrompt produced one,
+  // so printing both would repeat it. The caller says which it passed rather
+  // than the two being compared as strings: a caller that resolves a service
+  // name the plan was built without would defeat that comparison silently.
+  const promptIsNativeSetup = input.agentPromptIsNativeSetup ?? false;
   return [
     `# Crumbtrail: ${input.serviceName}`,
     "",
@@ -110,20 +135,16 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
           "app.UseCrumbtrail();",
           "```",
           "Replace the example route with eligible application routes. Exclude authentication routes.",
-          "Set CRUMBTRAIL_ENDPOINT to the capture HTTPS origin and CRUMBTRAIL_INGEST_KEY to the project key.",
+          "Set CRUMBTRAIL_ENDPOINT to the capture origin and CRUMBTRAIL_INGEST_KEY to the project key.",
           "No routes are captured by default. Missing correlation headers means no capture.",
           "The package handles bounded buffering, redaction, response capture and queued delivery.",
           "Verify backend.req.start and backend.req.end in a browser session, including safe JSON values.",
           "Oversized bodies are omitted. Unsupported values are withheld by a conservative profile.",
-          "For EF9 install Crumbtrail.EntityFrameworkCore 0.1.0 from the verified NuGet source.",
-          "Register AddCrumbtrailEntityFramework and add AddCrumbtrail(services) to the existing provider configuration.",
-          "CaptureCache.Observe and CaptureJob.RunAsync own cache and job events. Keep application tenant authorization and identity decisions local.",
-          "Read the SDK packages/dotnet/README.md for registration and transaction limitations.",
           "Update the package to update capture behavior. Do not copy middleware or redaction source.",
           "",
         ]
       : []),
-    ...(nativeSetup && nativeSetup !== input.agentPrompt
+    ...(nativeSetup && !promptIsNativeSetup
       ? ["## Maintained native capture setup", "", nativeSetup, ""]
       : []),
     "## Keep the key out of git",
