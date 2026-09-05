@@ -8,9 +8,10 @@ import type { Stack } from "crumbtrail-core";
  * README's "Other registries" section, is that it will not wire an app against a
  * package it cannot resolve. `crumbtrail-python` is on PyPI and the `crumbtrail`
  * gem is on RubyGems, and the Go module is tagged `packages/go/v0.1.0`, so every
- * stack in this table now carries native guidance. Nothing is gated today, which
- * makes the OTLP prompt in `install/index.ts` unreached; it is kept and tested
- * directly as the answer for the next stack added before its package ships.
+ * stack in this table now carries native guidance. There is no OTLP agent prompt
+ * to fall back to any more: a stack listed in `OTLP_STACKS` with no published
+ * entry here makes `buildAgentPrompt` throw rather than hand a reader a package
+ * for the wrong runtime.
  *
  * Flip an entry to `true` in the same change that publishes its artifact, and
  * check the registration lines against the package source at the same time.
@@ -104,8 +105,8 @@ const DEFAULT_KEY_ENV = "CRUMBTRAIL_KEY";
 /**
  * Registration guidance for a stack whose native package is published.
  *
- * Returns `null` for every stack today, which is what keeps the OTLP path alive
- * in every caller. See `NativePackage.published`.
+ * Returns `null` for a stack with no entry, or one whose artifact is not
+ * published yet. See `NativePackage.published`.
  */
 export function nativeCaptureSetup(
   stack: Stack,
