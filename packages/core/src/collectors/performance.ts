@@ -36,11 +36,72 @@ interface EntryTypeConfig {
   extract: (entry: any) => Record<string, unknown>;
 }
 
-const ENTRY_TYPES: EntryTypeConfig[] = [
+/**
+ * The origin the SDK's own transport calls, derived from the configured
+ * `httpEndpoint` the same way every transport request is built (see
+ * `packages/core/src/transports/http.ts` and `collectors/network.ts`'s
+ * `shouldExclude`). Every self-call — `/api/events`, `/api/capture-config`,
+ * `/api/session/start`, `/api/blob/*` — goes to this one origin, so one
+ * comparison covers all of them.
+ *
+ * Returns `undefined` for an unset or malformed endpoint so an unconfigured
+ * SDK (nothing to compare against) drops nothing, rather than reading every
+ * resource entry as "no origin, matches everything".
+ */
+function getOwnEndpointOrigin(config: CrumbtrailConfig): string | undefined {
+  const endpoint = config.httpEndpoint?.trim();
+  if (!endpoint) return undefined;
+  try {
+    const base =
+      typeof globalThis.location?.href === "string"
+        ? globalThis.location.href
+        : undefined;
+    return new URL(endpoint, base).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a `resource` entry's URL is the SDK's own upload endpoint.
+ *
+ * Compares full origin, not a substring or a path, so an application request
+ * that happens to share a path name (`/api/events` on the customer's own
+ * backend, say) is never mistaken for the SDK watching itself. A relative,
+ * empty, or unparseable `entry.name` never throws — it just fails to match,
+ * so it is kept.
+ */
+function isOwnEndpointResource(
+  entry: any,
+  ownOrigin: string | undefined,
+): boolean {
+  if (!ownOrigin) return false;
+  const name = entry?.name;
+  if (typeof name !== "string" || name === "") return false;
+  try {
+    const base =
+      typeof globalThis.location?.href === "string"
+        ? globalThis.location.href
+        : undefined;
+    return new URL(name, base).origin === ownOrigin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Built per collector instance rather than once at module scope, because the
+ * `resource` entry's `accepts` filter needs the caller's `httpEndpoint` — the
+ * one piece of per-session config this table otherwise has no reason to know
+ * about.
+ */
+function buildEntryTypes(ownOrigin: string | undefined): EntryTypeConfig[] {
+  return [
   {
     type: "resource",
     metric: "res",
     budget: "bulk",
+    accepts: (entry) => !isOwnEndpointResource(entry, ownOrigin),
     extract: (entry) => {
       const name = redactUrl(String(entry.name ?? ""), "name");
       const data: Record<string, unknown> = {
@@ -117,7 +178,8 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
     accepts: (entry) => entry.name === "first-contentful-paint",
     extract: (entry) => ({ value: entry.startTime }),
   },
-];
+  ];
+}
 
 /**
  * Per-session ceiling on the bulk `perf` events — `resource` and `longtask`.
@@ -278,11 +340,13 @@ const PERF_BUDGETS: Record<PerfBudgetName, PerfBudget> = {
 
 export function performanceCollector(
   bus: EventBus,
-  _config: CrumbtrailConfig,
+  config: CrumbtrailConfig,
 ): CollectorCleanup {
   if (typeof globalThis.PerformanceObserver === "undefined") {
     return () => {};
   }
+
+  const entryTypes = buildEntryTypes(getOwnEndpointOrigin(config));
 
   const observers: PerformanceObserver[] = [];
   /**
@@ -586,7 +650,7 @@ export function performanceCollector(
   doc?.addEventListener("keydown", freezeLcp, true);
   doc?.addEventListener("pointerdown", freezeLcp, true);
 
-  for (const cfg of ENTRY_TYPES) {
+  for (const cfg of entryTypes) {
     const record = recorders[cfg.type];
     try {
       const observer = new PerformanceObserver((list) => {
