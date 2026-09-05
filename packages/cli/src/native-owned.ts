@@ -7,10 +7,10 @@ import type { Stack } from "crumbtrail-core";
  * lookup table. The setup wizard's standing invariant, stated in the root
  * README's "Other registries" section, is that it will not wire an app against a
  * package it cannot resolve. `crumbtrail-python` is on PyPI and the `crumbtrail`
- * gem is on RubyGems, so the Python and Ruby stacks now carry native guidance.
- * The Go module has no tagged version, so `go get` resolves it only at a commit
- * pseudo-version; it stays gated and falls back to the OTLP guidance, which
- * works today.
+ * gem is on RubyGems, and the Go module is tagged `packages/go/v0.1.0`, so every
+ * stack in this table now carries native guidance. Nothing is gated today, which
+ * makes the OTLP prompt in `install/index.ts` unreached; it is kept and tested
+ * directly as the answer for the next stack added before its package ships.
  *
  * Flip an entry to `true` in the same change that publishes its artifact, and
  * check the registration lines against the package source at the same time.
@@ -71,9 +71,9 @@ export const NATIVE_PACKAGES: Partial<Record<Stack, NativePackage>> = {
     ],
   },
   go: {
-    package: "github.com/CrumbtrailDev/crumbtrail-cli/packages/go",
+    package: "github.com/CrumbtrailDev/crumbtrail-cli/packages/go v0.1.0",
     docs: "go",
-    published: false,
+    published: true,
     registration: [
       "Read the package README and wrap the net/http handler with crumbtrail.Middleware(options).",
       "Use crumbtrail.WrapDB(db, engine) for database/sql observation, with the actual driver name, and call the returned type's context methods.",

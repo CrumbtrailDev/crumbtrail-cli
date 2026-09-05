@@ -10,11 +10,15 @@ import {
 import { fakeInjectIO } from "./helpers";
 
 const keys = { endpoint: "https://capture.example", apiKey: "bl_live_secret" };
-// crumbtrail-python is on PyPI and the crumbtrail gem is on RubyGems, so these
-// stacks carry native guidance. The Go module has no tagged version, so it stays
-// on the OTLP path.
-const PUBLISHED_STACKS = ["django", "flask", "fastapi", "rails"] as const;
-const GATED_STACKS = ["go"] as const;
+// Every native package resolves from its registry now: crumbtrail-python on
+// PyPI, the crumbtrail gem on RubyGems, and the Go module at packages/go/v0.1.0.
+const PUBLISHED_STACKS = [
+  "django",
+  "flask",
+  "fastapi",
+  "rails",
+  "go",
+] as const;
 
 describe("owned native setup", () => {
   // The gate, not the copy. A stack may only be wired against an artifact that
@@ -27,12 +31,10 @@ describe("owned native setup", () => {
         stack,
       ).not.toBe(null);
     }
-    for (const stack of GATED_STACKS) {
-      expect(NATIVE_PACKAGES[stack]!.published, stack).toBe(false);
-      expect(nativeCaptureSetup(stack, keys.endpoint, "orders"), stack).toBe(
-        null,
-      );
-    }
+    // Nothing is gated today, so the gate is proven on its other arm: a stack
+    // with no entry gets no native guidance, which is what keeps the OTLP
+    // prompt the answer for a stack added before its artifact ships.
+    expect(nativeCaptureSetup("node", keys.endpoint, "orders")).toBe(null);
   });
 
   for (const stack of PUBLISHED_STACKS) {
@@ -61,25 +63,6 @@ describe("owned native setup", () => {
     });
   }
 
-  for (const stack of GATED_STACKS) {
-    it(`keeps ${stack} on the OTLP path while its package is unpublished`, () => {
-      const prompt = buildAgentPrompt(stack, keys, { serviceName: "orders" });
-      expect(prompt).toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
-      expect(prompt).not.toContain(NATIVE_PACKAGES[stack]!.package);
-      expect(prompt).not.toContain(keys.apiKey);
-
-      const guide = renderOtlpGuide({
-        stack,
-        serviceName: "orders",
-        endpoint: keys.endpoint,
-        snippet: "existing OTLP",
-        agentPrompt: prompt,
-      });
-      expect(guide).toContain("existing OTLP");
-      expect(guide).toContain(prompt);
-      expect(guide).not.toContain("Maintained native capture setup");
-    });
-  }
 
   // The body is checked directly so the gate above does not have to be defeated
   // to prove the guidance is right when it eventually ships.
