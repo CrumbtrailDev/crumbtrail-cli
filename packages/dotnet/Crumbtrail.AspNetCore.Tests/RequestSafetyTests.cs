@@ -76,6 +76,28 @@ public sealed class RequestSafetyTests
             .InvokeAsync(context, new(), Options with { ShouldCapture = _ => throw new Exception("private") }, sink, NullLogger<CaptureMiddleware>.Instance);
         Assert.True(reached); Assert.Empty(sink.Events);
     }
+    [Fact]
+    public async Task Capture_gap_precedes_the_terminal_event_it_describes()
+    {
+        var context = Context(); var sink = new Sink();
+        await new CaptureMiddleware(http =>
+        {
+            var capture = (CaptureContext)http.Items["capture"]!;
+            for (var i = 0; i < 250; i++) capture.Add("cache", new { requestId = capture.RequestId });
+            return Task.CompletedTask;
+        }).InvokeAsync(context, Tracked(context), Options, sink, NullLogger<CaptureMiddleware>.Instance);
+        var kinds = sink.Events.Select(e => e.k).ToArray();
+        Assert.Equal("backend.req.end", kinds[^1]);
+        var gap = Assert.Single(sink.Events, e => e.k == "capture_gap");
+        Assert.True(Array.IndexOf(kinds, "capture_gap") < kinds.Length - 1);
+        var data = JsonSerializer.SerializeToElement(gap.d);
+        Assert.Equal(51, data.GetProperty("droppedEventCount").GetInt32());
+    }
+    private static CaptureContext Tracked(HttpContext context)
+    {
+        var capture = new CaptureContext(); context.Items["capture"] = capture; return capture;
+    }
+
     private sealed class StartedResponse : IHttpResponseFeature
     {
         public int StatusCode { get; set; } = 202;
