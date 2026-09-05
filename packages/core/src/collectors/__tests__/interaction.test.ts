@@ -785,21 +785,43 @@ describe("interaction target accessible name", () => {
     expect(elOf(inp)?.label).toBe("Preferred contact time");
   });
 
-  it("redacts the fix plan's own example placeholder, because 'email' names a PII-shaped field", () => {
+  it("ships the fix plan's own example placeholder in full", () => {
     // "Search name, email or employee number" is the literal placeholder text
     // from the dogfood target app that motivated this feature (F4 in the fix
-    // plan). It still redacts: the word "email" matches the same
-    // deny-name/PII pattern a field named `email` would, and the classifier
-    // cannot tell "this text names an email field" from "this text ships an
-    // email value" — the same accepted-residual-risk tradeoff `ui-numbers.ts`
-    // makes for `isDeniedLabel`. The benign-placeholder case above proves
-    // ordinary caption capture still works when no such word is present.
+    // plan). The classifier's name-based deny check now runs against the
+    // element's own `name`/`id` (there is none here), not the caption text,
+    // so an ordinary word like "email" appearing INSIDE a caption no longer
+    // gets treated as if the element were itself a field named `email` — a
+    // caption is prose, not a field name. `redaction.denyFields` still
+    // reaches caption content, via an explicit word match: see the
+    // "denyFields" case below.
     cleanup = interactionCollector(bus, DEFAULT_CONFIG);
     bus.flush();
     events.length = 0;
 
     document.body.innerHTML =
       '<input placeholder="Search name, email or employee number">';
+    const input = document.querySelector("input")!;
+    input.value = "Sofia";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inp = events.find((e) => e.k === "inp");
+    expect(elOf(inp)?.label).toBe(
+      "Search name, email or employee number",
+    );
+  });
+
+  it("still redacts a caption naming a PII-shaped field when the element itself is named that way", () => {
+    // The element's OWN identifier (name/id), not the caption, is what feeds
+    // the classifier's built-in sensitive-name check now. An element that is
+    // actually named `email` still redacts its caption.
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+
+    document.body.innerHTML =
+      '<input name="email" placeholder="Search name, email or employee number">';
     const input = document.querySelector("input")!;
     input.value = "Sofia";
     input.dispatchEvent(new Event("input", { bubbles: true }));

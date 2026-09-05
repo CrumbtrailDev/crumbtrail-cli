@@ -27,6 +27,42 @@ import {
 import { subscribeNavCommit } from "../nav-signal";
 
 /**
+ * The element's own identifier — `name`, else `id` — used as `keyName` for
+ * the structured classifier. NOT the caption text: a caption is prose
+ * ("Search name, email or employee number"), not a field name, and passing
+ * it as its own keyName made an ordinary word inside the sentence ("email")
+ * trip the same name-based deny check a field actually NAMED `email` would,
+ * redacting captions that are not themselves sensitive. A `label[for=]`
+ * association resolves to the target's own `id` (that is what `for` means),
+ * so there is no separate "label's for" value to fall back to beyond it.
+ */
+function accessibleNameKey(target: Element): string | undefined {
+  const named = target as Partial<{ name: string }>;
+  if (typeof named.name === "string" && named.name !== "") return named.name;
+  if (target.id) return target.id;
+  return undefined;
+}
+
+/**
+ * Exact-word match of the caption's own words against `redaction.denyFields`
+ * — deliberately narrower than the classifier's built-in sensitive-name
+ * patterns (which now run against the element's identifier, not the
+ * caption): this is the explicit, opt-in list only. Lets `denyFields:
+ * ["patient"]` still suppress "Patient Sofia Ramirez" even though nothing
+ * about the button's `name`/`id` says "patient".
+ */
+function captionMatchesDenyField(
+  caption: string,
+  denyFields: string[] | undefined,
+): boolean {
+  if (!denyFields || denyFields.length === 0) return false;
+  const denySet = new Set(denyFields.map((field) => field.trim().toLowerCase()).filter(Boolean));
+  if (denySet.size === 0) return false;
+  const words = caption.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return words.some((word) => denySet.has(word));
+}
+
+/**
  * Runs an accessible name through the redaction the mobile lane already
  * applies to free text (`redactMobileText`'s `redactNetworkTextBody` call,
  * `contentType: "text/plain"`) before the structured classifier gets it.
@@ -37,15 +73,16 @@ import { subscribeNavCommit } from "../nav-signal";
  * but with `ui-numbers.ts`'s free-text carve-out, because the classifier's
  * `free_text_value` catch-all was tuned for network body VALUES, where any
  * multi-word string is suspect, and a label is a short, visible-by-design
- * string ("Preferred contact time") where free text is normal. `keyName` is
- * the label text itself, exactly as `ui-numbers.ts`
- * passes it, so `redaction.denyFields` can match words inside the caption
- * ("patient" denies "Patient Sofia Ramirez") the same way it matches a field
- * name — and, by the same built-in rules, a caption containing a bare
- * "email"/"phone"/"ssn"/… is name-denied even with no custom deny list,
- * which is accepted here for the reason `ui-numbers.ts` accepts it: the
- * classifier cannot tell "this caption IS the sensitive datum" from "this
- * caption is A LABEL FOR ONE", so it redacts both.
+ * string ("Preferred contact time") where free text is normal.
+ *
+ * `keyName` is the element's `name`/`id` ({@link accessibleNameKey}), not the
+ * caption text: the caption is content, not a field name, so it must not
+ * feed the name-based deny check the way a field named `email` would.
+ * `redaction.denyFields` still reaches the caption through
+ * {@link captionMatchesDenyField}, an explicit exact-word match against the
+ * caption's own words — narrower than the classifier's built-in
+ * sensitive-name patterns on purpose, since those now only see the element's
+ * real identifier.
  *
  * The text-plane pass runs first because it can replace just the sensitive
  * SUBSTRING of a longer sentence (a Bearer token, a key:value pair, an
@@ -67,6 +104,7 @@ import { subscribeNavCommit } from "../nav-signal";
  */
 function redactAccessibleName(
   rawLabel: string,
+  keyName: string | undefined,
   denyFields: string[] | undefined,
 ): { value: string | undefined; metadata?: RedactionMetadata } {
   const textPlane = redactNetworkTextBody(rawLabel, {
@@ -75,19 +113,22 @@ function redactAccessibleName(
   });
   const working = textPlane.body ?? rawLabel;
 
-  const classification = classifyStructuredValue(working, working, denyFields);
-  if (
+  const classification = classifyStructuredValue(working, keyName, denyFields);
+  const structurallyDenied =
     classification.action === "redact" &&
-    classification.reason !== "free_text_value"
-  ) {
+    classification.reason !== "free_text_value";
+  const wordDenied = captionMatchesDenyField(working, denyFields);
+
+  if (structurallyDenied || wordDenied) {
+    const reason = structurallyDenied ? classification.reason : "deny_field";
     const classifyMetadata: RedactionMetadata = {
       policy: BROWSER_REDACTION_POLICY,
       fields: [
         {
           path: "el.label",
-          reason: classification.reason,
+          reason,
           action: "redacted",
-          shape: computeRedactedShape(working, classification.reason),
+          shape: computeRedactedShape(working, reason),
         },
       ],
     };
@@ -118,6 +159,7 @@ function redactAccessibleName(
  * reasoning `ui-numbers.ts` applies to a rendered label.
  */
 function finalizeAccessibleName(
+  target: Element,
   descriptor: Record<string, unknown>,
   config: CrumbtrailConfig,
 ): Record<string, unknown> {
@@ -125,7 +167,11 @@ function finalizeAccessibleName(
     return descriptor;
 
   const { label: rawLabel, ...rest } = descriptor;
-  const redacted = redactAccessibleName(rawLabel, config.redaction?.denyFields);
+  const redacted = redactAccessibleName(
+    rawLabel,
+    accessibleNameKey(target),
+    config.redaction?.denyFields,
+  );
   const merged = mergeRedactionMetadata(
     readDescriptorMetadata(rest),
     redacted.metadata,
@@ -157,7 +203,11 @@ function describeInteractionTarget(
       const { label: rawLabel, ...rest } = removeUndefined(descriptor);
       const masked = maskElementDescriptor(target, rest, config);
       if (typeof rawLabel === "string" && rawLabel !== "") {
-        return finalizeAccessibleName({ ...masked, label: rawLabel }, config);
+        return finalizeAccessibleName(
+          target,
+          { ...masked, label: rawLabel },
+          config,
+        );
       }
       return masked;
     }
