@@ -131,7 +131,10 @@ export function describeElement(el: Element): ElementDescriptor {
  */
 export function readStructuredBody(body: unknown): string | undefined {
   try {
-    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+    if (
+      typeof URLSearchParams !== "undefined" &&
+      body instanceof URLSearchParams
+    ) {
       return body.toString();
     }
     if (typeof FormData !== "undefined" && body instanceof FormData) {
@@ -158,7 +161,8 @@ function describeFilePart(file: {
   name?: string;
   size?: number;
 }): Record<string, unknown> {
-  const ext = typeof file.name === "string" ? extractFileExtension(file.name) : undefined;
+  const ext =
+    typeof file.name === "string" ? extractFileExtension(file.name) : undefined;
   return {
     file: true,
     ...(typeof file.size === "number" ? { bytes: file.size } : {}),

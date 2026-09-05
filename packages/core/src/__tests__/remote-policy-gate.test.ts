@@ -1038,6 +1038,21 @@ describe("the release pass, per event kind", () => {
     expect(apply(domSnap, { storage: false })).toBeDefined();
   });
 
+  it("routes browser resource failures to errors instead of network", () => {
+    const resourceFailure: BugEvent = {
+      t: 1,
+      k: "net.err",
+      d: { transport: "resource", url: "/styles/app.css" },
+    };
+
+    expect(
+      apply(resourceFailure, { network: false, errors: true }),
+    ).toBeDefined();
+    expect(
+      apply(resourceFailure, { network: true, errors: false }),
+    ).toBeUndefined();
+  });
+
   // Page content is masked as it is captured, from a DOM that is gone by
   // release. A policy that tightens masking cannot be applied to it after the
   // fact, so the event goes rather than shipping under the looser mode.

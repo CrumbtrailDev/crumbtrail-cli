@@ -7,9 +7,10 @@ import type { BugEvent } from "./types";
  * the bus, so an admission rule written against a value that redaction
  * replaced cannot match the event's own copy. A request scope also lets a
  * start, terminal and file parts share the same admission outcome while a
- * remote policy is resolving. Context is read by the admission predicate and
- * never stored on the event, so nothing downstream — tap, buffer, transport,
- * ring buffer — ever sees it.
+ * remote policy is resolving. The scope's original session id is copied onto
+ * an event only when that event lacks one, so a rotated session can still send
+ * the whole request family to its origin. Raw URLs and admission state stay in
+ * context and never reach taps, buffers, transports, or the ring buffer.
  */
 export type RequestAdmissionDisposition = "undecided" | "admitted" | "dropped";
 
@@ -21,6 +22,8 @@ export interface RequestAdmissionScope {
   disposition: RequestAdmissionDisposition;
   /** Keeps an overflow outcome from being relabelled as a policy drop. */
   dropReason?: "overflow" | "policy";
+  /** Session active when this request began, retained for late family members. */
+  sessionId?: string;
 }
 
 export interface EmitContext {
@@ -34,6 +37,23 @@ export interface EmitOptions extends EmitContext {
 
 /** Matches the ring buffer's default ceiling; `Crumbtrail.init()` sets the real one. */
 const DEFAULT_MAX_BUFFERED_EVENTS = 50_000;
+
+function bindRequestSession(
+  event: BugEvent,
+  options: EmitOptions | undefined,
+): BugEvent {
+  const sessionId = options?.requestScope?.sessionId;
+  if (
+    typeof sessionId !== "string" ||
+    sessionId.length === 0 ||
+    event.d.sessionId !== undefined
+  )
+    return event;
+  return {
+    ...event,
+    d: { ...event.d, sessionId },
+  };
+}
 
 export class EventBus {
   private listeners: Array<(events: BugEvent[]) => void> = [];
@@ -55,21 +75,22 @@ export class EventBus {
   private droppedFromBuffer = 0;
 
   emit(event: BugEvent, options?: EmitOptions): boolean {
+    const emitted = bindRequestSession(event, options);
     if (!options?.bypassAdmission) {
       try {
-        if (!this.admissionPredicate(event, options)) return false;
+        if (!this.admissionPredicate(emitted, options)) return false;
       } catch {
         return false;
       }
     }
     for (const tap of this.taps) {
       try {
-        tap(event);
+        tap(emitted);
       } catch {
         // A misbehaving tap must never break event capture.
       }
     }
-    this.buffer.push(event);
+    this.buffer.push(emitted);
     if (this.buffer.length > this.maxBufferedEvents) {
       // Oldest first: after a long pause the events worth keeping are the ones
       // nearest whatever the reader is looking for.

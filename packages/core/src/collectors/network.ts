@@ -626,8 +626,6 @@ function wrapFetch(
     const id = nextId++;
     const method = extractMethod(input, init);
     const startTime = now();
-    const requestScope: RequestAdmissionScope = { disposition: "undecided" };
-    const requestContext: EmitContext = { rawUrl: url, requestScope };
     // Synchronously, before the first await: after one the application's frames
     // are gone from the stack and what remains is the microtask that resumed us.
     const callStack = captureCallStack(instrumentedFetch);
@@ -637,6 +635,12 @@ function wrapFetch(
       config,
       context,
     );
+    const requestSessionId = fetchArgs.sessionId ?? context?.sessionId;
+    const requestScope: RequestAdmissionScope = {
+      disposition: "undecided",
+      ...(requestSessionId ? { sessionId: requestSessionId } : {}),
+    };
+    const requestContext: EmitContext = { rawUrl: url, requestScope };
 
     const urlResult = redactUrl(url, "url");
     const reqMetadata: Array<RedactionMetadata | undefined> = [
@@ -1245,7 +1249,11 @@ function wrapXHR(
     }
 
     meta.startTime = now();
-    const requestScope: RequestAdmissionScope = { disposition: "undecided" };
+    const requestSessionId = meta.sessionId ?? context?.sessionId;
+    const requestScope: RequestAdmissionScope = {
+      disposition: "undecided",
+      ...(requestSessionId ? { sessionId: requestSessionId } : {}),
+    };
     const requestContext: EmitContext = {
       rawUrl: meta.url,
       requestScope,
@@ -1477,7 +1485,10 @@ function emitEarlyRecord(
   record: EarlyRequestRecord,
 ): void {
   const id = nextId++;
-  const requestScope: RequestAdmissionScope = { disposition: "undecided" };
+  const requestScope: RequestAdmissionScope = {
+    disposition: "undecided",
+    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+  };
   const requestContext: EmitContext = {
     rawUrl: record.url,
     requestScope,

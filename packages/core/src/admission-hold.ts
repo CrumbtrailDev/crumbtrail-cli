@@ -85,6 +85,15 @@ export const COLLECTOR_EVENT_KINDS = {
 } satisfies Record<string, readonly string[]>;
 
 /**
+ * Browser-managed resource failures are emitted by the errors collector using
+ * the network-error schema. They are not a request lifecycle, so `network`
+ * must not suppress one when `errors` remains enabled.
+ */
+export function isResourceFailureEvent(event: BugEvent): boolean {
+  return event.k === "net.err" && event.d?.transport === "resource";
+}
+
+/**
  * Kinds whose payload is user-visible page content, masked at capture time
  * under the mode then in force and carrying no record of which mode that was.
  * A policy that tightens masking mid-hold cannot be applied to them after the
@@ -323,12 +332,16 @@ export function reapplyPolicyToHeldEvent(
   // it, so this is the only place that decision reaches these events.
   if (context.samplingShed) return undefined;
 
-  for (const [key, kinds] of Object.entries(COLLECTOR_EVENT_KINDS)) {
-    if (
-      (kinds as readonly string[]).includes(event.k) &&
-      config[key as keyof CrumbtrailConfig] === false
-    )
-      return undefined;
+  if (isResourceFailureEvent(event)) {
+    if (config.errors === false) return undefined;
+  } else {
+    for (const [key, kinds] of Object.entries(COLLECTOR_EVENT_KINDS)) {
+      if (
+        (kinds as readonly string[]).includes(event.k) &&
+        config[key as keyof CrumbtrailConfig] === false
+      )
+        return undefined;
+    }
   }
 
   if (

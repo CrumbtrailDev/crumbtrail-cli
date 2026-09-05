@@ -110,6 +110,7 @@ import {
 import { buildCaptureGapEvent } from "./capture-gap";
 import {
   COLLECTOR_EVENT_KINDS,
+  isResourceFailureEvent,
   readMaskingState,
   reapplyPolicyToHeldEvent,
   type HeldEvent,
@@ -188,9 +189,20 @@ function estimateHeldEventBytes(event: BugEvent): number {
   }
 }
 
-/** Network events that describe one request and must share its admission fate. */
-function isNetworkRequestFamilyEvent(event: BugEvent): boolean {
-  return (COLLECTOR_EVENT_KINDS.network as readonly string[]).includes(event.k);
+/**
+ * Only collector-created request families carry this scope. An explicit event
+ * can retain its own `d.sessionId` across rotation without being reclassified
+ * as a network capture attempt, and a resource failure belongs to errors.
+ */
+function isNetworkRequestFamilyEvent(
+  event: BugEvent,
+  requestScope: RequestAdmissionScope | undefined,
+): boolean {
+  return (
+    requestScope !== undefined &&
+    !isResourceFailureEvent(event) &&
+    (COLLECTOR_EVENT_KINDS.network as readonly string[]).includes(event.k)
+  );
 }
 
 /** The unredacted URL when the emitter retained it, otherwise its event copy. */
@@ -2550,7 +2562,7 @@ export class Crumbtrail {
       if (this.isAdmissionUndecided()) this.holdForAdmission(event, context);
       return false;
     }
-    if (isNetworkRequestFamilyEvent(event)) {
+    if (isNetworkRequestFamilyEvent(event, requestScope)) {
       const rawUrl = requestUrlForAdmission(event, context);
       if (
         this.config.network === false ||
@@ -2896,7 +2908,7 @@ export class Crumbtrail {
         // normally impossible because the request start is emitted first, but
         // failing closed also protects a custom EventBus emitter order.
         if (
-          isNetworkRequestFamilyEvent(entry.event) &&
+          isNetworkRequestFamilyEvent(entry.event, scope) &&
           scope?.disposition === "undecided"
         ) {
           dropRequestScope(scope, "policy");

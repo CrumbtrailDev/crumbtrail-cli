@@ -214,6 +214,47 @@ describe("networkCollector — fetch", () => {
     cleanup();
   });
 
+  it("keeps a request family under the session that began it after context rotates", async () => {
+    let activeSessionId = "sess_first";
+    let settleResponse: ((response: Response) => void) | undefined;
+    globalThis.fetch = vi.fn().mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleResponse = resolve;
+        }),
+    );
+
+    const events: BugEvent[] = [];
+    const bus = new EventBus();
+    bus.subscribe((batch) => events.push(...batch));
+    const cleanup = networkCollector(
+      bus,
+      makeConfig({ networkCorrelationHeaders: false }),
+      {
+        get sessionId() {
+          return activeSessionId;
+        },
+      },
+    );
+
+    const request = globalThis.fetch("/api/rotate");
+    activeSessionId = "sess_second";
+    settleResponse?.(new Response("ok", { status: 200 }));
+    await request;
+    bus.flush();
+
+    const family = events.filter(
+      (event) => event.k === "net.req" || event.k === "net.res",
+    );
+    expect(family).toHaveLength(2);
+    expect(family.map((event) => event.d.sessionId)).toEqual([
+      "sess_first",
+      "sess_first",
+    ]);
+
+    cleanup();
+  });
+
   it("skips URLs matching networkExcludeUrls", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(new Response("ok"));
     const { events, bus, cleanup } = collect({
