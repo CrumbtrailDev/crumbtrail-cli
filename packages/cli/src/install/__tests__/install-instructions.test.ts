@@ -8,6 +8,7 @@ import {
   OTLP_STACKS,
   allStackInstalls,
   buildAgentPrompt,
+  otlpAgentPrompt,
   buildBackendJsNote,
   buildOtlpSnippets,
   getInstallVariant,
@@ -252,8 +253,16 @@ describe("install-instructions snippets", () => {
     expect(p).toContain('service: "payments-api"');
   });
 
-  it("agent prompt uses the OTLP path (no SDK) for a backend with no published package", () => {
-    const p = buildAgentPrompt("go", keys);
+  // No stack reaches the OTLP prompt now that every OTLP stack has a maintained
+  // or published package, so it is exercised directly. It is the answer for the
+  // next stack added before its artifact ships, and this keeps it from rotting.
+  it("OTLP prompt still tells a reader everything the exporter path needs", () => {
+    const p = otlpAgentPrompt(
+      "https://app.crumbtrail.com",
+      "CRUMBTRAIL_KEY",
+      "<your-app-name>",
+      false,
+    );
     expect(p).toContain(
       "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
     );
@@ -264,16 +273,23 @@ describe("install-instructions snippets", () => {
     expect(p).toContain("crumbtrail.session.id");
     expect(p).toContain("Optional");
     expect(p).toContain("sessionless OTLP is accepted");
+    expect(p).toContain("Keep your existing exporter");
     expect(p).toContain("OTEL_SERVICE_NAME=<your-app-name>");
     expect(p).toContain(
       "Replace <your-app-name> with a stable name for this app before running it.",
     );
     expect(p).not.toContain("PRESET_PASSIVE");
+    // A resolved name needs no instruction to replace the placeholder.
+    expect(
+      otlpAgentPrompt("https://app.crumbtrail.com", "CRUMBTRAIL_KEY", "orders", true),
+    ).not.toContain("Replace <your-app-name>");
   });
 
   // Every OTLP stack, not just django: the native path once returned early for
-  // all six and made the whole block above unreachable for each of them.
-  it("keeps the OTLP prompt reachable for every stack with no published package", () => {
+  // all six and made the OTLP block unreachable and untested. It is reachable
+  // as a function now, and each stack must still name a package a reader can
+  // actually install.
+  it("gives every OTLP stack a package it can resolve", () => {
     for (const stack of [
       "django",
       "flask",
@@ -284,25 +300,14 @@ describe("install-instructions snippets", () => {
     ] as const) {
       const p = buildAgentPrompt(stack, keys, { serviceName: "orders" });
       if (stack === "dotnet") {
-        // dotnet has its own maintained package and answers before the OTLP path.
+        // dotnet has its own maintained package and answers before this path.
         expect(p).toContain("maintained ASP.NET Core package");
         continue;
       }
-      if (NATIVE_PACKAGES[stack]?.published) {
-        // A published package answers before the OTLP path, and names itself.
-        expect(p).toContain(NATIVE_PACKAGES[stack]!.package);
-        continue;
-      }
-      expect(p).toContain(
-        "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
-      );
-      expect(p).toContain("Keep your existing exporter");
-      expect(p).toContain("OTEL_SERVICE_NAME=orders");
-      expect(p).toContain("crumbtrail.session.id");
-      // A resolved name needs no instruction to replace the placeholder.
-      expect(p).not.toContain(
-        "Replace <your-app-name> with a stable name for this app before running it.",
-      );
+      expect(NATIVE_PACKAGES[stack]!.published, stack).toBe(true);
+      expect(p, stack).toContain(NATIVE_PACKAGES[stack]!.package);
+      expect(p, stack).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+      expect(p, stack).not.toContain(keys.apiKey);
     }
   });
 

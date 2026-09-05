@@ -1618,13 +1618,14 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expect(plan.snippet).toContain(`X-Crumbtrail-Auth=${KEY_PLACEHOLDER}`);
     expect(plan.snippet).toContain("crumbtrail.session.id");
     expectNoKeyLiteral(plan.snippet);
-    // Agent prompt routes to the no-SDK OTLP variant (no PRESET_PASSIVE).
+    // The snippet keeps wiring OTLP tracing; the agent prompt now hands the
+    // reader the published native package instead, which is the stronger path.
     expect(plan.agentPrompt).toContain(ENDPOINT);
     // The coding-agent hand-off uses the runtime env var instead of carrying
     // even the placeholder key into the prompt.
     expect(plan.agentPrompt).not.toContain(KEY_PLACEHOLDER);
     expect(plan.agentPrompt).toContain("CRUMBTRAIL_KEY");
-    expect(plan.agentPrompt).toContain("sessionless OTLP is accepted");
+    expect(plan.agentPrompt).toContain("crumbtrail-python 0.1.0");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
     // otlp injects no key via an env var — it uses OTLP headers instead.
     expect(plan.keyEnvVar).toBeUndefined();
@@ -1643,9 +1644,10 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
       io,
     );
     // The receiver resolves an app from service.name when the key names none,
-    // and every OTLP SDK sets service.name from OTEL_SERVICE_NAME.
+    // and every OTLP SDK sets service.name from OTEL_SERVICE_NAME. The native
+    // prompt carries the same name as the service it registers.
     expect(plan.snippet).toContain("OTEL_SERVICE_NAME=billing-api");
-    expect(plan.agentPrompt).toContain("OTEL_SERVICE_NAME=billing-api");
+    expect(plan.agentPrompt).toContain('Use service "billing-api"');
 
     // With no provisioned name, it asks for one rather than filing under none.
     const unnamed = buildPlan(
@@ -1658,8 +1660,8 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
   it("keys the agent prompt to the DETECTED stack, not the registry placeholder", () => {
     const io = fakeInjectIO({});
     // The registry placeholder for otlp is "django"; a detected go stack must
-    // still route via the shared OTLP prompt (both are otlp-variant), so assert
-    // the guidance is the no-SDK OTLP path regardless.
+    // be keyed to go, so assert the prompt names the Go module rather than the
+    // placeholder's Python package.
     const plan = buildPlan(
       {
         cwd: CWD,
@@ -1670,7 +1672,10 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
       io,
     );
     expect(plan.kind).toBe("otlp-guidance");
-    expect(plan.agentPrompt).toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+    expect(plan.agentPrompt).toContain(
+      "github.com/CrumbtrailDev/crumbtrail-cli/packages/go v0.1.0",
+    );
+    expect(plan.agentPrompt).not.toContain("crumbtrail-python");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
   });
 
