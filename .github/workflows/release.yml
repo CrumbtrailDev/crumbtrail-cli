@@ -227,12 +227,17 @@ jobs:
 
   publish-nuget:
     runs-on: ubuntu-latest
+    # The trusted publishing policy on nuget.org is scoped to the `production`
+    # environment, so the OIDC token must carry it or the exchange is rejected.
+    environment: production
     permissions:
       contents: read
-      # The one job here that needs a stored secret. NuGet.org has no trusted
-      # publishing equivalent to npm's, so NUGET_API_KEY is a repository secret
-      # and must be rotated by hand when it expires. Nothing else in this
-      # workflow stores a registry credential.
+      # nuget.org runs trusted publishing too, so this job stores no credential
+      # either: NuGet/login exchanges the OIDC token for an API key that lives
+      # one hour. The policy is registered against this repo and `release.yml`,
+      # so renaming this file breaks NuGet along with npm, crates.io, PyPI and
+      # RubyGems.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -244,6 +249,16 @@ jobs:
         run: |
           dotnet pack packages/dotnet/Crumbtrail.AspNetCore -o .local-packs/dotnet
           dotnet pack packages/dotnet/Crumbtrail.EntityFrameworkCore -o .local-packs/dotnet
+      # Deliberately the last thing before the push: the temporary key expires
+      # after an hour, and each OIDC token buys exactly one key, so requesting
+      # it earlier only risks it going stale mid-run.
+      - name: NuGet login
+        if: ${{ !inputs.dry_run }}
+        id: login
+        uses: NuGet/login@v1
+        with:
+          # The nuget.org profile name that owns the packages, not an email.
+          user: crumbtrail
       - name: Publish
         # --skip-duplicate is the version check: NuGet answers 409 for an id and
         # version that already exist, and the flag turns that into a success
@@ -252,10 +267,8 @@ jobs:
         run: |
           dotnet nuget push ".local-packs/dotnet/*.nupkg" \
             --source https://api.nuget.org/v3/index.json \
-            --api-key "$NUGET_API_KEY" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
             --skip-duplicate
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
 
   tag-go:
     runs-on: ubuntu-latest
