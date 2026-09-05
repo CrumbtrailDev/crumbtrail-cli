@@ -988,6 +988,39 @@ collector emits one `ui.layout` event per navigation with
 locale-vs-rendered-number contradiction, and horizontal overflow from a long
 translated label, joinable without capturing any DOM.
 
+### Interaction target names (`el.label`)
+
+A `clk` or `inp` event's `el` payload carries a structural signature path
+(`div[id]>div:nth-of-type(1)>...>button:nth-of-type(2)`) that answers "where"
+but never "what" — the same click, replayed for a reader, says nothing about
+whether it was Next, Cancel, or Delete. `el.label` is the target's accessible
+name: `aria-label`, an associated `<label>` (`label[for]` or a wrapping
+`<label>`, with any nested form control's own text excluded, so a `<select>`
+inside a `<label>` does not leak its option list), a button or link's own
+visible text, `placeholder`, then `title` — capped at 40 characters after
+redaction. Never the value of an input, and never present for a password
+field, or for an element (or label source) matched by `ignoreSelectors`, inside
+a `data-crumbtrail-block` subtree, or under `data-crumbtrail-mask`.
+
+An authored caption is not user content, so unlike other captured text it is
+not dropped by `maskAllText`/`maskAllInputs`, the same reasoning `ui.num`
+above applies to a rendered on-screen label. It still runs through the same
+deny-biased classifier — an embedded email, card number, JWT, or token still
+redacts — but keyed on the ELEMENT's own `name`/`id`, not the caption text: a
+caption is prose, not a field name, so an ordinary word inside a sentence
+("Search name, email or employee number") does not get treated as if the
+element were itself named `email`. `redaction.denyFields` still reaches the
+caption, through an explicit exact-word match against the caption's own
+words ("patient" denies "Patient Sofia Ramirez"), separate from and
+narrower than the classifier's built-in sensitive-name patterns. The same
+accepted residual risk as `ui.num` applies: a caption that is itself PII but
+reads as ordinary free text (a human name) can survive capture when no
+`denyFields` entry matches it, and a spaced phone number, a dashed
+nine-digit SSN-style run, or an IBAN embedded in a sentence is not caught by
+either the text-plane pass or the structured classifier. Mitigate with
+`redaction.denyFields`, `ignoreSelectors`, or `data-crumbtrail-mask` on the
+element.
+
 ## React
 
 The React bindings live on the `crumbtrail-core/react` subpath. Nothing extra to

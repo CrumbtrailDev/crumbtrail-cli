@@ -7,6 +7,14 @@ import {
 
 const UNMASK_ATTRIBUTE = "data-crumbtrail-unmask";
 const BLOCK_ATTRIBUTE = "data-crumbtrail-block";
+/**
+ * The DOM replay serializer's own opt-out marker (`replay/serialize.ts`),
+ * reused here so an integrator has one attribute — not two, one per
+ * subsystem — for "force this text masked regardless of the global
+ * setting". Ancestor-inclusive: it forces masking on the element it sits on
+ * and everything under it, the same as `replay/serialize.ts`'s own check.
+ */
+const MASK_ATTRIBUTE = "data-crumbtrail-mask";
 
 /**
  * Replaces visible characters while retaining whitespace and a useful approximation of length.
@@ -27,6 +35,17 @@ export function isUnmasked(el: Element): boolean {
 /** Whether an element and its entire subtree must be excluded from capture. */
 export function isBlocked(el: Element): boolean {
   return el.closest(`[${BLOCK_ATTRIBUTE}]`) !== null;
+}
+
+/**
+ * Whether this element, or an ancestor, forces its text masked regardless of
+ * the project's `maskAllText`/`maskAllInputs` setting. The escape hatch for
+ * an authored caption (an interaction target's accessible name survives
+ * masking by default; see `collectors/interaction.ts`) that a specific
+ * integration still wants kept out of capture.
+ */
+export function isMaskForced(el: Element): boolean {
+  return el.closest(`[${MASK_ATTRIBUTE}]`) !== null;
 }
 
 /**

@@ -771,6 +771,40 @@ export interface DbStatementEventData {
   t: number;
 }
 
+/**
+ * The `el` payload of a `clk` or `inp` event: either the SDK's built-in
+ * {@link describeElement} output or whatever `describeInteractionElement`
+ * returns in its place. Untyped because a custom factory may shape it however
+ * the integration needs, but the built-in descriptor always carries `tag` and
+ * a structural `sig`/`path` pair, and additionally a `label` when one was
+ * found — the target's accessible name (`aria-label`, an associated
+ * `<label>` — either `label[for]` or a wrapping `<label>`, excluding the text
+ * of any nested form control — visible text for a button or link,
+ * `placeholder`, then `title`), capped at 40 characters after redaction.
+ *
+ * Never the value of an input, and never present for a password field, an
+ * element (or label source) matched by `ignoreSelectors`, inside a
+ * `data-crumbtrail-block` subtree, or under `data-crumbtrail-mask`. Unlike
+ * other captured text, `label` is NOT dropped by `maskAllText`/
+ * `maskAllInputs`: an authored caption is not user content, so it survives
+ * that setting the same way a rendered on-screen label does for `ui.num`
+ * (see `README.md`'s "On-screen numbers"). The name still runs through the
+ * deny-biased redaction classifier (an embedded email, card number, JWT or
+ * token still redacts), keyed on the ELEMENT's own `name`/`id`, never on the
+ * caption text itself — a caption is prose, not a field name, so an ordinary
+ * word like "email" appearing inside a sentence ("Search name, email or
+ * employee number") does not get treated as if the element were itself a
+ * field named `email`. `redaction.denyFields` still reaches the caption
+ * through an explicit exact-word match against the caption's own words
+ * ("patient" denies "Patient Sofia Ramirez"), separate from and narrower
+ * than the classifier's built-in sensitive-name patterns. Accepted residual
+ * risk, the same as `ui.num`'s label redaction: a caption that is itself PII
+ * but reads as ordinary free text (a human name) can survive capture with no
+ * matching `denyFields` entry, and a spaced phone number, dashed nine-digit
+ * SSN-style run, or IBAN embedded in a sentence is not caught either.
+ * Mitigate with `redaction.denyFields`, `ignoreSelectors`, or
+ * `data-crumbtrail-mask` on the element.
+ */
 export type InteractionElementDescriptor = Record<string, unknown>;
 export type InteractionElementDescriptorFactory = (
   element: Element,
