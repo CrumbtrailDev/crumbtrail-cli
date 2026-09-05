@@ -782,6 +782,25 @@ export class Crumbtrail {
   private lifecycleClosing = false;
   private lifecycleSuspended = false;
   private lifecycleEndPromise?: Promise<void>;
+  /**
+   * The document is going away for good, so the visit this close ends is the
+   * last one this instance may open.
+   *
+   * Without the latch, anything that reaches `startSessionIfAllowed` while the
+   * teardown close is still in flight opens a successor: a visibility change
+   * back to visible, a persisted `pageshow`, a duration rotation whose deadline
+   * has passed, or a late remote config. The page then dies before that
+   * successor can record anything worth reading, and `startLifecycleEnd` has
+   * already run for the visit that is closing, so nothing ends it either. The
+   * server reclaims it by empty session sweep minutes later, and an operator
+   * reading the project sees two sessions a second apart and has to pick the
+   * real one by event count.
+   *
+   * Only a nonpersisted `pagehide` and an explicit `stop()` set this. A
+   * persisted `pagehide` never closes the visit at all, so a back forward cache
+   * restore still resumes under a fresh session.
+   */
+  private lifecycleTerminated = false;
 
   /**
    * Session replay, off until the server says a project asked for it.
@@ -2192,6 +2211,7 @@ export class Crumbtrail {
     this.cancelDurationTimer();
     const duration = this.config.maxSessionDurationMs;
     if (
+      this.lifecycleTerminated ||
       !Number.isFinite(duration) ||
       duration <= 0 ||
       !this.transport.sendSessionEvents ||
@@ -2209,6 +2229,10 @@ export class Crumbtrail {
   }
 
   private rotateActiveSession(): void {
+    if (this.lifecycleTerminated) {
+      this.cancelDurationTimer();
+      return;
+    }
     if (!this.sessionStarted || !this.canTransport()) return;
     const previousId = this.sessionId;
     this.bus.flush();
@@ -2278,6 +2302,7 @@ export class Crumbtrail {
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
     this.cancelDurationTimer();
+    if (immediateEnd) this.lifecycleTerminated = true;
     if (this.stopped || this.lifecycleSuspended) {
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
@@ -2498,6 +2523,10 @@ export class Crumbtrail {
   }
 
   private escalateLifecycleClose(): void {
+    // Escalation only ever comes from a teardown: a nonpersisted pagehide over
+    // an already running hidden-page close, or stop(). Either way this instance
+    // is finished opening visits.
+    this.lifecycleTerminated = true;
     const closeState = this.lifecycleCloseState;
     if (!closeState || closeState.immediateEnd) return;
     closeState.immediateEnd = true;
@@ -2521,6 +2550,7 @@ export class Crumbtrail {
   private resumeFromLifecycle(
     preserveExpectations = false,
   ): Promise<void> | undefined {
+    if (this.lifecycleTerminated) return undefined;
     const closing = this.lifecycleClosePromise;
     if (closing) {
       return closing.then(() => {
@@ -2623,7 +2653,7 @@ export class Crumbtrail {
   }
 
   private startSessionIfAllowed(): void {
-    if (!this.canTransport()) return;
+    if (this.lifecycleTerminated || !this.canTransport()) return;
     if (this.sessionStarted) {
       if (
         this.durationDeadline !== undefined &&
