@@ -95,12 +95,21 @@ GoRouter(
 
 ### Requests
 
-Wrap the `http` client your application uses, or register the Dio interceptor
-once on your existing Dio instance. The adapters record status, URL, method,
-duration, and error type. The adapters do not read bodies or add headers.
+The HTTP adapters ship as their own packages, `crumbtrail_flutter_http` and
+`crumbtrail_flutter_dio`. Dart has no compile-only dependency, so anything this
+SDK declares is a package every application resolves; an application pinned to
+Dio 4 must not fail `pub get` because of a capture adapter it never enabled.
+Add whichever one matches the client you already use.
+
+```yaml
+dependencies:
+  crumbtrail_flutter: ^0.1.0
+  crumbtrail_flutter_http: ^0.1.0 # or crumbtrail_flutter_dio: ^0.1.0
+```
 
 ```dart
 import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
+import 'package:crumbtrail_flutter_http/crumbtrail_flutter_http.dart';
 import 'package:http/http.dart' as http;
 
 final client = CrumbtrailClient(
@@ -115,6 +124,7 @@ For Dio:
 
 ```dart
 import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
+import 'package:crumbtrail_flutter_dio/crumbtrail_flutter_dio.dart';
 import 'package:dio/dio.dart';
 
 final dio = Dio();
@@ -126,14 +136,26 @@ Start Crumbtrail before registering an adapter. Set
 is `true`. Stopping Crumbtrail prevents further events. Register each adapter
 once and avoid calling `recordRequest` for the same request.
 
-URLs are redacted before queueing. Error messages, headers, and bodies are not
-collected by these adapters. The `http` wrapper measures time to response headers. Dio measures time until
-its response or error interceptor runs, which includes normal buffered body
-download and decoding. With `ResponseType.stream`, Dio returns before stream
-consumption. Later stream read errors are not captured by either adapter. The original response, exception, cancellation, and stream
-remain available to the application. Capture failures do not replace HTTP results.
+The adapters record status, URL, method, duration, and error type. They do not
+read bodies or add headers, and URLs are redacted before queueing. The original
+response, exception, cancellation and stream all reach your application
+untouched, and a capture failure never replaces an HTTP result. Requests to your
+Crumbtrail endpoint's own host are skipped, so sharing a client with the SDK's
+transport cannot feed capture into itself.
 
-Verify with `flutter test test/network_adapters_test.dart` from this package.
+Duration means different things in the two adapters, and each event says which.
+The `http` wrapper reports `durTo: "headers"`, time until the response head is
+available. Dio reports `durTo: "body"`, because its response interceptor cannot
+run until the body has been buffered and decoded. With `ResponseType.stream`,
+Dio returns before the stream is consumed, and a later stream read error is not
+captured by either adapter.
+
+A client neither adapter wraps records nothing, which is a real limit rather
+than an oversight. `HttpClient` from `dart:io`, a hand rolled client, or any
+package built directly on `dart:io` still needs `recordRequest` from wherever
+your application already sees the result.
+
+Verify with `flutter test` from `packages/flutter-http` or `packages/flutter-dio`.
 For an application check, issue a request through the configured client, flush
 Crumbtrail, and inspect its session for a `net` event with the request status.
 
@@ -158,7 +180,7 @@ try {
 | Dart hang | Foreground Dart event loop watchdog, disabled in debug mode by default |
 | Screen changes | `CrumbtrailNavigatorObserver` |
 | Environment | OS, OS version, locale and Dart version, from `dart:io` |
-| Requests | `CrumbtrailClient` or `CrumbtrailDioInterceptor`, redacted metadata |
+| Requests | `recordRequest`, or an adapter package, redacted metadata |
 
 Both error surfaces are installed, and both chain to any handler already in
 place, so adding Crumbtrail never silently removes a crash reporter you already

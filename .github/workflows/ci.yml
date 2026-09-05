@@ -138,9 +138,11 @@ jobs:
 
   # ── Native SDK conformance suites ────────────────────────────────────────
   # packages/swift, packages/kotlin and packages/flutter each ship a wire
-  # contract suite that asserts the same envelope shape as the JS SDKs. Those
-  # suites are the only thing preventing the four languages drifting apart, so
-  # they run as first-class jobs. Deliberately no `|| true` and no
+  # contract suite that asserts the same envelope shape as the JS SDKs, and the
+  # Kotlin and Dart suites additionally read test-fixtures/redaction/urls.json so
+  # neither can quietly redact less than the other. Those suites are the only
+  # thing preventing the four languages drifting apart, so they run as
+  # first-class jobs. Deliberately no `|| true` and no
   # `continue-on-error`: a suite that cannot run has to fail the job, because a
   # green check that proves nothing is worse than no check at all.
   # scripts/dev-harness/ci-workflow.test.mjs enforces exactly that.
@@ -189,3 +191,13 @@ jobs:
         working-directory: packages/flutter
       - run: flutter test
         working-directory: packages/flutter
+      # The HTTP adapters are separate packages so an application never resolves
+      # a client it does not use. They still have to be tested.
+      - run: flutter pub get
+        working-directory: packages/flutter-http
+      - run: flutter test
+        working-directory: packages/flutter-http
+      - run: flutter pub get
+        working-directory: packages/flutter-dio
+      - run: flutter test
+        working-directory: packages/flutter-dio

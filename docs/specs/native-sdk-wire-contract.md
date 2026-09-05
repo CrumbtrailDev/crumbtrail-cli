@@ -114,7 +114,7 @@ outside this list gets no cross platform treatment on the ingest side.
 | `err` | An error or crash | `msg`, `stk`, `fatal`, `source` |
 | `rej` | An unhandled async failure | `msg`, `stk`, `source` |
 | `con` | A console/log line | `lv` (`log`/`warn`/`err`/`dbg`/`info`), `args` |
-| `net` | A completed request | `url`, `method`, `status`, `ok`, `dur`, `source` |
+| `net` | A completed request | `url`, `method`, `status`, `ok`, `dur`, `durTo`, `source`, `error` |
 | `net-status` | Connectivity state or change | `connected`, `type`, `kind` |
 | `env` | Environment snapshot | `kind`, `device`, `app`, `battery`, `locale` |
 | `navigation` | A screen or route change | `name`, `path`, `key`, `url`, `source` |
@@ -126,6 +126,37 @@ outside this list gets no cross platform treatment on the ingest side.
 
 `err` carries `fatal: true` only for a failure that actually terminated the
 process. A caught and reported exception is `fatal: false`.
+
+`net` describes a request that finished, successfully or not. `status` and `ok`
+are absent when there was no response at all, and `error` then names the failure
+type: an exception class name (`IOException`, `SocketException`), or the
+transport's own category (`connectionTimeout`, `cancel`). It is a type, never a
+message and never a stack, because the message is where a URL, a header or a
+token ends up. It is optional, and a request that produced a status normally
+omits it.
+
+`dur` is milliseconds, and `durTo` says which phase it covers:
+
+| `durTo`     | Meaning                                                              |
+| ----------- | -------------------------------------------------------------------- |
+| `headers`   | Request start until the response head is available                   |
+| `body`      | Request start until the body has been received and decoded           |
+| *(absent)*  | The SDK does not state a phase                                       |
+
+The distinction is not cosmetic. An adapter sitting on a streaming seam
+(`URLProtocol`, an OkHttp interceptor, a `package:http` client) reports
+`headers`, and an adapter whose only callback runs after buffering (a Dio
+response interceptor) reports `body`. Two numbers under one kind, one of which
+silently includes a very large download, cannot be compared or charted
+together. An SDK that reports `dur` without knowing which it measured omits
+`durTo` rather than guessing; a reader treats an absent `durTo` as unknown, not
+as `headers`.
+
+An adapter never records a request to the capture endpoint itself. Every
+interception seam these SDKs use belongs to the host application as well, so an
+application that shares one HTTP client between its own traffic and the SDK's
+transport would otherwise capture each delivery, and each captured delivery
+would trigger the next.
 
 `native-crash` is delivered by the launch AFTER the one that crashed, so its
 envelope `t` is the relaunch, not the crash. `at` carries the Unix milliseconds

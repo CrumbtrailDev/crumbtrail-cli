@@ -161,15 +161,38 @@ application call, including its redirects and retries. Set
 is `true`. Stopping Crumbtrail prevents further events.
 
 The adapter records redacted URL, method, status, error type, and monotonic time
-to response headers. It leaves request and response bodies and headers untouched.
-Stream read failures after response headers are not captured. Original HTTP
-exceptions are rethrown. Capture failures do not replace HTTP results.
-Do not also call `recordRequest` for calls using this interceptor.
+to response headers. The event carries `durTo: "headers"`, which says the number
+excludes body download and decoding. It leaves request and response bodies and
+headers untouched. Stream read failures after response headers are not captured.
+
+Every failure the call throws is rethrown untouched, and every one of them is
+recorded first, not only `IOException`. A downstream interceptor that throws
+`IllegalStateException` ends the call just as visibly, and a session that showed
+a request starting and never finishing was the worst of both. Capture failures
+do not replace HTTP results. Do not also call `recordRequest` for calls using
+this interceptor.
+
+Requests to your Crumbtrail endpoint's own host are skipped. An application that
+gives Crumbtrail an OkHttp backed transport, to share its certificate pinning,
+would otherwise record the SDK's own delivery, and each recorded delivery would
+trigger the next.
+
+This instruments OkHttp and nothing else, and that is a real limit rather than
+an oversight. Android applications use OkHttp, Retrofit, Ktor and
+`HttpURLConnection` in rough parity, so an application built on any of the
+others captures no requests from this interceptor. Retrofit is covered when it
+is configured with the client above, because Retrofit runs on OkHttp. Ktor with
+a non OkHttp engine, and `HttpURLConnection`, still need `recordRequest` from
+wherever your application already sees the result.
+
+`compileOnly` leaves `okhttp3` references in a shipped class, so the JAR carries
+`META-INF/proguard/crumbtrail.pro` with `-dontwarn okhttp3.**`. R8 reads it
+automatically. An application that shrinks without OkHttp on its classpath needs
+no configuration of its own.
 
 Verify with `gradle test --tests '*OkHttp*'` from this package. In your app,
 issue a request through the configured client, flush Crumbtrail, and inspect its
-session for a `net` event with the request status. Other HTTP clients can still
-use `recordRequest` directly.
+session for a `net` event with the request status.
 
 ## Recording things yourself
 
