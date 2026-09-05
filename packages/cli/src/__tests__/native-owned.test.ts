@@ -10,23 +10,58 @@ import {
 import { fakeInjectIO } from "./helpers";
 
 const keys = { endpoint: "https://capture.example", apiKey: "bl_live_secret" };
-const NATIVE_STACKS = ["django", "flask", "fastapi", "rails", "go"] as const;
+// crumbtrail-python is on PyPI and the crumbtrail gem is on RubyGems, so these
+// stacks carry native guidance. The Go module has no tagged version, so it stays
+// on the OTLP path.
+const PUBLISHED_STACKS = ["django", "flask", "fastapi", "rails"] as const;
+const GATED_STACKS = ["go"] as const;
 
 describe("owned native setup", () => {
-  // The gate, not the copy. Nothing in NATIVE_PACKAGES resolves from a public
-  // registry: crumbtrail-python is not on PyPI, the crumbtrail gem is not on
-  // RubyGems, and packages/go exists only on an unmerged branch. Until that
-  // changes the CLI must not tell anyone to install one of them.
-  it("ships no native package the wizard is allowed to wire an app against", () => {
-    for (const [stack, native] of Object.entries(NATIVE_PACKAGES)) {
-      expect(native.published, `${stack} claims publication`).toBe(false);
-      expect(nativeCaptureSetup(stack as never, keys.endpoint, "orders")).toBe(
+  // The gate, not the copy. A stack may only be wired against an artifact that
+  // resolves from its public registry today.
+  it("wires an app only against a package that resolves from its registry", () => {
+    for (const stack of PUBLISHED_STACKS) {
+      expect(NATIVE_PACKAGES[stack]!.published, stack).toBe(true);
+      expect(
+        nativeCaptureSetup(stack, keys.endpoint, "orders"),
+        stack,
+      ).not.toBe(null);
+    }
+    for (const stack of GATED_STACKS) {
+      expect(NATIVE_PACKAGES[stack]!.published, stack).toBe(false);
+      expect(nativeCaptureSetup(stack, keys.endpoint, "orders"), stack).toBe(
         null,
       );
     }
   });
 
-  for (const stack of NATIVE_STACKS) {
+  for (const stack of PUBLISHED_STACKS) {
+    it(`points ${stack} at its published package`, () => {
+      const prompt = buildAgentPrompt(stack, keys, { serviceName: "orders" });
+      expect(prompt).toContain(NATIVE_PACKAGES[stack]!.package);
+      expect(prompt).not.toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
+      expect(prompt).not.toContain(keys.apiKey);
+      for (const step of NATIVE_PACKAGES[stack]!.registration) {
+        expect(prompt).toContain(step);
+      }
+
+      // The caller says the prompt already is the native setup, so the guide
+      // must not print the same block twice.
+      const guide = renderOtlpGuide({
+        stack,
+        serviceName: "orders",
+        endpoint: keys.endpoint,
+        snippet: "existing OTLP",
+        agentPrompt: prompt,
+        agentPromptIsNativeSetup: true,
+      });
+      expect(guide).toContain("existing OTLP");
+      expect(guide).toContain(prompt);
+      expect(guide).not.toContain("## Maintained native capture setup");
+    });
+  }
+
+  for (const stack of GATED_STACKS) {
     it(`keeps ${stack} on the OTLP path while its package is unpublished`, () => {
       const prompt = buildAgentPrompt(stack, keys, { serviceName: "orders" });
       expect(prompt).toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
@@ -117,13 +152,13 @@ describe("owned native setup", () => {
     };
     const plan = buildPlan(input, fakeInjectIO(files));
     expect(plan.content).toContain("python crumbtrail_otel.py");
-    // No native package is published, so nothing is written beside the tracing
-    // edits and every file the plan names is one the reader can act on.
-    expect(
-      plan.extraEdits?.some((e) =>
-        e.path.endsWith("CRUMBTRAIL_NATIVE_SETUP.md"),
-      ),
-    ).toBe(false);
+    // crumbtrail-python resolves, so the plan writes the native guide beside the
+    // tracing edits and names the package the reader can actually install.
+    const guide = plan.extraEdits?.find((e) =>
+      e.path.endsWith("CRUMBTRAIL_NATIVE_SETUP.md"),
+    );
+    expect(guide).toBeDefined();
+    expect(guide!.content).toContain(NATIVE_PACKAGES.fastapi!.package);
 
     const alreadyTraced = buildPlan(
       input,
