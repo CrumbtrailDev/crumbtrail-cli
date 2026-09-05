@@ -219,7 +219,9 @@ jobs:
       - name: Build gem
         if: ${{ steps.check.outputs.published == 'false' }}
         run: gem build crumbtrail.gemspec
-      - uses: rubygems/configure-rubygems-credentials@v1
+      # Pinned exactly: this action publishes no floating major tag, so `@v1`
+      # does not resolve and the job fails before any step runs.
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
         if: ${{ !inputs.dry_run && steps.check.outputs.published == 'false' }}
       - name: Publish
         if: ${{ !inputs.dry_run && steps.check.outputs.published == 'false' }}
@@ -246,9 +248,17 @@ jobs:
       - run: dotnet test packages/dotnet/Crumbtrail.AspNetCore.Tests
       - run: dotnet test packages/dotnet/Crumbtrail.EntityFrameworkCore.Tests
       - name: Pack
+        # -p:PackageOutputPath rather than -o, and an absolute path rather than a
+        # relative one. The SDK on the runner mangles `-o` into a bare
+        # `PackageOutputPath=...` argument, which MSBuild then reads as a second
+        # project and rejects with MSB1008. The property form is unambiguous on
+        # every SDK, and absolute keeps both projects writing to one directory
+        # instead of one beside each .csproj.
         run: |
-          dotnet pack packages/dotnet/Crumbtrail.AspNetCore -o .local-packs/dotnet
-          dotnet pack packages/dotnet/Crumbtrail.EntityFrameworkCore -o .local-packs/dotnet
+          dotnet pack packages/dotnet/Crumbtrail.AspNetCore \
+            -p:PackageOutputPath="$GITHUB_WORKSPACE/.local-packs/dotnet"
+          dotnet pack packages/dotnet/Crumbtrail.EntityFrameworkCore \
+            -p:PackageOutputPath="$GITHUB_WORKSPACE/.local-packs/dotnet"
       # Deliberately the last thing before the push: the temporary key expires
       # after an hour, and each OIDC token buys exactly one key, so requesting
       # it earlier only risks it going stale mid-run.
