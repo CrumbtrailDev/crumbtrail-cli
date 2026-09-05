@@ -1,0 +1,33 @@
+name: crumbtrail_flutter_http
+description: package:http adapter for Crumbtrail. Records status, method, redacted URL and time to response headers for requests made through a wrapped client.
+version: 0.1.0
+homepage: https://crumbtrail.ai
+repository: https://github.com/CrumbtrailDev/crumbtrail-cli
+issue_tracker: https://github.com/CrumbtrailDev/crumbtrail-cli/issues
+
+environment:
+  sdk: ^3.5.0
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Its own package precisely so this dependency exists here and not in
+  # crumbtrail_flutter. Dart has no compileOnly, so a dependency declared in the
+  # SDK is a dependency every consumer resolves, and an app pinned to a
+  # different major of package:http would fail `pub get` because of a capture
+  # adapter it never enabled.
+  http: ^1.2.0
+  crumbtrail_flutter: ^0.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+# Resolves against the sibling checkout until crumbtrail_flutter is published.
+# `dependency_overrides` is ignored when this package is itself a dependency, so
+# a consumer still resolves the constraint above.
+dependency_overrides:
+  crumbtrail_flutter:
+    path: ../flutter

@@ -29,7 +29,7 @@ public static class StructuredBody
     // Short words that appear inside innocent identifiers ("capacity" contains "city"), so they
     // are matched as whole words rather than as substrings.
     private static readonly Regex DeniedWord = new("^(pwd|pin|pan|otp|pass|sid|dob|zip|jwt|mfa|csrf|xsrf|city|town|geo|cell|race|sex|age|location|lat|lng|lon|gps)s?[0-9]*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static bool Sensitive(string key)
+    internal static bool Sensitive(string key)
     {
         var words = Regex.Replace(key, "([a-z0-9])([A-Z])", "$1 $2");
         var compact = Regex.Replace(key, "[^a-zA-Z0-9]", "");

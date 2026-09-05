@@ -51,6 +51,15 @@ dependencies {
         // and test — which is most of the SDK and all of the shared behaviour.
         logger.warn("android.jar not found: Android bindings will be skipped")
     }
+    // The host application supplies OkHttp. Packaging it would collide with
+    // whatever version the app already pins, and pinning one here would force a
+    // version on an app that never asked Crumbtrail for an HTTP client.
+    compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
+    // Named explicitly rather than arriving transitively through mockwebserver:
+    // a mockwebserver bump would otherwise silently move the version the
+    // interceptor is compiled and tested against.
+    testImplementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation(kotlin("test"))
 }
 
