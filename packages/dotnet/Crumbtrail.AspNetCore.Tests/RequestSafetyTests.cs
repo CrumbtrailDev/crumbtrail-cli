@@ -18,7 +18,7 @@ public sealed class RequestSafetyTests
     }
     private static CaptureOptions Options = new(new Uri("https://capture.example"), "key", "test") { ShouldCapture = _ => true };
     [Theory]
-    [InlineData(false, "/")]
+    [InlineData(false, "/reset/[REDACTED]")]
     [InlineData(true, "/reset/{token}")]
     public async Task Routes_never_export_raw_path_values(bool matched, string route)
     {
@@ -29,8 +29,34 @@ public sealed class RequestSafetyTests
         var wire = JsonSerializer.Serialize(sink.Events); Assert.DoesNotContain("private-token", wire);
         foreach (var item in sink.Events)
         {
-            var data = JsonSerializer.SerializeToElement(item.d); Assert.Equal(route, data.GetProperty("url").GetString()); Assert.Equal(route, data.GetProperty("route").GetString());
+            var data = JsonSerializer.SerializeToElement(item.d);
+            Assert.Equal("/reset/[REDACTED]", data.GetProperty("url").GetString());
+            Assert.Equal("/reset/[REDACTED]", data.GetProperty("pathname").GetString());
+            Assert.Equal(route, data.GetProperty("route").GetString());
         }
+    }
+
+    [Theory]
+    [InlineData("/", "/")]
+    [InlineData("/api/auth/whoami", "/api/auth/whoami")]
+    [InlineData("/orders/1042", "/orders/1042")]
+    [InlineData("/static/app.css", "/static/app.css")]
+    [InlineData("/session/8f14e45fceea167a5a36dedd4bea2543", "/session/[REDACTED]")]
+    [InlineData("/files/be3ac089-71fe-4dda-ae99-6403ec2dba82", "/files/[REDACTED]")]
+    [InlineData("/reset/private-token", "/reset/[REDACTED]")]
+    public void Unmatched_paths_keep_route_shape_without_exporting_values(string path, string expected)
+        => Assert.Equal(expected, CapturePath.Scrub(path));
+
+    [Fact]
+    public async Task Unmatched_requests_report_their_own_path()
+    {
+        var context = Context(); context.Request.Path = "/no/such/page"; var sink = new Sink();
+        await new CaptureMiddleware(http => { http.Response.StatusCode = 404; return Task.CompletedTask; })
+            .InvokeAsync(context, new(), Options, sink, NullLogger<CaptureMiddleware>.Instance);
+        var data = JsonSerializer.SerializeToElement(Assert.Single(sink.Events, e => e.k == "backend.req.end").d);
+        Assert.Equal("/no/such/page", data.GetProperty("url").GetString());
+        Assert.Equal("/no/such/page", data.GetProperty("route").GetString());
+        Assert.Equal(404, data.GetProperty("statusCode").GetInt32());
     }
     [Fact]
     public async Task Short_request_is_withheld_without_changing_bytes_read_by_application()

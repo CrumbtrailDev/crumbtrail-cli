@@ -15,8 +15,8 @@ public sealed class CaptureMiddleware(RequestDelegate next)
                 context.Request.Headers["x-crumbtrail-request-id"].ToString()))
         { await next(context); return; }
 
-        var route = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? "/";
-        var path = route;
+        var path = CapturePath.Scrub(context.Request.Path.Value);
+        var route = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? path;
         var watch = Stopwatch.StartNew();
         var requestBody = new CapturedBody(null, "missing");
         if (IsJson(context.Request.ContentType) &&
@@ -72,6 +72,7 @@ public sealed class CaptureMiddleware(RequestDelegate next)
                 capture.Flush(sink);
             }
             catch { log.LogWarning("Crumbtrail could not prepare request evidence"); }
+            capture.Stop();
             tee.Captured.Dispose();
         }
     }
