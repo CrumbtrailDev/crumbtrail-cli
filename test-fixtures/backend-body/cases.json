@@ -1,0 +1,393 @@
+{
+  "$comment": "Structured backend body policy. Normative for every Crumbtrail SDK that captures a request or response body: the Ruby, Go and ASP.NET Core packages each run this file and must agree on it. Changing a case therefore fails all three at once, which is the point: three hand written copies of the same policy drifted apart on day one.",
+  "policy": "crumbtrail.backend-redaction.v1",
+  "limits": {
+    "bytes": 16384,
+    "nesting": 8,
+    "keys": 64,
+    "items": 40,
+    "integerDigits": 6,
+    "safeInteger": 9007199254740991
+  },
+  "states": {
+    "captured": "Parsed and nothing was withheld.",
+    "redacted": "Parsed and at least one value was withheld.",
+    "invalid": "Malformed, ambiguous or structurally excessive.",
+    "truncated": "Larger than the byte limit, or known to be incomplete.",
+    "missing": "There was no body to capture."
+  },
+  "notes": [
+    "A denied name is redacted whole and the subtree under it is never inspected, so an odd field inside a secret cannot decide the whole body is invalid.",
+    "Ruby and Go reject duplicate keys anywhere in the document because their parsers see them; .NET does not see duplicates inside a subtree it has already redacted. That is the one place the three answers differ, and no case here depends on it."
+  ],
+  "cases": [
+    {
+      "name": "safe_operands",
+      "why": "Bounded numbers, booleans, null, short enums and ISO currency codes are the operands an agent reasons with.",
+      "input": "{\"amount\":18.75,\"entityId\":731,\"currency\":\"CAD\",\"ok\":true,\"note\":null}",
+      "state": "captured",
+      "body": {
+        "amount": 18.75,
+        "entityId": 731,
+        "currency": "CAD",
+        "ok": true,
+        "note": null
+      }
+    },
+    {
+      "name": "sensitive_key_redacted",
+      "why": "A denied name is dropped and the shape around it is kept.",
+      "input": "{\"amount\":12,\"password\":\"do-not-capture\"}",
+      "state": "redacted",
+      "body": {
+        "amount": 12,
+        "password": "[REDACTED]"
+      }
+    },
+    {
+      "name": "sensitive_subtree_not_walked",
+      "why": "The subtree under a denied name is never inspected, so an odd field inside a secret cannot decide the whole body is invalid.",
+      "input": "{\"password\":{\"a-b\":1}}",
+      "state": "redacted",
+      "body": {
+        "password": "[REDACTED]"
+      }
+    },
+    {
+      "name": "sensitive_array_redacted_whole",
+      "why": "A denied name covers the array, not each element separately.",
+      "input": "{\"tokens\":[\"red\",\"blue\"]}",
+      "state": "redacted",
+      "body": {
+        "tokens": "[REDACTED]"
+      }
+    },
+    {
+      "name": "free_text_withheld",
+      "why": "Free text carries whatever the user typed.",
+      "input": "{\"note\":\"hello world\"}",
+      "state": "redacted",
+      "body": {
+        "note": "[REDACTED]"
+      }
+    },
+    {
+      "name": "token_shape_withheld",
+      "why": "A credential shape is withheld even under an innocent name.",
+      "input": "{\"note\":\"sk_live_abcdefghijklmno\"}",
+      "state": "redacted",
+      "body": {
+        "note": "[REDACTED]"
+      }
+    },
+    {
+      "name": "card_number_withheld",
+      "why": "Sixteen digits is far past the digit cap.",
+      "input": "{\"id\":4111111111111111}",
+      "state": "redacted",
+      "body": {
+        "id": "[REDACTED]"
+      }
+    },
+    {
+      "name": "card_across_decimal",
+      "why": "A card split by a decimal point keeps a short integer part, so the Luhn check is what catches it.",
+      "input": "{\"ratio\":411111.1111111111}",
+      "state": "redacted",
+      "body": {
+        "ratio": "[REDACTED]"
+      }
+    },
+    {
+      "name": "phone_number_withheld",
+      "why": "Ten digits reaches phone length.",
+      "input": "{\"mobile\":4165551234}",
+      "state": "redacted",
+      "body": {
+        "mobile": "[REDACTED]"
+      }
+    },
+    {
+      "name": "phone_string_withheld",
+      "why": "The same number as a string.",
+      "input": "{\"contact\":\"4165551234\"}",
+      "state": "redacted",
+      "body": {
+        "contact": "[REDACTED]"
+      }
+    },
+    {
+      "name": "identifier_withheld",
+      "why": "Nine digits reaches national identifier length.",
+      "input": "{\"identifier\":123456789}",
+      "state": "redacted",
+      "body": {
+        "identifier": "[REDACTED]"
+      }
+    },
+    {
+      "name": "city_withheld",
+      "why": "A city name locates a person.",
+      "input": "{\"city\":\"toronto\"}",
+      "state": "redacted",
+      "body": {
+        "city": "[REDACTED]"
+      }
+    },
+    {
+      "name": "diagnosis_withheld",
+      "why": "A diagnosis is the most sensitive thing a body can carry.",
+      "input": "{\"diagnosis\":\"cancer\"}",
+      "state": "redacted",
+      "body": {
+        "diagnosis": "[REDACTED]"
+      }
+    },
+    {
+      "name": "short_denied_word_is_not_a_substring",
+      "why": "\"capacity\" contains \"city\" and \"page\" contains \"age\". Neither is sensitive.",
+      "input": "{\"capacity\":50,\"page\":3,\"pageSize\":25}",
+      "state": "captured",
+      "body": {
+        "capacity": 50,
+        "page": 3,
+        "pageSize": 25
+      }
+    },
+    {
+      "name": "mixed_body",
+      "why": "The request body the Rack, net/http and ASP.NET Core tests all send.",
+      "input": "{\"amount\":18.75,\"email\":\"x@example.com\",\"routing_number\":123,\"note\":\"hello world\",\"id\":4111111111111111}",
+      "state": "redacted",
+      "body": {
+        "amount": 18.75,
+        "email": "[REDACTED]",
+        "routing_number": "[REDACTED]",
+        "note": "[REDACTED]",
+        "id": "[REDACTED]"
+      }
+    },
+    {
+      "name": "digit_cap_boundary",
+      "why": "Six digits is kept, seven is not.",
+      "input": "{\"a\":999999,\"b\":1000000}",
+      "state": "redacted",
+      "body": {
+        "a": 999999,
+        "b": "[REDACTED]"
+      }
+    },
+    {
+      "name": "currency_code",
+      "why": "Exactly three uppercase letters is a currency unit.",
+      "input": "{\"currency\":\"CAD\"}",
+      "state": "captured",
+      "body": {
+        "currency": "CAD"
+      }
+    },
+    {
+      "name": "uppercase_word_withheld",
+      "why": "Four uppercase letters is not a currency unit.",
+      "input": "{\"code\":\"ABCD\"}",
+      "state": "redacted",
+      "body": {
+        "code": "[REDACTED]"
+      }
+    },
+    {
+      "name": "duplicate_key_invalid",
+      "why": "An ambiguous object loses an operand whichever value wins.",
+      "input": "{\"a\":1,\"a\":2}",
+      "state": "invalid",
+      "body": null
+    },
+    {
+      "name": "malformed_invalid",
+      "why": "Truncated JSON is not a body.",
+      "input": "{\"a\":",
+      "state": "invalid",
+      "body": null
+    },
+    {
+      "name": "field_name_invalid",
+      "why": "A key outside the identifier shape is refused rather than normalised.",
+      "input": "{\"a-b\":1}",
+      "state": "invalid",
+      "body": null
+    },
+    {
+      "name": "empty_missing",
+      "why": "No body at all.",
+      "input": "",
+      "state": "missing",
+      "body": null
+    },
+    {
+      "name": "nesting_at_limit",
+      "why": "Eight levels is the limit.",
+      "input": "[[[[[[[[1]]]]]]]]",
+      "state": "captured",
+      "body": [
+        [
+          [
+            [
+              [
+                [
+                  [
+                    [
+                      1
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "nesting_over_limit",
+      "why": "Nine levels is refused.",
+      "input": "[[[[[[[[[1]]]]]]]]]",
+      "state": "invalid",
+      "body": null
+    },
+    {
+      "name": "items_at_limit",
+      "why": "Forty items is the limit.",
+      "input": "{\"tags\":[\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\"]}",
+      "state": "captured",
+      "body": {
+        "tags": [
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red",
+          "red"
+        ]
+      }
+    },
+    {
+      "name": "items_over_limit",
+      "why": "Forty one items is refused.",
+      "input": "{\"tags\":[\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\",\"red\"]}",
+      "state": "invalid",
+      "body": null
+    },
+    {
+      "name": "keys_at_limit",
+      "why": "Sixty four keys is the limit.",
+      "input": "{\"k0\":0,\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4,\"k5\":5,\"k6\":6,\"k7\":7,\"k8\":8,\"k9\":9,\"k10\":10,\"k11\":11,\"k12\":12,\"k13\":13,\"k14\":14,\"k15\":15,\"k16\":16,\"k17\":17,\"k18\":18,\"k19\":19,\"k20\":20,\"k21\":21,\"k22\":22,\"k23\":23,\"k24\":24,\"k25\":25,\"k26\":26,\"k27\":27,\"k28\":28,\"k29\":29,\"k30\":30,\"k31\":31,\"k32\":32,\"k33\":33,\"k34\":34,\"k35\":35,\"k36\":36,\"k37\":37,\"k38\":38,\"k39\":39,\"k40\":40,\"k41\":41,\"k42\":42,\"k43\":43,\"k44\":44,\"k45\":45,\"k46\":46,\"k47\":47,\"k48\":48,\"k49\":49,\"k50\":50,\"k51\":51,\"k52\":52,\"k53\":53,\"k54\":54,\"k55\":55,\"k56\":56,\"k57\":57,\"k58\":58,\"k59\":59,\"k60\":60,\"k61\":61,\"k62\":62,\"k63\":63}",
+      "state": "captured",
+      "body": {
+        "k0": 0,
+        "k1": 1,
+        "k2": 2,
+        "k3": 3,
+        "k4": 4,
+        "k5": 5,
+        "k6": 6,
+        "k7": 7,
+        "k8": 8,
+        "k9": 9,
+        "k10": 10,
+        "k11": 11,
+        "k12": 12,
+        "k13": 13,
+        "k14": 14,
+        "k15": 15,
+        "k16": 16,
+        "k17": 17,
+        "k18": 18,
+        "k19": 19,
+        "k20": 20,
+        "k21": 21,
+        "k22": 22,
+        "k23": 23,
+        "k24": 24,
+        "k25": 25,
+        "k26": 26,
+        "k27": 27,
+        "k28": 28,
+        "k29": 29,
+        "k30": 30,
+        "k31": 31,
+        "k32": 32,
+        "k33": 33,
+        "k34": 34,
+        "k35": 35,
+        "k36": 36,
+        "k37": 37,
+        "k38": 38,
+        "k39": 39,
+        "k40": 40,
+        "k41": 41,
+        "k42": 42,
+        "k43": 43,
+        "k44": 44,
+        "k45": 45,
+        "k46": 46,
+        "k47": 47,
+        "k48": 48,
+        "k49": 49,
+        "k50": 50,
+        "k51": 51,
+        "k52": 52,
+        "k53": 53,
+        "k54": 54,
+        "k55": 55,
+        "k56": 56,
+        "k57": 57,
+        "k58": 58,
+        "k59": 59,
+        "k60": 60,
+        "k61": 61,
+        "k62": 62,
+        "k63": 63
+      }
+    },
+    {
+      "name": "keys_over_limit",
+      "why": "Sixty five keys is refused.",
+      "input": "{\"k0\":0,\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4,\"k5\":5,\"k6\":6,\"k7\":7,\"k8\":8,\"k9\":9,\"k10\":10,\"k11\":11,\"k12\":12,\"k13\":13,\"k14\":14,\"k15\":15,\"k16\":16,\"k17\":17,\"k18\":18,\"k19\":19,\"k20\":20,\"k21\":21,\"k22\":22,\"k23\":23,\"k24\":24,\"k25\":25,\"k26\":26,\"k27\":27,\"k28\":28,\"k29\":29,\"k30\":30,\"k31\":31,\"k32\":32,\"k33\":33,\"k34\":34,\"k35\":35,\"k36\":36,\"k37\":37,\"k38\":38,\"k39\":39,\"k40\":40,\"k41\":41,\"k42\":42,\"k43\":43,\"k44\":44,\"k45\":45,\"k46\":46,\"k47\":47,\"k48\":48,\"k49\":49,\"k50\":50,\"k51\":51,\"k52\":52,\"k53\":53,\"k54\":54,\"k55\":55,\"k56\":56,\"k57\":57,\"k58\":58,\"k59\":59,\"k60\":60,\"k61\":61,\"k62\":62,\"k63\":63,\"k64\":64}",
+      "state": "invalid",
+      "body": null
+    }
+  ]
+}
