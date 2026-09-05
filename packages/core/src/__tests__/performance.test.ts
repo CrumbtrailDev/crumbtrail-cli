@@ -216,6 +216,44 @@ describe("performanceCollector", () => {
       // None of these matched the own-endpoint origin, so all are kept.
       expect(events.filter((e) => e.k === "perf")).toHaveLength(4);
     });
+
+    it("drops configEndpoint entries on a second origin, keeps an application entry on the same path elsewhere", async () => {
+      // A self hosted config service can live on a different origin than
+      // httpEndpoint, so its poll has to be excluded independently rather than
+      // assumed to share httpEndpoint's origin.
+      const performanceCollector = await loadCollector();
+      performanceCollector(bus, {
+        ...DEFAULT_CONFIG,
+        httpEndpoint: "https://app.crumbtrail.ai",
+        configEndpoint: "https://config.example-selfhost.com/capture-config",
+      });
+
+      const resourceObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "resource",
+      );
+
+      resourceObserver!.simulateEntries([
+        {
+          entryType: "resource",
+          name: "https://config.example-selfhost.com/capture-config",
+          duration: 5,
+          transferSize: 300,
+          initiatorType: "fetch",
+        },
+        {
+          entryType: "resource",
+          name: "https://app.example.com/capture-config",
+          duration: 20,
+          transferSize: 500,
+          initiatorType: "fetch",
+        },
+      ]);
+
+      bus.flush();
+      const perf = events.filter((e) => e.k === "perf");
+      expect(perf).toHaveLength(1);
+      expect(perf[0].d.name).toBe("https://app.example.com/capture-config");
+    });
   });
 
   it("caps perf events per session and records the shedding as a capture gap", async () => {
