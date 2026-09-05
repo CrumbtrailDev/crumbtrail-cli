@@ -150,6 +150,33 @@ const MAX_DELIVERY_GAP_EVENTS = 3;
  * `capture_gap` when the gate finally opens.
  */
 const MAX_PENDING_ADMISSION_EVENTS = 2_000;
+
+/**
+ * Byte ceiling on the same hold, because the count alone does not bound it.
+ *
+ * Under `consentMode: "required"` the hold waits for a `consent()` call that
+ * may never come, and 2,000 events is a small number when one of them is a DOM
+ * snapshot capped at 256 KB. 4 MB is roughly the largest first screen worth
+ * keeping and well under what a page can spare; past it the oldest events go,
+ * counted as `buffer_overflow` like any other cap.
+ */
+const MAX_PENDING_ADMISSION_BYTES = 4_194_304;
+
+/**
+ * Size of one held event, for the byte ceiling above.
+ *
+ * `JSON.stringify` is what the transport will do to this event anyway, so it
+ * measures the thing being bounded rather than a proxy for it. A payload that
+ * cannot be serialized is counted at zero: it will not reach the wire either,
+ * and a throw here would lose an event to a measurement.
+ */
+function estimateHeldEventBytes(event: BugEvent): number {
+  try {
+    return JSON.stringify(event)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
 import { buildMaskedDomSnapshot, maskText } from "./masking";
 import { CAPTURE_GAP_EVENT_KIND } from "./types";
 
@@ -644,8 +671,10 @@ export class Crumbtrail {
    * ever transporting them, which is the same outcome refusing them had.
    */
   private pendingAdmissionEvents: HeldEvent[] = [];
-  /** Events the hold discarded to stay under its cap, as one `capture_gap`. */
+  /** Events the hold discarded to stay under its caps, as one `capture_gap`. */
   private pendingAdmissionDropped = 0;
+  /** Running total of the held events' sizes, kept under the byte ceiling. */
+  private pendingAdmissionBytes = 0;
   /**
    * The masking switches in force when the hold started. A policy that tightens
    * them cannot be applied retroactively to content already rendered into an
@@ -1838,6 +1867,7 @@ export class Crumbtrail {
       // A visitor this policy just shed must not upload it.
       this.pendingAdmissionEvents = [];
       this.pendingAdmissionDropped = 0;
+      this.pendingAdmissionBytes = 0;
       this.pendingAdmissionMasking = undefined;
       this.emitSamplingGapIfNeeded();
     }
@@ -2226,10 +2256,28 @@ export class Crumbtrail {
       this.bus.flush();
       // Anything still held belongs to the session that is ending. Carrying it
       // past the close would replay pre-suspend events, with pre-suspend
-      // timestamps, into the new session `resumeFromLifecycle` mints.
+      // timestamps, into the new session `resumeFromLifecycle` mints. The
+      // discard is declared: this session is still sending, so it can say what
+      // it lost rather than ending with a first screen that never existed.
+      const discarded =
+        this.pendingAdmissionEvents.length + this.pendingAdmissionDropped;
       this.pendingAdmissionEvents = [];
       this.pendingAdmissionDropped = 0;
+      this.pendingAdmissionBytes = 0;
       this.pendingAdmissionMasking = undefined;
+      if (discarded > 0) {
+        // Queued rather than emitted: the bus gate closes on the next line, so
+        // an emit here would be refused. The deferred queue is sent by this
+        // close, before `endSession`.
+        this.deferredDeliveryGaps.push(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "session_ended_unanswered",
+            droppedEventCount: discarded,
+            sessionId: this.sessionId,
+          }),
+        );
+      }
       this.lifecycleClosing = true;
       this.expirePersistedVisit();
       try {
@@ -2692,17 +2740,27 @@ export class Crumbtrail {
     // release pass can match `excludeUrls` against what the application asked
     // for rather than against the redacted copy, and it is dropped with the
     // entry.
+    const bytes = estimateHeldEventBytes(event);
     this.pendingAdmissionEvents.push({
       event,
+      bytes,
       ...(context?.rawUrl !== undefined ? { rawUrl: context.rawUrl } : {}),
     });
-    const overflow =
-      this.pendingAdmissionEvents.length - MAX_PENDING_ADMISSION_EVENTS;
-    if (overflow > 0) {
-      // Oldest first, matching the bus buffer: the events nearest whatever
-      // opened the gate are the ones a reader is looking for.
-      this.pendingAdmissionEvents.splice(0, overflow);
-      this.pendingAdmissionDropped += overflow;
+    this.pendingAdmissionBytes += bytes;
+    // Oldest first, matching the bus buffer: the events nearest whatever opens
+    // the gate are the ones a reader is looking for. Both ceilings evict the
+    // same way, so one loop serves them. The byte ceiling never empties the
+    // hold: one event over the limit is kept rather than losing the newest
+    // thing that happened.
+    while (
+      this.pendingAdmissionEvents.length > MAX_PENDING_ADMISSION_EVENTS ||
+      (this.pendingAdmissionBytes > MAX_PENDING_ADMISSION_BYTES &&
+        this.pendingAdmissionEvents.length > 1)
+    ) {
+      const evicted = this.pendingAdmissionEvents.shift();
+      if (!evicted) break;
+      this.pendingAdmissionBytes -= evicted.bytes;
+      this.pendingAdmissionDropped += 1;
     }
   }
 
@@ -2715,12 +2773,13 @@ export class Crumbtrail {
    */
   private releasePendingAdmissionEvents(admitted: boolean): void {
     const held = this.pendingAdmissionEvents;
-    let overflowDropped = this.pendingAdmissionDropped;
+    const overflowDropped = this.pendingAdmissionDropped;
     let policyDropped = 0;
     const heldMasking =
       this.pendingAdmissionMasking ?? readMaskingState(this.config);
     this.pendingAdmissionEvents = [];
     this.pendingAdmissionDropped = 0;
+    this.pendingAdmissionBytes = 0;
     this.pendingAdmissionMasking = undefined;
     if (!admitted || held.length === 0) return;
 

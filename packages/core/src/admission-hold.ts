@@ -101,6 +101,72 @@ const MASKING_DEPENDENT_KINDS = new Set([
 ]);
 
 /** Per-kind ceilings, so a re-redaction does not re-cap a frame at the body limit. */
+/**
+ * Text fields a policy can shrink after an event carrying them was held.
+ *
+ * The network body path has its own re-redaction, which re-runs a redactor and
+ * can summarise a body away. These four are plainer: the collector that built
+ * them truncated the text at a cap the policy has since lowered, so the release
+ * pass truncates to the new cap the same way, and marks the event truncated
+ * where the collector marks it.
+ */
+const TRUNCATED_TEXT_FIELDS: Record<
+  string,
+  {
+    limit: keyof CrumbtrailConfig;
+    fields: readonly string[];
+    /** The collector sets this beside the text; release keeps it honest. */
+    flag?: string;
+    /** `state.snap` appends this when it cuts, so a reader sees the cut. */
+    ellipsis?: boolean;
+  }
+> = {
+  clip: { limit: "clipboardMaxLength", fields: ["txt"] },
+  stor: { limit: "storageValueMaxLength", fields: ["oldVal", "newVal"] },
+  "state.snap": {
+    limit: "stateMaxBytes",
+    fields: ["json"],
+    flag: "truncated",
+    ellipsis: true,
+  },
+  "dom.snap": {
+    limit: "domSnapshotMaxBytes",
+    fields: ["html"],
+    flag: "truncated",
+  },
+};
+
+/**
+ * Applies the size cap for this kind to whatever text it carries.
+ *
+ * A held `clip`, `stor`, `state.snap` or `dom.snap` was built under the local
+ * cap. Without this it releases at that size under a policy that asked for
+ * less, which is the same leak as an uncapped body, in a field the body path
+ * never looks at.
+ */
+function applySizeCaps(
+  kind: string,
+  data: Record<string, unknown>,
+  config: CrumbtrailConfig,
+): void {
+  const spec = TRUNCATED_TEXT_FIELDS[kind];
+  if (!spec) return;
+  const limit = config[spec.limit];
+  if (typeof limit !== "number" || limit <= 0) return;
+  let cut = false;
+  for (const field of spec.fields) {
+    const value = data[field];
+    if (typeof value !== "string" || value.length <= limit) continue;
+    data[field] = spec.ellipsis
+      ? `${value.slice(0, limit)}...`
+      : value.slice(0, limit);
+    cut = true;
+  }
+  // Never cleared: a collector that already truncated at its own cap is still
+  // truncated whatever this pass did.
+  if (cut && spec.flag) data[spec.flag] = true;
+}
+
 function maxBodyLengthFor(kind: string, config: CrumbtrailConfig): number {
   if (kind === "net.ws") return WS_MAX_FRAME_BYTES;
   if (kind === "worker.msg") return WORKER_MAX_MESSAGE_BYTES;
@@ -145,6 +211,8 @@ function maskingTightened(
  */
 export interface HeldEvent {
   event: BugEvent;
+  /** Serialized size, counted once, so eviction can subtract it exactly. */
+  bytes: number;
   rawUrl?: string;
 }
 
@@ -276,6 +344,15 @@ export function reapplyPolicyToHeldEvent(
   const data: Record<string, unknown> = { ...event.d };
 
   if (config.networkCaptureHeaders === false) delete data.hdrs;
+
+  // The environment snapshot is emitted at init and so is always held. It
+  // carries the `utm_*` labels under `campaign`, which the collector switch has
+  // no other way to reach: `env` is the environment collector's event, not the
+  // campaign switch's, so turning `campaign` off drops the labels rather than
+  // the snapshot.
+  if (config.campaign === false) delete data.campaign;
+
+  applySizeCaps(event.k, data, config);
 
   // `captureInputValues: false` is a one-way switch that turns every input into
   // a placeholder. `redactInputValue` reads it off the module-level flag the

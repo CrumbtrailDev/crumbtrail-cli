@@ -346,6 +346,15 @@ export function emitFilePartEvents(
   requestId: number,
   formData: Iterable<[string, unknown]>,
   requestTime: number,
+  /**
+   * The request's own URL, passed through to the bus and never written onto the
+   * event. A file part carries no URL of its own, so without it the admission
+   * hold cannot test the part against an `excludeUrls` tightening: it would
+   * drop the `net.req` and `net.res` for an excluded upload and release the
+   * part beside them, with the field name, extension, name shape, MIME type and
+   * image dimensions intact.
+   */
+  requestUrl: string,
 ): void {
   let tasks: FileSniffTask[];
   try {
@@ -361,17 +370,20 @@ export function emitFilePartEvents(
       sync = {};
     }
     const emit = (sniffed: FileSniffResult) => {
-      bus.emit({
-        t: requestTime,
-        k: "net.req.file",
-        d: {
-          id: requestId,
-          field: task.field,
-          index: task.index,
-          ...sync,
-          ...sniffed,
+      bus.emit(
+        {
+          t: requestTime,
+          k: "net.req.file",
+          d: {
+            id: requestId,
+            field: task.field,
+            index: task.index,
+            ...sync,
+            ...sniffed,
+          },
         },
-      });
+        { rawUrl: requestUrl },
+      );
     };
     sniffFile(task.file)
       .then(emit)
