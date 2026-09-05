@@ -35,12 +35,14 @@ single home on its own platform's registry. Three of them are built and tested
 here but not released yet, so the status column is the one to read first: the
 setup wizard will not wire an app against a package it cannot resolve.
 
-| SDK                                                  | Registry                                                                                   | Status            |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------- |
-| [`Crumbtrail` (Swift)](packages/swift)               | Swift Package Manager. Native iOS, macOS and tvOS. No dependencies.                        | Not published yet |
-| [`tauri-plugin-crumbtrail`](packages/tauri/rust)     | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published         |
-| [`ai.crumbtrail:crumbtrail-kotlin`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet |
-| [`crumbtrail_flutter`](packages/flutter)             | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet |
+| SDK                                                   | Registry                                                                                   | Status                |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
+| [`Crumbtrail` (Swift)](packages/swift)                | Swift Package Manager. Native iOS, macOS and tvOS. No dependencies.                        | Not published yet     |
+| [`tauri-plugin-crumbtrail`](packages/tauri/rust)      | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published             |
+| [`ai.crumbtrail:crumbtrail-kotlin`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet     |
+| [`crumbtrail_flutter`](packages/flutter)              | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet     |
+| [`crumbtrail_flutter_http`](packages/flutter-http)    | pub.dev. `package:http` capture for Flutter. Optional, so an app never resolves a client it does not use. | Not published yet     |
+| [`crumbtrail_flutter_dio`](packages/flutter-dio)      | pub.dev. Dio capture for Flutter. Optional, so an app never resolves a client it does not use. | Not published yet     |
 
 ## Quick start
 

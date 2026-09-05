@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup><TargetFramework>net9.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><PackageId>Crumbtrail.EntityFrameworkCore</PackageId><Version>0.1.0</Version><Description>Crumbtrail EF Core command and committed change capture.</Description><PackageLicenseExpression>MIT</PackageLicenseExpression><PackageReadmeFile>README.md</PackageReadmeFile><RepositoryUrl>https://github.com/CrumbtrailDev/crumbtrail-cli</RepositoryUrl></PropertyGroup>
+<ItemGroup><ProjectReference Include="../Crumbtrail.AspNetCore/Crumbtrail.AspNetCore.csproj"/><PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.0"/></ItemGroup>
+<ItemGroup><None Include="../README.md" Pack="true" PackagePath="/"/><None Include="../../../LICENSE" Pack="true" PackagePath="/"/></ItemGroup>
+</Project>

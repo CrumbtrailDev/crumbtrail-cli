@@ -95,24 +95,69 @@ GoRouter(
 
 ### Requests
 
-Flutter has no single HTTP chokepoint the way a browser does, so requests are
-recorded explicitly. This is deliberate: swallowing every request through a
-global interceptor would capture requests from packages you did not choose to
-instrument.
+The HTTP adapters ship as their own packages, `crumbtrail_flutter_http` and
+`crumbtrail_flutter_dio`. Dart has no compile-only dependency, so anything this
+SDK declares is a package every application resolves; an application pinned to
+Dio 4 must not fail `pub get` because of a capture adapter it never enabled.
+Add whichever one matches the client you already use.
 
-```dart
-final started = DateTime.now();
-final response = await client.get(url);
-Crumbtrail.instance?.recordRequest(
-  url: url.toString(),
-  method: 'GET',
-  status: response.statusCode,
-  durationMs: DateTime.now().difference(started).inMilliseconds,
-);
+```yaml
+dependencies:
+  crumbtrail_flutter: ^0.1.0
+  crumbtrail_flutter_http: ^0.1.0 # or crumbtrail_flutter_dio: ^0.1.0
 ```
 
-The URL is redacted before it is queued: userinfo, fragment and
-credential-shaped query values are stripped on the device.
+```dart
+import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
+import 'package:crumbtrail_flutter_http/crumbtrail_flutter_http.dart';
+import 'package:http/http.dart' as http;
+
+final client = CrumbtrailClient(
+  crumbtrail: Crumbtrail.instance!,
+  inner: http.Client(),
+);
+final response = await client.get(Uri.parse('https://example.com/api/items'));
+client.close(); // Also closes the wrapped client.
+```
+
+For Dio:
+
+```dart
+import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
+import 'package:crumbtrail_flutter_dio/crumbtrail_flutter_dio.dart';
+import 'package:dio/dio.dart';
+
+final dio = Dio();
+dio.interceptors.add(CrumbtrailDioInterceptor(Crumbtrail.instance!));
+```
+
+Start Crumbtrail before registering an adapter. Set
+`CrumbtrailCollectors(network: false)` to disable adapter capture. The default
+is `true`. Stopping Crumbtrail prevents further events. Register each adapter
+once and avoid calling `recordRequest` for the same request.
+
+The adapters record status, URL, method, duration, and error type. They do not
+read bodies or add headers, and URLs are redacted before queueing. The original
+response, exception, cancellation and stream all reach your application
+untouched, and a capture failure never replaces an HTTP result. Requests to your
+Crumbtrail endpoint's own host are skipped, so sharing a client with the SDK's
+transport cannot feed capture into itself.
+
+Duration means different things in the two adapters, and each event says which.
+The `http` wrapper reports `durTo: "headers"`, time until the response head is
+available. Dio reports `durTo: "body"`, because its response interceptor cannot
+run until the body has been buffered and decoded. With `ResponseType.stream`,
+Dio returns before the stream is consumed, and a later stream read error is not
+captured by either adapter.
+
+A client neither adapter wraps records nothing, which is a real limit rather
+than an oversight. `HttpClient` from `dart:io`, a hand rolled client, or any
+package built directly on `dart:io` still needs `recordRequest` from wherever
+your application already sees the result.
+
+Verify with `flutter test` from `packages/flutter-http` or `packages/flutter-dio`.
+For an application check, issue a request through the configured client, flush
+Crumbtrail, and inspect its session for a `net` event with the request status.
 
 ### Caught errors
 
@@ -135,7 +180,7 @@ try {
 | Dart hang | Foreground Dart event loop watchdog, disabled in debug mode by default |
 | Screen changes | `CrumbtrailNavigatorObserver` |
 | Environment | OS, OS version, locale and Dart version, from `dart:io` |
-| Requests | `recordRequest`, redacted |
+| Requests | `recordRequest`, or an adapter package, redacted metadata |
 
 Both error surfaces are installed, and both chain to any handler already in
 place, so adding Crumbtrail never silently removes a crash reporter you already

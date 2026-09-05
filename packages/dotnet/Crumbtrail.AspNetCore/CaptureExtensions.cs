@@ -11,6 +11,7 @@ public static class CaptureExtensions
     {
         services.AddSingleton(options);
         services.TryAddScoped<CaptureContext>();
+        services.TryAddScoped<CaptureCache>();
         services.AddSingleton(sp => new CaptureSender(options,
             new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(5) },
             sp.GetRequiredService<ILogger<CaptureSender>>()));

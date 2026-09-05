@@ -2,9 +2,12 @@
 
 Machine readable form of [`docs/specs/native-sdk-wire-contract.md`](../../docs/specs/native-sdk-wire-contract.md).
 
-Every SDK that is not built on `crumbtrail-core` — Swift, Kotlin, and Dart —
-ships a conformance test that constructs its own event types, serialises them,
-and asserts the result equals the fixture here. React Native uses the core
+Every SDK that is not built on `crumbtrail-core` — Swift, Kotlin, Dart, Ruby,
+and Go — ships a conformance test that constructs its own event types,
+serialises them, and asserts the result equals the fixture here. The Ruby and
+Go packages are backend capture SDKs and do not emit the mobile event kinds, so
+their tests assert the envelope: the field names, which of them are optional,
+and how each one encodes. React Native uses the core
 event envelope, and its native bridge tests validate the same bounded payload
 before handing it to core. The `native-hang-js.json` and
 `native-hang-dart.json` fixtures cover the framework specific watchdog sources.
