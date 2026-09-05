@@ -902,6 +902,28 @@ unit}`. These power the display-arithmetic detector (subtotal + tax vs total)
 and the UI-vs-API divergence detector. It never captures raw DOM or HTML, only
 the short label and the parsed number.
 
+Two further shapes are read, because a list screen states its own counts in
+prose rather than as bare numbers. First, a text node whose **whole** content
+is a short count phrase:
+
+| Rendered                                                            | Items                               |
+| ------------------------------------------------------------------- | ----------------------------------- |
+| `{n} {noun}` ("31 people")                                          | `{ label: noun, value: n }`         |
+| `Page {a} of {b}`                                                   | `page` = a, `pages` = b             |
+| `{a}-{b} of {n}` (also en/em dash, `to`, optional `Showing` prefix) | `range_start`, `range_end`, `total` |
+| `Showing {a} of {n}`                                                | `shown` = a, `total` = n            |
+
+The noun is one to three lowercase words and may not contain a function word,
+so a sentence that merely mentions a number ("We have 31 people on the team.")
+is not a count and produces nothing. Labels come only from the phrase's own
+noun or the pattern's fixed words, never from surrounding text.
+
+Second, a pager control's state: a `button` or `a` whose accessible text is
+Previous, Prev, Next, Newer, Older, First or Last emits
+`{ label: "control:<text>", value: 1 | 0 }`, where the value is a boolean, 1 for
+actionable and 0 for disabled (`disabled` or `aria-disabled="true"`), not a
+count. The `control:` prefix is what tells the two apart.
+
 This means numeric amounts shown on screen are captured together with their
 labels. Labels run through the redaction classifier, so PII-shaped labels
 (emails, tokens) and card-number-shaped values are dropped entirely. The honest

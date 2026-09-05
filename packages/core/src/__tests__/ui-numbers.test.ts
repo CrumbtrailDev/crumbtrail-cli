@@ -10,6 +10,8 @@ import {
 import { REDACTED_VALUE } from "../redaction";
 import {
   parseNumericToken,
+  parsePagerControl,
+  parseProseCounts,
   scanUiNumbers,
   uiNumbersCollector,
   UI_NUM_MAX_SCAN_ELEMENTS,
@@ -119,6 +121,182 @@ describe("parseNumericToken", () => {
     expect(parseNumericToken("1,23,4", "en-US")).toBeNull();
     expect(parseNumericToken("1.2.3,4.5")).toBeNull();
     expect(parseNumericToken("12,3456")).toBeNull();
+  });
+});
+
+describe("parseProseCounts", () => {
+  it("reads a count and its noun", () => {
+    expect(parseProseCounts("31 people")).toEqual([
+      { label: "people", value: 31 },
+    ]);
+    expect(parseProseCounts("4 results")).toEqual([
+      { label: "results", value: 4 },
+    ]);
+    expect(parseProseCounts("12 open orders")).toEqual([
+      { label: "open orders", value: 12 },
+    ]);
+    expect(parseProseCounts("1,204 active team members")).toEqual([
+      { label: "active team members", value: 1204 },
+    ]);
+  });
+
+  it("reads pager, range and showing phrases", () => {
+    expect(parseProseCounts("Page 1 of 1")).toEqual([
+      { label: "page", value: 1 },
+      { label: "pages", value: 1 },
+    ]);
+    expect(parseProseCounts("1–25 of 31")).toEqual([
+      { label: "range_start", value: 1 },
+      { label: "range_end", value: 25 },
+      { label: "total", value: 31 },
+    ]);
+    expect(parseProseCounts("1-25 of 31")).toEqual([
+      { label: "range_start", value: 1 },
+      { label: "range_end", value: 25 },
+      { label: "total", value: 31 },
+    ]);
+    expect(parseProseCounts("1 to 25 of 31")).toEqual([
+      { label: "range_start", value: 1 },
+      { label: "range_end", value: 25 },
+      { label: "total", value: 31 },
+    ]);
+    expect(parseProseCounts("Showing 25 of 31")).toEqual([
+      { label: "shown", value: 25 },
+      { label: "total", value: 31 },
+    ]);
+  });
+
+  // Every pattern is anchored to the whole text. A label lifted out of running
+  // prose would be both wrong and a way for page content to escape as a
+  // "label", which is exactly what the label cap and deny list exist to stop.
+  it("stays silent on prose that merely contains a number", () => {
+    expect(parseProseCounts("We have 31 people on the team.")).toBeNull();
+    expect(parseProseCounts("3 items in your cart")).toBeNull();
+    expect(
+      parseProseCounts("Deleted 4 of the 9 rows we found earlier"),
+    ).toBeNull();
+    expect(parseProseCounts("Sofia Nunez")).toBeNull();
+    expect(parseProseCounts(`${"x".repeat(60)} 31 people`)).toBeNull();
+  });
+});
+
+describe("parsePagerControl", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  function control(html: string) {
+    document.body.innerHTML = html;
+    return parsePagerControl(document.body.firstElementChild!);
+  }
+
+  it("reads pager words in either state, case insensitively", () => {
+    expect(control("<button>Next</button>")).toEqual({
+      label: "control:next",
+      value: 1,
+    });
+    expect(control("<button disabled> PREV </button>")).toEqual({
+      label: "control:prev",
+      value: 0,
+    });
+    expect(control('<a aria-label="Newer">→</a>')).toEqual({
+      label: "control:newer",
+      value: 1,
+    });
+    expect(control('<a aria-disabled="true">Last</a>')).toEqual({
+      label: "control:last",
+      value: 0,
+    });
+  });
+
+  it("ignores controls that are not pager controls", () => {
+    expect(control("<button>Save changes</button>")).toBeNull();
+    expect(control("<button>Next step in setup</button>")).toBeNull();
+    expect(control("<span>Next</span>")).toBeNull();
+  });
+});
+
+/**
+ * The People screen from the dogfood run: a total in prose, a pager sentence,
+ * and two buttons whose state is the whole story. Three captured sessions of
+ * this markup carried zero `ui.num` events.
+ */
+function peopleMarkup(total: number, page: number, pages: number): string {
+  return `
+    <main>
+      <div class="toolbar">
+        <input placeholder="Search name, email or employee number" />
+        <select><option>All</option></select>
+        <span class="sub">${total} people</span>
+      </div>
+      <div class="toolbar">
+        <button ${page === 1 ? "disabled" : ""}>Previous</button>
+        <span class="sub">Page ${page} of ${pages}</span>
+        <button ${page >= pages ? "disabled" : ""}>Next</button>
+      </div>
+    </main>`;
+}
+
+function allItems(scan: ReturnType<typeof scanUiNumbers>) {
+  return [...(scan?.regions.values() ?? [])].flat();
+}
+
+describe("scanUiNumbers rendered counts and pager state", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("captures the People screen's total, pager and both control states", () => {
+    document.body.innerHTML = peopleMarkup(31, 1, 1);
+    const items = allItems(scanUiNumbers(document.body));
+    expect(items).toEqual([
+      { label: "people", value: 31 },
+      { label: "control:previous", value: 0 },
+      { label: "page", value: 1 },
+      { label: "pages", value: 1 },
+      { label: "control:next", value: 0 },
+    ]);
+  });
+
+  it("records Next as actionable when a second page exists", () => {
+    document.body.innerHTML = peopleMarkup(31, 1, 2);
+    const items = allItems(scanUiNumbers(document.body));
+    expect(items).toContainEqual({ label: "pages", value: 2 });
+    expect(items).toContainEqual({ label: "control:next", value: 1 });
+    expect(items).toContainEqual({ label: "control:previous", value: 0 });
+  });
+
+  it("captures nothing from prose that merely contains a number", () => {
+    document.body.innerHTML = `
+      <main>
+        <p>We have 31 people on the team.</p>
+        <p>Sofia Nunez joined 4 years ago and manages 3 of our regions.</p>
+      </main>`;
+    expect(allItems(scanUiNumbers(document.body))).toEqual([]);
+  });
+
+  it("reads a link pager and aria-disabled state", () => {
+    document.body.innerHTML = `
+      <nav class="pager">
+        <a href="#" aria-disabled="true">First</a>
+        <a href="#">Older</a>
+        <span>Showing 25 of 31</span>
+      </nav>`;
+    expect(allItems(scanUiNumbers(document.body))).toEqual([
+      { label: "control:first", value: 0 },
+      { label: "control:older", value: 1 },
+      { label: "shown", value: 25 },
+      { label: "total", value: 31 },
+    ]);
+  });
+
+  it("skips a hidden pager", () => {
+    document.body.innerHTML = `
+      <nav class="pager" hidden>
+        <button disabled>Next</button>
+        <span>Page 1 of 1</span>
+      </nav>`;
+    expect(allItems(scanUiNumbers(document.body))).toEqual([]);
   });
 });
 

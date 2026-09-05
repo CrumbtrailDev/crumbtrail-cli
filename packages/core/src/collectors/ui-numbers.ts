@@ -608,7 +608,10 @@ export function parsePagerControl(el: Element): UiNumItem | null {
     el.hasAttribute("disabled") ||
     el.getAttribute("aria-disabled") === "true" ||
     (el as HTMLButtonElement).disabled === true;
-  return { label: `${PAGER_CONTROL_LABEL_PREFIX}${text}`, value: disabled ? 0 : 1 };
+  return {
+    label: `${PAGER_CONTROL_LABEL_PREFIX}${text}`,
+    value: disabled ? 0 : 1,
+  };
 }
 
 /**
