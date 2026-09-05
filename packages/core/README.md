@@ -626,13 +626,17 @@ wait on first load rather than the session.
 Nothing leaves the page during that wait, and nothing is thrown away either.
 Events captured before the policy answers are held in memory and released once
 it does, in the order they happened and with their original timestamps, so the
-requests that render the first screen keep both halves of the pair rather than
-arriving as a response with no request behind it. The hold is bounded at 2,000
-events and drops the oldest first, recording a `buffer_overflow` gap counting
-what the cap cost. Events the arriving policy drops are counted separately,
-under a `policy_tightened` gap, because the two say opposite things about a
-deployment: one says the hold was too small for the page, the other says the
-policy did its job.
+requests that render the first screen keep their full request family rather
+than arriving as a response with no request behind it. A family contains its
+`net.req`, `net.res` or `net.err`, and any `net.req.file` descriptions. It is
+either released together or dropped together if the arriving policy excludes
+the URL, turns network capture off, or the hold has already evicted its start.
+The hold is bounded at 2,000 events or 4 MiB of serialized event data and drops
+the oldest first, recording a `buffer_overflow` gap counting what the cap cost.
+Events the arriving policy drops are counted separately, under a
+`policy_tightened` gap, because the two say opposite things about a deployment:
+one says the hold was too small for the page, the other says the policy did its
+job.
 
 Release is not a replay of what was captured, it is a re-ask under the policy
 that just arrived. A held event is dropped when its collector is now off, when

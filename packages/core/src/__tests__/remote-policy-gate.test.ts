@@ -355,6 +355,308 @@ describe("the window between init() and the first capture policy", () => {
 });
 
 /**
+ * A network request may start before policy resolution and finish afterwards.
+ * Its start, terminal and asynchronous file descriptions must agree on one
+ * admission result instead of leaving a terminal next to a dropped start.
+ */
+describe("request families crossing remote policy resolution", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalXHR: typeof globalThis.XMLHttpRequest;
+
+  class DeferredXHR {
+    static instances: DeferredXHR[] = [];
+
+    status = 200;
+    responseText = "";
+    private listeners: Record<string, Array<() => void>> = {};
+
+    constructor() {
+      DeferredXHR.instances.push(this);
+    }
+
+    open(_method: string, _url: string | URL): void {}
+
+    setRequestHeader(_name: string, _value: string): void {}
+
+    send(_body?: unknown): void {}
+
+    addEventListener(event: string, listener: () => void): void {
+      (this.listeners[event] ??= []).push(listener);
+    }
+
+    getResponseHeader(_name: string): string | null {
+      return null;
+    }
+
+    getAllResponseHeaders(): string {
+      return "";
+    }
+
+    fail(): void {
+      this.status = 0;
+      for (const listener of this.listeners.error ?? []) listener();
+      for (const listener of this.listeners.loadend ?? []) listener();
+    }
+  }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalXHR = globalThis.XMLHttpRequest;
+    DeferredXHR.instances = [];
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    uninstallEarlyCapture();
+    globalThis.fetch = originalFetch;
+    globalThis.XMLHttpRequest = originalXHR;
+    sessionStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  async function settleMicrotasks(turns = 20): Promise<void> {
+    for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
+  }
+
+  function requestFamily(events: BugEvent[], url: string): BugEvent[] {
+    return events.filter(
+      (event) =>
+        (event.k === "net.req" ||
+          event.k === "net.res" ||
+          event.k === "net.err") &&
+        String(event.d?.url).includes(url),
+    );
+  }
+
+  function expectPolicyDrop(events: BugEvent[]): void {
+    expect(
+      events.some(
+        (event) =>
+          event.k === CAPTURE_GAP_EVENT_KIND &&
+          event.d?.reason === "policy_tightened",
+      ),
+    ).toBe(true);
+  }
+
+  const TIGHTENINGS: Array<[string, Record<string, unknown>]> = [
+    [
+      "the policy newly excludes its URL",
+      { killSwitch: false, network: { excludeUrls: ["/api/request-family"] } },
+    ],
+    [
+      "the policy disables network capture",
+      { killSwitch: false, collectors: { network: false } },
+    ],
+  ];
+
+  for (const [description, policy] of TIGHTENINGS) {
+    it(`drops an in flight fetch family when ${description}`, async () => {
+      let answerConfig: (() => void) | undefined;
+      const configAnswer = new Promise<Response>((resolve) => {
+        answerConfig = () => resolve(new Response(JSON.stringify(policy)));
+      });
+      let answerRequest: ((response: Response) => void) | undefined;
+      const requestAnswer = new Promise<Response>((resolve) => {
+        answerRequest = resolve;
+      });
+      globalThis.fetch = vi.fn().mockImplementation((input: unknown) => {
+        if (String(input).includes("/api/capture-config")) return configAnswer;
+        if (String(input).includes("/api/request-family")) return requestAnswer;
+        return Promise.resolve(appResponse());
+      }) as unknown as typeof globalThis.fetch;
+
+      const transport = makeTransport();
+      const logger = Crumbtrail.init({
+        ...QUIET,
+        network: true,
+        transportInstance: transport,
+        httpEndpoint: "https://api.crumbtrail.test",
+        httpAuthToken: "ctkey_live",
+        remoteConfig: true,
+      });
+      await settleMicrotasks();
+      expect(answerConfig).toBeDefined();
+
+      const inFlight = globalThis.fetch("/api/request-family");
+      answerConfig?.();
+      await configAnswer;
+      await settleMicrotasks();
+      answerRequest?.(appResponse());
+      await inFlight;
+      await settleMicrotasks();
+      await logger.stop();
+
+      const events = delivered(transport);
+      expect(requestFamily(events, "/api/request-family")).toHaveLength(0);
+      expectPolicyDrop(events);
+    });
+
+    it(`drops an in flight XHR failure when ${description}`, async () => {
+      let answerConfig: (() => void) | undefined;
+      const configAnswer = new Promise<Response>((resolve) => {
+        answerConfig = () => resolve(new Response(JSON.stringify(policy)));
+      });
+      globalThis.fetch = vi.fn().mockImplementation((input: unknown) => {
+        if (String(input).includes("/api/capture-config")) return configAnswer;
+        return Promise.resolve(appResponse());
+      }) as unknown as typeof globalThis.fetch;
+      globalThis.XMLHttpRequest =
+        DeferredXHR as unknown as typeof XMLHttpRequest;
+
+      const transport = makeTransport();
+      const logger = Crumbtrail.init({
+        ...QUIET,
+        network: true,
+        transportInstance: transport,
+        httpEndpoint: "https://api.crumbtrail.test",
+        httpAuthToken: "ctkey_live",
+        remoteConfig: true,
+      });
+      await settleMicrotasks();
+      expect(answerConfig).toBeDefined();
+
+      const xhr = new XMLHttpRequest() as unknown as DeferredXHR;
+      xhr.open("GET", "/api/request-family");
+      xhr.send();
+      answerConfig?.();
+      await configAnswer;
+      await settleMicrotasks();
+      xhr.fail();
+      await settleMicrotasks();
+      await logger.stop();
+
+      const events = delivered(transport);
+      expect(requestFamily(events, "/api/request-family")).toHaveLength(0);
+      expectPolicyDrop(events);
+    });
+  }
+
+  for (const sniffBeforePolicy of [true, false]) {
+    it(`drops an excluded file part when its sniff completes ${
+      sniffBeforePolicy ? "before" : "after"
+    } policy release`, async () => {
+      let answerConfig: (() => void) | undefined;
+      const configAnswer = new Promise<Response>((resolve) => {
+        answerConfig = () =>
+          resolve(
+            new Response(
+              JSON.stringify({
+                killSwitch: false,
+                network: { excludeUrls: ["/api/upload"] },
+              }),
+            ),
+          );
+      });
+      globalThis.fetch = vi.fn().mockImplementation((input: unknown) => {
+        if (String(input).includes("/api/capture-config")) return configAnswer;
+        return Promise.resolve(appResponse());
+      }) as unknown as typeof globalThis.fetch;
+
+      let answerSniff: ((buffer: ArrayBuffer) => void) | undefined;
+      const sniffAnswer = new Promise<ArrayBuffer>((resolve) => {
+        answerSniff = resolve;
+      });
+      const file = new File(["private payroll"], "payroll.pdf", {
+        type: "application/pdf",
+      });
+      vi.spyOn(file, "slice").mockReturnValue({
+        arrayBuffer: () => sniffAnswer,
+      } as unknown as Blob);
+      const form = new FormData();
+      form.append("document", file);
+
+      const transport = makeTransport();
+      const logger = Crumbtrail.init({
+        ...QUIET,
+        network: true,
+        transportInstance: transport,
+        httpEndpoint: "https://api.crumbtrail.test",
+        httpAuthToken: "ctkey_live",
+        remoteConfig: true,
+      });
+      await settleMicrotasks();
+      expect(answerConfig).toBeDefined();
+
+      await globalThis.fetch("/api/upload?token=private", {
+        method: "POST",
+        body: form,
+      });
+      if (sniffBeforePolicy) {
+        answerSniff?.(new TextEncoder().encode("%PDF-1.7").buffer);
+        await settleMicrotasks();
+      }
+
+      answerConfig?.();
+      await configAnswer;
+      await settleMicrotasks();
+      if (!sniffBeforePolicy) {
+        answerSniff?.(new TextEncoder().encode("%PDF-1.7").buffer);
+        await settleMicrotasks();
+      }
+      await logger.stop();
+
+      const events = delivered(transport);
+      expect(requestFamily(events, "/api/upload")).toHaveLength(0);
+      expect(events.filter((event) => event.k === "net.req.file")).toHaveLength(
+        0,
+      );
+      expect(JSON.stringify(events)).not.toContain("token=private");
+      expectPolicyDrop(events);
+    });
+  }
+
+  it("drops a terminal when admission hold overflow evicts its request start", async () => {
+    let answerConfig: (() => void) | undefined;
+    const configAnswer = new Promise<Response>((resolve) => {
+      answerConfig = () => resolve(new Response(RECOGNIZED_POLICY));
+    });
+    let answerRequest: ((response: Response) => void) | undefined;
+    const requestAnswer = new Promise<Response>((resolve) => {
+      answerRequest = resolve;
+    });
+    globalThis.fetch = vi.fn().mockImplementation((input: unknown) => {
+      if (String(input).includes("/api/capture-config")) return configAnswer;
+      if (String(input).includes("/api/overflow")) return requestAnswer;
+      return Promise.resolve(appResponse());
+    }) as unknown as typeof globalThis.fetch;
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      network: true,
+      transportInstance: transport,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: true,
+    });
+    await settleMicrotasks();
+    expect(answerConfig).toBeDefined();
+
+    const inFlight = globalThis.fetch("/api/overflow");
+    for (let index = 0; index < 2_000; index += 1)
+      logger.mark(`overflow ${index}`);
+
+    answerConfig?.();
+    await configAnswer;
+    await settleMicrotasks();
+    answerRequest?.(appResponse());
+    await inFlight;
+    await settleMicrotasks();
+    await logger.stop();
+
+    const events = delivered(transport);
+    expect(requestFamily(events, "/api/overflow")).toHaveLength(0);
+    expect(
+      events.some(
+        (event) =>
+          event.k === CAPTURE_GAP_EVENT_KIND &&
+          event.d?.reason === "buffer_overflow",
+      ),
+    ).toBe(true);
+  });
+});
+
+/**
  * A held event was BUILT under the local config. The policy that releases it may
  * also have narrowed what may be captured at all, so release re-asks every
  * question the built event can still answer and drops what no longer passes.

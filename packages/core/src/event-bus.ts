@@ -3,14 +3,29 @@ import type { BugEvent } from "./types";
 /**
  * What the emitter knows that the built event no longer carries.
  *
- * Only the raw URL so far. `d.url` has already been through `redactUrl` by the
- * time an event reaches the bus, so an admission rule written against a value
- * that redaction replaced cannot match the event's own copy. The context is
- * read by the admission predicate and never stored on the event, so nothing
- * downstream — tap, buffer, transport, ring buffer — ever sees it.
+ * `d.url` has already been through `redactUrl` by the time an event reaches
+ * the bus, so an admission rule written against a value that redaction
+ * replaced cannot match the event's own copy. A request scope also lets a
+ * start, terminal and file parts share the same admission outcome while a
+ * remote policy is resolving. Context is read by the admission predicate and
+ * never stored on the event, so nothing downstream — tap, buffer, transport,
+ * ring buffer — ever sees it.
  */
+export type RequestAdmissionDisposition = "undecided" | "admitted" | "dropped";
+
+/**
+ * Mutable state owned by one network request and shared only through
+ * {@link EmitContext}. It deliberately carries no URL or event data.
+ */
+export interface RequestAdmissionScope {
+  disposition: RequestAdmissionDisposition;
+  /** Keeps an overflow outcome from being relabelled as a policy drop. */
+  dropReason?: "overflow" | "policy";
+}
+
 export interface EmitContext {
   rawUrl?: string;
+  requestScope?: RequestAdmissionScope;
 }
 
 export interface EmitOptions extends EmitContext {

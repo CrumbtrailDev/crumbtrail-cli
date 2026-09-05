@@ -1,4 +1,8 @@
-import { EventBus, type EmitContext } from "./event-bus";
+import {
+  EventBus,
+  type EmitContext,
+  type RequestAdmissionScope,
+} from "./event-bus";
 import { RingBuffer } from "./ring-buffer";
 import type {
   AddBugEventOptions,
@@ -76,7 +80,7 @@ import { visibilityCollector } from "./collectors/visibility";
 import { clipboardCollector } from "./collectors/clipboard";
 import { cookieCollector } from "./collectors/cookie";
 import { storageCollector } from "./collectors/storage";
-import { networkCollector } from "./collectors/network";
+import { networkCollector, shouldExclude } from "./collectors/network";
 import { performanceCollector } from "./collectors/performance";
 import { heartbeatCollector } from "./collectors/heartbeat";
 import { uiNumbersCollector } from "./collectors/ui-numbers";
@@ -156,7 +160,7 @@ const MAX_PENDING_ADMISSION_EVENTS = 2_000;
  *
  * Under `consentMode: "required"` the hold waits for a `consent()` call that
  * may never come, and 2,000 events is a small number when one of them is a DOM
- * snapshot capped at 256 KB. 4 MB is roughly the largest first screen worth
+ * snapshot capped at 256 KB. 4 MiB is roughly the largest first screen worth
  * keeping and well under what a page can spare; past it the oldest events go,
  * counted as `buffer_overflow` like any other cap.
  */
@@ -172,10 +176,44 @@ const MAX_PENDING_ADMISSION_BYTES = 4_194_304;
  */
 function estimateHeldEventBytes(event: BugEvent): number {
   try {
-    return JSON.stringify(event)?.length ?? 0;
+    const serialized = JSON.stringify(event);
+    if (serialized === undefined) return 0;
+    // TextEncoder is present in every supported browser. The fallback keeps an
+    // unusual older host bounded rather than failing capture while it waits.
+    return typeof TextEncoder === "function"
+      ? new TextEncoder().encode(serialized).byteLength
+      : serialized.length;
   } catch {
     return 0;
   }
+}
+
+/** Network events that describe one request and must share its admission fate. */
+function isNetworkRequestFamilyEvent(event: BugEvent): boolean {
+  return (COLLECTOR_EVENT_KINDS.network as readonly string[]).includes(event.k);
+}
+
+/** The unredacted URL when the emitter retained it, otherwise its event copy. */
+function requestUrlForAdmission(
+  event: BugEvent,
+  context?: EmitContext,
+): string | undefined {
+  if (context?.rawUrl !== undefined) return context.rawUrl;
+  const url = event.d?.url;
+  return typeof url === "string" ? url : undefined;
+}
+
+/**
+ * A request scope only ever gets stricter. In particular, an overflowing
+ * start remains an overflow even if a later policy also excludes its URL.
+ */
+function dropRequestScope(
+  scope: RequestAdmissionScope | undefined,
+  reason: "overflow" | "policy",
+): void {
+  if (!scope || scope.disposition === "dropped") return;
+  scope.disposition = "dropped";
+  scope.dropReason = reason;
 }
 import { buildMaskedDomSnapshot, maskText } from "./masking";
 import { CAPTURE_GAP_EVENT_KIND } from "./types";
@@ -2503,9 +2541,34 @@ export class Crumbtrail {
   }
 
   private shouldAdmitEvent(event: BugEvent, context?: EmitContext): boolean {
+    const requestScope = context?.requestScope;
+    // An event can arrive after the gate opened even though its own request
+    // start was rejected while it was closed. The scope makes that terminal
+    // follow the start instead of becoming an orphaned net.res or net.err.
+    if (requestScope?.disposition === "dropped") return false;
     if (!this.canTransport()) {
       if (this.isAdmissionUndecided()) this.holdForAdmission(event, context);
       return false;
+    }
+    if (isNetworkRequestFamilyEvent(event)) {
+      const rawUrl = requestUrlForAdmission(event, context);
+      if (
+        this.config.network === false ||
+        (rawUrl !== undefined && shouldExclude(rawUrl, this.config))
+      ) {
+        dropRequestScope(requestScope, "policy");
+        return false;
+      }
+      // A terminal with no admitted parent is unsafe to infer. This normally
+      // means the parent was evicted before release, but it also closes any
+      // unusual emitter ordering without letting half a request through.
+      if (requestScope?.disposition === "undecided") {
+        if (event.k !== "net.req") {
+          dropRequestScope(requestScope, "policy");
+          return false;
+        }
+        requestScope.disposition = "admitted";
+      }
     }
     if (this.isFlightRecorderTerminal()) return false;
     if (!this.samplingShed) return true;
@@ -2745,6 +2808,9 @@ export class Crumbtrail {
       event,
       bytes,
       ...(context?.rawUrl !== undefined ? { rawUrl: context.rawUrl } : {}),
+      ...(context?.requestScope !== undefined
+        ? { requestScope: context.requestScope }
+        : {}),
     });
     this.pendingAdmissionBytes += bytes;
     // Oldest first, matching the bus buffer: the events nearest whatever opens
@@ -2761,6 +2827,10 @@ export class Crumbtrail {
       if (!evicted) break;
       this.pendingAdmissionBytes -= evicted.bytes;
       this.pendingAdmissionDropped += 1;
+      // A terminal that arrives after the gate must not survive the request
+      // start this cap just removed. The scope belongs only to this request and
+      // is never put onto an event or retained by the bus.
+      dropRequestScope(evicted.requestScope, "overflow");
     }
   }
 
@@ -2773,7 +2843,7 @@ export class Crumbtrail {
    */
   private releasePendingAdmissionEvents(admitted: boolean): void {
     const held = this.pendingAdmissionEvents;
-    const overflowDropped = this.pendingAdmissionDropped;
+    let overflowDropped = this.pendingAdmissionDropped;
     let policyDropped = 0;
     const heldMasking =
       this.pendingAdmissionMasking ?? readMaskingState(this.config);
@@ -2784,23 +2854,66 @@ export class Crumbtrail {
     if (!admitted || held.length === 0) return;
 
     // The policy that just opened the gate may also have narrowed what may be
-    // captured, and these events were BUILT before it arrived. Each one is
-    // re-asked under the current policy and dropped when it no longer passes.
+    // captured. Rebuild every event first, then decide the fate of each held
+    // request start before any terminal or file event can be released. A later
+    // net.res/net.err reuses that scope after the gate, so it follows the start
+    // even though it is no longer in this array.
+    const released = held.map((entry) => ({
+      entry,
+      event: reapplyPolicyToHeldEvent(entry.event, this.config, {
+        heldMasking,
+        samplingShed: this.samplingShed,
+        ...(entry.rawUrl !== undefined ? { rawUrl: entry.rawUrl } : {}),
+      }),
+    }));
+    for (const { entry, event } of released) {
+      const scope = entry.requestScope;
+      if (entry.event.k === "net.req" && scope?.disposition === "undecided") {
+        if (event) scope.disposition = "admitted";
+        else dropRequestScope(scope, "policy");
+      }
+    }
+
     // Nothing bypasses admission: the same predicate that gates a live event
-    // gates a released one.
+    // gates a released one. A scope dropped by overflow accounts every held
+    // member under that cap, while a scope dropped by the policy accounts under
+    // `policy_tightened` rather than turning a request family into halves.
     this.releasingAdmissionHold = true;
     try {
-      for (const entry of held) {
-        const allowed = reapplyPolicyToHeldEvent(entry.event, this.config, {
-          heldMasking,
-          samplingShed: this.samplingShed,
-          ...(entry.rawUrl !== undefined ? { rawUrl: entry.rawUrl } : {}),
-        });
-        if (!allowed) {
+      for (const { entry, event } of released) {
+        const scope = entry.requestScope;
+        if (scope?.disposition === "dropped") {
+          if (scope.dropReason === "overflow") overflowDropped += 1;
+          else policyDropped += 1;
+          continue;
+        }
+        if (!event) {
+          dropRequestScope(scope, "policy");
           policyDropped += 1;
           continue;
         }
-        if (!this.bus.emit(allowed)) policyDropped += 1;
+        // A child without an admitted parent is unsafe to infer. This is
+        // normally impossible because the request start is emitted first, but
+        // failing closed also protects a custom EventBus emitter order.
+        if (
+          isNetworkRequestFamilyEvent(entry.event) &&
+          scope?.disposition === "undecided"
+        ) {
+          dropRequestScope(scope, "policy");
+          policyDropped += 1;
+          continue;
+        }
+        const context: EmitContext | undefined =
+          entry.rawUrl !== undefined || scope !== undefined
+            ? {
+                ...(entry.rawUrl !== undefined ? { rawUrl: entry.rawUrl } : {}),
+                ...(scope !== undefined ? { requestScope: scope } : {}),
+              }
+            : undefined;
+        if (!this.bus.emit(event, context)) {
+          if (scope?.dropReason === "overflow") overflowDropped += 1;
+          else policyDropped += 1;
+        }
       }
     } finally {
       this.releasingAdmissionHold = false;

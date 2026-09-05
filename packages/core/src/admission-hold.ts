@@ -12,6 +12,7 @@ import {
   redactNetworkTextBody,
   type RedactionMetadata,
 } from "./redaction";
+import type { RequestAdmissionScope } from "./event-bus";
 import { CAPTURE_GAP_EVENT_KIND, type BugEvent } from "./types";
 import type { CrumbtrailConfig } from "./types";
 
@@ -214,6 +215,8 @@ export interface HeldEvent {
   /** Serialized size, counted once, so eviction can subtract it exactly. */
   bytes: number;
   rawUrl?: string;
+  /** Shared only by one network request family, never by an emitted event. */
+  requestScope?: RequestAdmissionScope;
 }
 
 export interface HeldEventPolicyContext {

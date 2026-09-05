@@ -1,5 +1,9 @@
 import { applyGraphqlIdentity } from "../graphql";
-import type { EventBus } from "../event-bus";
+import type {
+  EmitContext,
+  EventBus,
+  RequestAdmissionScope,
+} from "../event-bus";
 import type {
   CrumbtrailConfig,
   CollectorCleanup,
@@ -622,6 +626,8 @@ function wrapFetch(
     const id = nextId++;
     const method = extractMethod(input, init);
     const startTime = now();
+    const requestScope: RequestAdmissionScope = { disposition: "undecided" };
+    const requestContext: EmitContext = { rawUrl: url, requestScope };
     // Synchronously, before the first await: after one the application's frames
     // are gone from the stack and what remains is the microtask that resumed us.
     const callStack = captureCallStack(instrumentedFetch);
@@ -700,7 +706,7 @@ function wrapFetch(
 
     attachRedactionMetadata(reqData, ...reqMetadata);
 
-    bus.emit({ t: startTime, k: "net.req", d: reqData }, { rawUrl: url });
+    bus.emit({ t: startTime, k: "net.req", d: reqData }, requestContext);
 
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
@@ -710,7 +716,7 @@ function wrapFetch(
         id,
         requestBody.formData.entries(),
         startTime,
-        url,
+        requestContext,
       );
     }
 
@@ -766,7 +772,7 @@ function wrapFetch(
       if (fetchArgs.traceId) errData.traceId = fetchArgs.traceId;
       if (fetchArgs.spanId) errData.spanId = fetchArgs.spanId;
       attachRedactionMetadata(errData, urlResult.metadata);
-      bus.emit({ t: now(), k: "net.err", d: errData }, { rawUrl: url });
+      bus.emit({ t: now(), k: "net.err", d: errData }, requestContext);
     }
 
     const dur = now() - startTime;
@@ -881,7 +887,7 @@ function wrapFetch(
 
     attachRedactionMetadata(resData, ...resMetadata);
 
-    bus.emit({ t: responseTime, k: "net.res", d: resData }, { rawUrl: url });
+    bus.emit({ t: responseTime, k: "net.res", d: resData }, requestContext);
 
     return response;
   };
@@ -1239,6 +1245,11 @@ function wrapXHR(
     }
 
     meta.startTime = now();
+    const requestScope: RequestAdmissionScope = { disposition: "undecided" };
+    const requestContext: EmitContext = {
+      rawUrl: meta.url,
+      requestScope,
+    };
 
     const urlResult = redactUrl(meta.url, "url");
     const reqMetadata: Array<RedactionMetadata | undefined> = [
@@ -1292,17 +1303,18 @@ function wrapXHR(
 
     attachRedactionMetadata(reqData, ...reqMetadata);
 
-    bus.emit(
-      { t: meta.startTime, k: "net.req", d: reqData },
-      {
-        rawUrl: meta.url,
-      },
-    );
+    bus.emit({ t: meta.startTime, k: "net.req", d: reqData }, requestContext);
 
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
     if (typeof FormData !== "undefined" && body instanceof FormData) {
-      emitFilePartEvents(bus, meta.id, body.entries(), meta.startTime, meta.url);
+      emitFilePartEvents(
+        bus,
+        meta.id,
+        body.entries(),
+        meta.startTime,
+        requestContext,
+      );
     }
 
     const emitResponse = () => {
@@ -1401,7 +1413,7 @@ function wrapXHR(
 
       attachRedactionMetadata(resData, ...resMetadata);
 
-      bus.emit({ t: now(), k: "net.res", d: resData }, { rawUrl: meta.url });
+      bus.emit({ t: now(), k: "net.res", d: resData }, requestContext);
     };
 
     // error/timeout/abort settle the XHR without an HTTP response (status 0),
@@ -1421,7 +1433,7 @@ function wrapXHR(
       if (meta.traceId) errData.traceId = meta.traceId;
       if (meta.spanId) errData.spanId = meta.spanId;
       attachRedactionMetadata(errData, urlResult.metadata);
-      bus.emit({ t: now(), k: "net.err", d: errData }, { rawUrl: meta.url });
+      bus.emit({ t: now(), k: "net.err", d: errData }, requestContext);
     };
 
     this.addEventListener("load", emitResponse);
@@ -1465,6 +1477,11 @@ function emitEarlyRecord(
   record: EarlyRequestRecord,
 ): void {
   const id = nextId++;
+  const requestScope: RequestAdmissionScope = { disposition: "undecided" };
+  const requestContext: EmitContext = {
+    rawUrl: record.url,
+    requestScope,
+  };
   const urlResult = redactUrl(record.url, "url");
   const reqMetadata: Array<RedactionMetadata | undefined> = [
     urlResult.metadata,
@@ -1506,7 +1523,7 @@ function emitEarlyRecord(
   }
 
   attachRedactionMetadata(reqData, ...reqMetadata);
-  bus.emit({ t: record.t, k: "net.req", d: reqData }, { rawUrl: record.url });
+  bus.emit({ t: record.t, k: "net.req", d: reqData }, requestContext);
 
   const settledAt = record.t + record.dur;
 
@@ -1525,12 +1542,7 @@ function emitEarlyRecord(
     if (record.traceId) errData.traceId = record.traceId;
     if (record.spanId) errData.spanId = record.spanId;
     attachRedactionMetadata(errData, urlResult.metadata);
-    bus.emit(
-      { t: settledAt, k: "net.err", d: errData },
-      {
-        rawUrl: record.url,
-      },
-    );
+    bus.emit({ t: settledAt, k: "net.err", d: errData }, requestContext);
     return;
   }
 
@@ -1570,7 +1582,7 @@ function emitEarlyRecord(
   }
 
   attachRedactionMetadata(resData, ...resMetadata);
-  bus.emit({ t: settledAt, k: "net.res", d: resData }, { rawUrl: record.url });
+  bus.emit({ t: settledAt, k: "net.res", d: resData }, requestContext);
 }
 
 function isEarlyResourceError(record: EarlyRequestRecord): boolean {

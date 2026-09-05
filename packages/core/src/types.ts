@@ -388,14 +388,6 @@ export interface CaptureGapEventData {
      */
     | "session_ended_unanswered"
     /**
-     * The session ended before the capture policy answered, so events held for
-     * that answer were discarded rather than released into the session the page
-     * lifecycle mints next. Their timestamps belong to a session that is
-     * already finalized, and this record is what keeps the loss visible in the
-     * session that actually lost them.
-     */
-    | "session_ended_unanswered"
-    /**
      * A capture policy lowered the ring buffer's retention mid-session and the
      * shrink evicted events that were already held. The window a later report
      * is cut from is shorter than the session that led to it, and this is what
