@@ -126,3 +126,171 @@ jobs:
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # ---------------------------------------------------------------------------
+  # Native SDK registries.
+  #
+  # These publish on their own version lines, not the npm one: every native SDK
+  # sits at 0.1.0 while npm is in the 0.52.x range. Each job therefore reads its
+  # own version from its own manifest and skips itself when that version is
+  # already on the registry, so a dispatch that only moved npm is a no-op here
+  # rather than an error. `base_ref` does not select these; the version check
+  # does.
+  # ---------------------------------------------------------------------------
+
+  publish-pypi:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Same trusted-publishing model as npm and crates.io: PyPI exchanges the
+      # OIDC id-token for a short-lived publish token, so there is deliberately
+      # NO PyPI API token secret. crumbtrail-python must be configured on
+      # pypi.org (Manage → Publishing) with this repo and this workflow
+      # filename; renaming release.yml breaks it until that config matches.
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]" twine
+      - run: python -m pytest
+      - name: Skip if version already published
+        id: check
+        run: |
+          VERSION=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if curl -sf -o /dev/null "https://pypi.org/pypi/crumbtrail-python/$VERSION/json"; then
+            echo "crumbtrail-python $VERSION is already on PyPI; skipping publish."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build sdist and wheel
+        if: ${{ steps.check.outputs.published == 'false' }}
+        run: |
+          rm -rf dist
+          python -m build
+          python -m twine check dist/*
+      - name: Publish
+        # packages-dir is repo-relative: an action does not inherit
+        # defaults.run.working-directory, only `run:` steps do.
+        if: ${{ !inputs.dry_run && steps.check.outputs.published == 'false' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist
+          skip-existing: true
+
+  publish-gem:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # RubyGems trusted publishing, so no GEM_HOST_API_KEY secret. The gem must
+      # be configured on rubygems.org (crumbtrail → Trusted publishers) with
+      # this repo and this workflow filename.
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          # The gemspec floor is >= 3.2. Anything older cannot even load the
+          # library, which is how a local run once silently tested nothing.
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: packages/ruby
+      - run: bundle exec ruby -Ilib -Itest -e 'Dir.glob("test/*_test.rb").sort.each { |f| require File.expand_path(f) }'
+      - name: Skip if version already published
+        id: check
+        run: |
+          VERSION=$(ruby -e "puts Gem::Specification.load('crumbtrail.gemspec').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if curl -sf -o /dev/null "https://rubygems.org/api/v2/rubygems/crumbtrail/versions/$VERSION.json"; then
+            echo "crumbtrail $VERSION is already on RubyGems; skipping publish."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build gem
+        if: ${{ steps.check.outputs.published == 'false' }}
+        run: gem build crumbtrail.gemspec
+      - uses: rubygems/configure-rubygems-credentials@v1
+        if: ${{ !inputs.dry_run && steps.check.outputs.published == 'false' }}
+      - name: Publish
+        if: ${{ !inputs.dry_run && steps.check.outputs.published == 'false' }}
+        run: gem push "crumbtrail-${{ steps.check.outputs.version }}.gem"
+
+  publish-nuget:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The one job here that needs a stored secret. NuGet.org has no trusted
+      # publishing equivalent to npm's, so NUGET_API_KEY is a repository secret
+      # and must be rotated by hand when it expires. Nothing else in this
+      # workflow stores a registry credential.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - run: dotnet test packages/dotnet/Crumbtrail.AspNetCore.Tests
+      - run: dotnet test packages/dotnet/Crumbtrail.EntityFrameworkCore.Tests
+      - name: Pack
+        run: |
+          dotnet pack packages/dotnet/Crumbtrail.AspNetCore -o .local-packs/dotnet
+          dotnet pack packages/dotnet/Crumbtrail.EntityFrameworkCore -o .local-packs/dotnet
+      - name: Publish
+        # --skip-duplicate is the version check: NuGet answers 409 for an id and
+        # version that already exist, and the flag turns that into a success
+        # instead of failing the whole release.
+        if: ${{ !inputs.dry_run }}
+        run: |
+          dotnet nuget push ".local-packs/dotnet/*.nupkg" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+  tag-go:
+    runs-on: ubuntu-latest
+    permissions:
+      # No registry and no credential: the Go module proxy serves whatever the
+      # tag points at, so pushing the tag IS the publish.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/go/go.mod
+      - run: go test ./...
+        working-directory: packages/go
+      - name: Tag the module
+        run: |
+          # capture.go's Version constant is the source of truth, because it is
+          # also what the SDK reports over the wire. Tagging from anywhere else
+          # lets the published module disagree with the events it sends.
+          VERSION=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' packages/go/capture.go)
+          if [ -z "$VERSION" ]; then
+            echo "Could not read const Version from packages/go/capture.go" >&2
+            exit 1
+          fi
+          # The directory prefix is mandatory for a module in a subdirectory. A
+          # bare vX.Y.Z tag publishes nothing and cannot be corrected later: the
+          # proxy caches tags immutably, so a wrong one is fixed by bumping the
+          # patch, never by moving the tag.
+          TAG="packages/go/v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists; skipping."
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "Dry run: would tag $TAG at $GITHUB_SHA"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Tagged $TAG"
+          fi
