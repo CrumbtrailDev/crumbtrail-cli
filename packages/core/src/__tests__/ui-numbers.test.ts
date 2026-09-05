@@ -14,6 +14,7 @@ import {
   parseProseCounts,
   scanUiNumbers,
   uiNumbersCollector,
+  UI_NUM_MAX_PHRASE_ITEMS,
   UI_NUM_MAX_SCAN_ELEMENTS,
   UI_NUM_SETTLE_MS,
 } from "../collectors/ui-numbers";
@@ -125,45 +126,75 @@ describe("parseNumericToken", () => {
 });
 
 describe("parseProseCounts", () => {
-  it("reads a count and its noun", () => {
+  it("reads a count and its noun under the count namespace", () => {
     expect(parseProseCounts("31 people")).toEqual([
-      { label: "people", value: 31 },
+      { label: "count:people", value: 31 },
     ]);
     expect(parseProseCounts("4 results")).toEqual([
-      { label: "results", value: 4 },
+      { label: "count:results", value: 4 },
     ]);
     expect(parseProseCounts("12 open orders")).toEqual([
-      { label: "open orders", value: 12 },
+      { label: "count:open orders", value: 12 },
     ]);
-    expect(parseProseCounts("1,204 active team members")).toEqual([
-      { label: "active team members", value: 1204 },
+    expect(parseProseCounts("1,204 members")).toEqual([
+      { label: "count:members", value: 1204 },
     ]);
   });
 
-  it("reads pager, range and showing phrases", () => {
+  // A free multi-word noun is a way for page content to leave as a "label".
+  // Two words are allowed only when the first is a known qualifier.
+  it("refuses a noun that is not one word plus a known qualifier", () => {
+    expect(parseProseCounts("2 jane doe")).toBeNull();
+    expect(parseProseCounts("1,204 active team members")).toBeNull();
+    expect(parseProseCounts("3 unread messages")).toEqual([
+      { label: "count:unread messages", value: 3 },
+    ]);
+  });
+
+  it("reads pager, range and showing phrases under the pager namespace", () => {
     expect(parseProseCounts("Page 1 of 1")).toEqual([
-      { label: "page", value: 1 },
-      { label: "pages", value: 1 },
+      { label: "pager:page", value: 1 },
+      { label: "pager:pages", value: 1 },
     ]);
     expect(parseProseCounts("1–25 of 31")).toEqual([
-      { label: "range_start", value: 1 },
-      { label: "range_end", value: 25 },
-      { label: "total", value: 31 },
-    ]);
-    expect(parseProseCounts("1-25 of 31")).toEqual([
-      { label: "range_start", value: 1 },
-      { label: "range_end", value: 25 },
-      { label: "total", value: 31 },
-    ]);
-    expect(parseProseCounts("1 to 25 of 31")).toEqual([
-      { label: "range_start", value: 1 },
-      { label: "range_end", value: 25 },
-      { label: "total", value: 31 },
+      { label: "pager:range_start", value: 1 },
+      { label: "pager:range_end", value: 25 },
+      { label: "pager:total", value: 31 },
     ]);
     expect(parseProseCounts("Showing 25 of 31")).toEqual([
-      { label: "shown", value: 25 },
-      { label: "total", value: 31 },
+      { label: "pager:shown", value: 25 },
+      { label: "pager:total", value: 31 },
     ]);
+  });
+
+  // The unit noun a real pager writes after its numbers used to be swallowed
+  // into the number, so three of the four commonest renderings parsed as
+  // nothing at all.
+  it("accepts a trailing unit noun on the `of` shapes", () => {
+    expect(parseProseCounts("Showing 25 of 138 results")).toEqual([
+      { label: "pager:shown", value: 25 },
+      { label: "pager:total", value: 138 },
+    ]);
+    expect(parseProseCounts("Showing 1 to 25 of 31 entries")).toEqual([
+      { label: "pager:range_start", value: 1 },
+      { label: "pager:range_end", value: 25 },
+      { label: "pager:total", value: 31 },
+    ]);
+    expect(parseProseCounts("1-25 of 31 items")).toEqual([
+      { label: "pager:range_start", value: 1 },
+      { label: "pager:range_end", value: 25 },
+      { label: "pager:total", value: 31 },
+    ]);
+    expect(parseProseCounts("Total 85 items")).toEqual([
+      { label: "pager:total", value: 85 },
+    ]);
+  });
+
+  // "Total" plus a currency figure is a rendered money total, which belongs to
+  // the arithmetic lane and must not be minted as a pager fact.
+  it("leaves a rendered currency total alone", () => {
+    expect(parseProseCounts("Total $84.00")).toBeNull();
+    expect(parseProseCounts("Total 85")).toBeNull();
   });
 
   // Every pattern is anchored to the whole text. A label lifted out of running
@@ -185,12 +216,13 @@ describe("parsePagerControl", () => {
     document.body.innerHTML = "";
   });
 
-  function control(html: string) {
+  function control(html: string, selector = "button, a") {
     document.body.innerHTML = html;
-    return parsePagerControl(document.body.firstElementChild!);
+    const el = document.body.querySelector(selector);
+    return el ? parsePagerControl(el) : null;
   }
 
-  it("reads pager words in either state, case insensitively", () => {
+  it("reads a plain button pager in either state", () => {
     expect(control("<button>Next</button>")).toEqual({
       label: "control:next",
       value: 1,
@@ -199,29 +231,72 @@ describe("parsePagerControl", () => {
       label: "control:prev",
       value: 0,
     });
-    expect(control('<a aria-label="Newer">→</a>')).toEqual({
-      label: "control:newer",
+  });
+
+  // The three pagers a real application is most likely to be using. An
+  // equality test against the word recognised none of them.
+  it("reads MUI, Ant and Bootstrap pagers", () => {
+    expect(control('<button aria-label="Go to next page">›</button>')).toEqual({
+      label: "control:next",
       value: 1,
     });
-    expect(control('<a aria-disabled="true">Last</a>')).toEqual({
-      label: "control:last",
-      value: 0,
+    expect(
+      control('<button aria-label="Go to previous page" disabled>‹</button>'),
+    ).toEqual({ label: "control:previous", value: 0 });
+    expect(control('<button aria-label="Next Page">›</button>')).toEqual({
+      label: "control:next",
+      value: 1,
     });
+    expect(
+      control(
+        '<ul class="pagination"><li class="page-item disabled">' +
+          '<a class="page-link" tabindex="-1">Previous</a></li></ul>',
+        "a",
+      ),
+    ).toEqual({ label: "control:previous", value: 0 });
+    expect(
+      control(
+        '<ul class="pagination"><li class="page-item">' +
+          '<a class="page-link" href="?page=2">Next</a></li></ul>',
+        "a",
+      ),
+    ).toEqual({ label: "control:next", value: 1 });
+  });
+
+  it("reads glyph-only controls and Load more", () => {
+    expect(control('<a href="#">»</a>')).toEqual({
+      label: "control:last",
+      value: 1,
+    });
+    expect(control('<a href="#">«</a>')).toEqual({
+      label: "control:first",
+      value: 1,
+    });
+    expect(control("<button>Load more</button>")).toEqual({
+      label: "control:load_more",
+      value: 1,
+    });
+  });
+
+  // A confident `1` on a control whose state is unknown would be read
+  // downstream as "the user could have gone to page two".
+  it("emits nothing when the state cannot be determined", () => {
+    expect(control("<a>Next</a>")).toBeNull();
   });
 
   it("ignores controls that are not pager controls", () => {
     expect(control("<button>Save changes</button>")).toBeNull();
     expect(control("<button>Next step in setup</button>")).toBeNull();
-    expect(control("<span>Next</span>")).toBeNull();
+    expect(control("<span>Next</span>", "span")).toBeNull();
   });
 });
 
 /**
- * The People screen from the dogfood run: a total in prose, a pager sentence,
- * and two buttons whose state is the whole story. Three captured sessions of
- * this markup carried zero `ui.num` events.
+ * A list toolbar that states its own size in prose and pages itself with two
+ * buttons: a count, a "Page a of b" line, and a Previous/Next pair whose
+ * disabled state is the fact that matters.
  */
-function peopleMarkup(total: number, page: number, pages: number): string {
+function listToolbarMarkup(total: number, page: number, pages: number): string {
   return `
     <main>
       <div class="toolbar">
@@ -246,22 +321,22 @@ describe("scanUiNumbers rendered counts and pager state", () => {
     document.body.innerHTML = "";
   });
 
-  it("captures the People screen's total, pager and both control states", () => {
-    document.body.innerHTML = peopleMarkup(31, 1, 1);
+  it("captures a list toolbar's total, pager and both control states", () => {
+    document.body.innerHTML = listToolbarMarkup(31, 1, 1);
     const items = allItems(scanUiNumbers(document.body));
     expect(items).toEqual([
-      { label: "people", value: 31 },
+      { label: "count:people", value: 31 },
       { label: "control:previous", value: 0 },
-      { label: "page", value: 1 },
-      { label: "pages", value: 1 },
+      { label: "pager:page", value: 1 },
+      { label: "pager:pages", value: 1 },
       { label: "control:next", value: 0 },
     ]);
   });
 
   it("records Next as actionable when a second page exists", () => {
-    document.body.innerHTML = peopleMarkup(31, 1, 2);
+    document.body.innerHTML = listToolbarMarkup(31, 1, 2);
     const items = allItems(scanUiNumbers(document.body));
-    expect(items).toContainEqual({ label: "pages", value: 2 });
+    expect(items).toContainEqual({ label: "pager:pages", value: 2 });
     expect(items).toContainEqual({ label: "control:next", value: 1 });
     expect(items).toContainEqual({ label: "control:previous", value: 0 });
   });
@@ -285,8 +360,8 @@ describe("scanUiNumbers rendered counts and pager state", () => {
     expect(allItems(scanUiNumbers(document.body))).toEqual([
       { label: "control:first", value: 0 },
       { label: "control:older", value: 1 },
-      { label: "shown", value: 25 },
-      { label: "total", value: 31 },
+      { label: "pager:shown", value: 25 },
+      { label: "pager:total", value: 31 },
     ]);
   });
 
@@ -297,6 +372,46 @@ describe("scanUiNumbers rendered counts and pager state", () => {
         <span>Page 1 of 1</span>
       </nav>`;
     expect(allItems(scanUiNumbers(document.body))).toEqual([]);
+  });
+
+  // A pager range beside a currency component in ONE region: the range's total
+  // must never arrive as a bare `total`, or the display-arithmetic detector
+  // reads a row count as a money total and reports a confident mismatch.
+  it("never mints a bare total beside a currency component", () => {
+    document.body.innerHTML = `
+      <section class="cart">
+        <span aria-label="Shipping">$5.00</span>
+        <span>1–25 of 31</span>
+      </section>`;
+    const items = allItems(scanUiNumbers(document.body));
+    expect(items).toContainEqual({
+      label: "Shipping",
+      value: 5,
+      unit: "$",
+    });
+    expect(items.some((item) => /^total$/i.test(item.label))).toBe(false);
+    expect(items).toContainEqual({ label: "pager:total", value: 31 });
+  });
+
+  // Phrase items have their own budget: a chatty feed must not push a region
+  // over the token cap and delete the labeled currency token with it.
+  it("keeps token evidence when a feed floods the region with phrases", () => {
+    const rows = Array.from(
+      { length: 30 },
+      () => `<li><span>12 likes</span><span>3 comments</span></li>`,
+    ).join("");
+    document.body.innerHTML = `
+      <ul class="feed">
+        <li><span aria-label="Payout">$5.00</span></li>
+        ${rows}
+      </ul>`;
+    const scan = scanUiNumbers(document.body);
+    const items = allItems(scan);
+    expect(scan!.truncated).toEqual([]);
+    expect(items).toContainEqual({ label: "Payout", value: 5, unit: "$" });
+    expect(
+      items.filter((item) => item.label.startsWith("count:")),
+    ).toHaveLength(UI_NUM_MAX_PHRASE_ITEMS);
   });
 });
 

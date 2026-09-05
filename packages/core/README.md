@@ -903,26 +903,40 @@ and the UI-vs-API divergence detector. It never captures raw DOM or HTML, only
 the short label and the parsed number.
 
 Two further shapes are read, because a list screen states its own counts in
-prose rather than as bare numbers. First, a text node whose **whole** content
-is a short count phrase:
+prose rather than as bare numbers. Both use a namespaced label, so a pager
+footer can never be mistaken for a rendered figure by a consumer that matches
+labels by word.
 
-| Rendered                                                            | Items                               |
-| ------------------------------------------------------------------- | ----------------------------------- |
-| `{n} {noun}` ("31 people")                                          | `{ label: noun, value: n }`         |
-| `Page {a} of {b}`                                                   | `page` = a, `pages` = b             |
-| `{a}-{b} of {n}` (also en/em dash, `to`, optional `Showing` prefix) | `range_start`, `range_end`, `total` |
-| `Showing {a} of {n}`                                                | `shown` = a, `total` = n            |
+First, a text node whose **whole** content is a short count phrase:
 
-The noun is one to three lowercase words and may not contain a function word,
-so a sentence that merely mentions a number ("We have 31 people on the team.")
-is not a count and produces nothing. Labels come only from the phrase's own
-noun or the pattern's fixed words, never from surrounding text.
+| Rendered                                                              | Items                                                 |
+| --------------------------------------------------------------------- | ----------------------------------------------------- |
+| `31 people` (`{n} {noun}`)                                            | `count:people` = 31                                   |
+| `Total 85 items`                                                      | `pager:total` = 85                                    |
+| `Page 1 of 1`                                                         | `pager:page` = 1, `pager:pages` = 1                   |
+| `1-25 of 31 items` (also en/em dash, `to`, optional `Showing` prefix) | `pager:range_start`, `pager:range_end`, `pager:total` |
+| `Showing 25 of 138 results`                                           | `pager:shown` = 25, `pager:total` = 138               |
 
-Second, a pager control's state: a `button` or `a` whose accessible text is
-Previous, Prev, Next, Newer, Older, First or Last emits
-`{ label: "control:<text>", value: 1 | 0 }`, where the value is a boolean, 1 for
-actionable and 0 for disabled (`disabled` or `aria-disabled="true"`), not a
-count. The `control:` prefix is what tells the two apart.
+A trailing unit noun is accepted and ignored. The noun of a `{n} {noun}` count
+is one word, optionally preceded by one of a closed qualifier list (open,
+closed, new, unread, active, pending, total, matching), so free text cannot
+become a label: "12 open orders" is read, "2 jane doe" is not. A sentence that
+merely mentions a number ("We have 31 people on the team.") is not a count and
+produces nothing.
+
+Second, a pager control's state: a `button` or `a` whose accessible name
+reduces to a pager word emits `{ label: "control:<word>", value: 1 | 0 }`, where
+the value is a boolean, 1 for actionable and 0 for disabled, not a count. The
+name is reduced rather than matched whole, so "Go to next page" and "Next Page"
+both read as `control:next` while "Next step in setup" is not a pager control.
+Disabled is read from the `disabled` attribute, `aria-disabled="true"`, a
+disabled class on the control or its wrapper, or an anchor with
+`tabindex="-1"`; `«`, `»`, `‹`, `›` and "Load more" are recognised too. A
+control whose state cannot be established emits no item rather than a confident
+`1`.
+
+Count and control items are budgeted separately from rendered figures, so a
+chatty feed cannot push a region over the numeric-token cap.
 
 This means numeric amounts shown on screen are captured together with their
 labels. Labels run through the redaction classifier, so PII-shaped labels

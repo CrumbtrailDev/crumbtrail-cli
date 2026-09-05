@@ -43,6 +43,13 @@ export const UI_NUM_MAX_WAIT_MS = 1500;
  * this is reported as a gap and withheld, never clipped — see `scanUiNumbers`.
  */
 export const UI_NUM_MAX_ITEMS = 50;
+/**
+ * Separate cap on phrase and control items per region. They are budgeted apart
+ * from numeric tokens because over-cap tokens withhold a region whole (the
+ * arithmetic detector needs every component of a region or none), and a chatty
+ * list of count phrases must not be able to trigger that withholding.
+ */
+export const UI_NUM_MAX_PHRASE_ITEMS = 20;
 /** Labels longer than this are ignored (they are prose, not labels). */
 const MAX_LABEL_LENGTH = 64;
 /**
@@ -447,6 +454,22 @@ function isLeaf(el: Element): boolean {
 const MAX_PROSE_TEXT_LENGTH = 64;
 
 /**
+ * Namespace for a label derived from a count phrase's own noun, and for the
+ * pattern's fixed pagination words.
+ *
+ * These prefixes are not decoration. `ui.num` labels are matched by word
+ * downstream — the display-arithmetic detector treats any label containing
+ * "total" as a region's total — so minting a bare `total` from a "1-25 of 31"
+ * footer would put a page count into a currency sum and manufacture a
+ * confident "components sum to 5.00 but total shows 31.00". A phrase label is
+ * a different KIND of fact from a rendered figure, and it says so in its name.
+ */
+export const COUNT_LABEL_PREFIX = "count:";
+export const PAGER_LABEL_PREFIX = "pager:";
+/** Label prefix that marks a pager control state rather than a count. */
+export const PAGER_CONTROL_LABEL_PREFIX = "control:";
+
+/**
  * Function words that turn a trailing phrase into a sentence fragment rather
  * than a noun. Without them "3 items in your cart" would label a count with a
  * slice of running prose ("items in your").
@@ -487,28 +510,96 @@ const PROSE_STOP_WORDS = new Set([
   "your",
 ]);
 
+/**
+ * The only words allowed in front of a count noun. A noun is otherwise ONE
+ * word: an open-ended multi-word noun turns "2 jane doe" into the label
+ * "jane doe", which is a person's name lifted off the page under the guise of
+ * a label. A short, closed qualifier list keeps "12 open orders" without
+ * opening that door.
+ */
+const COUNT_NOUN_QUALIFIERS = new Set([
+  "active",
+  "closed",
+  "matching",
+  "new",
+  "open",
+  "pending",
+  "total",
+  "unread",
+]);
+
 // Every pattern is anchored to the WHOLE trimmed text. A count phrase is the
 // entire content of its leaf; a sentence that merely contains a number ("We
 // have 31 people on the team.") is prose and must stay uncaptured.
-const PAGE_OF_RE = /^page\s+(.+?)\s+of\s+(.+?)$/i;
-const RANGE_DASH_OF_RE = /^(?:showing\s+)?(.+?)\s*[-–—]\s*(.+?)\s+of\s+(.+?)$/i;
-const RANGE_TO_OF_RE = /^(?:showing\s+)?(.+?)\s+to\s+(.+?)\s+of\s+(.+?)$/i;
-const SHOWING_OF_RE = /^showing\s+(.+?)\s+of\s+(.+?)$/i;
-const COUNT_NOUN_RE = /^(.+?)\s+([a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,2})$/;
+//
+// `NOUN_TAIL` is the optional unit noun a real pager writes after its numbers
+// ("Showing 25 of 138 results"). Without it the noun is swallowed into the
+// number and the whole phrase parses as nothing, which is how three of the
+// four commonest pager renderings were invisible.
+const NOUN_TAIL = String.raw`(?:\s+([a-z][a-z-]*(?:\s+[a-z][a-z-]*)?))?`;
+const PAGE_OF_RE = new RegExp(String.raw`^page\s+(.+?)\s+of\s+(.+?)$`, "i");
+const RANGE_DASH_OF_RE = new RegExp(
+  String.raw`^(?:showing\s+)?(.+?)\s*[-–—]\s*(.+?)\s+of\s+(.+?)${NOUN_TAIL}$`,
+  "i",
+);
+const RANGE_TO_OF_RE = new RegExp(
+  String.raw`^(?:showing\s+)?(.+?)\s+to\s+(.+?)\s+of\s+(.+?)${NOUN_TAIL}$`,
+  "i",
+);
+const SHOWING_OF_RE = new RegExp(
+  String.raw`^showing\s+(.+?)\s+of\s+(.+?)${NOUN_TAIL}$`,
+  "i",
+);
+const TOTAL_COUNT_RE = new RegExp(String.raw`^total\s+(.+?)${NOUN_TAIL}$`, "i");
+const COUNT_NOUN_RE = /^(.+?)\s+([a-z][a-z-]*(?:\s+[a-z][a-z-]*)?)$/;
 
-/** Label prefix that marks a pager control state rather than a count. */
-export const PAGER_CONTROL_LABEL_PREFIX = "control:";
-
-/** Accessible texts that identify a pager control, lowercased. */
-const PAGER_CONTROL_TEXTS = new Set([
-  "previous",
-  "prev",
-  "next",
-  "newer",
-  "older",
+/**
+ * Pager words, matched against a normalized accessible name rather than
+ * against the whole string. Real pagers write "Go to next page" (MUI),
+ * "Next Page" (Ant) and a bare "»", so an equality test recognised almost
+ * none of them.
+ */
+const PAGER_WORDS = new Set([
   "first",
   "last",
+  "newer",
+  "next",
+  "older",
+  "prev",
+  "previous",
 ]);
+
+/**
+ * Words a pager puts around its own verb and that carry no meaning here.
+ * Stripping them lets "go to next page" reduce to "next" while "next step in
+ * setup" keeps words that are not filler and is therefore rejected — the
+ * reason this is a reduction and not a substring search.
+ */
+const PAGER_FILLER_WORDS = new Set([
+  "a",
+  "button",
+  "entries",
+  "go",
+  "items",
+  "page",
+  "pages",
+  "records",
+  "results",
+  "rows",
+  "the",
+  "to",
+]);
+
+/** Glyph-only pager controls, which carry no text to reduce. */
+const PAGER_SYMBOLS = new Map<string, string>([
+  ["«", "first"],
+  ["»", "last"],
+  ["‹", "previous"],
+  ["›", "next"],
+]);
+
+/** Class names a component library puts on a wrapper to mean "disabled". */
+const DISABLED_CLASS_RE = /(?:^|[\s_-])disabled(?:$|[\s_-])/i;
 
 function labeledNumbers(
   parts: Array<[label: string, raw: string]>,
@@ -525,18 +616,28 @@ function labeledNumbers(
   return items;
 }
 
+/** A trailing unit noun is accepted only when it is a noun, not prose. */
+function nounTailOk(tail: string | undefined): boolean {
+  if (tail === undefined) return true;
+  return !tail.split(" ").some((word) => PROSE_STOP_WORDS.has(word));
+}
+
 /**
  * Parse a short rendered count phrase into labeled numbers. The labels come
  * only from the phrase's own noun or from the pattern's fixed words, never
  * from surrounding text, so nothing but a number and a short noun leaves the
- * page.
+ * page. Every label is namespaced, so no phrase can mint a bare word that
+ * another lane already reads as something else.
  *
- * Recognised, whole-text only:
- *   `{n} {noun}`            -> {noun: n}                      ("31 people")
- *   `Page {a} of {b}`       -> {page: a, pages: b}
- *   `{a}-{b} of {n}`        -> {range_start, range_end, total} (also – — / "to",
- *                              with an optional "Showing " prefix)
- *   `Showing {a} of {n}`    -> {shown: a, total: n}
+ * Recognised, whole-text only (a trailing unit noun is allowed and ignored on
+ * the `of` shapes):
+ *   `{n} {noun}`            -> `count:<noun>`                  ("31 people")
+ *   `Total {n} {noun}`      -> `pager:total`
+ *   `Page {a} of {b}`       -> `pager:page`, `pager:pages`
+ *   `{a}-{b} of {n}`        -> `pager:range_start`, `pager:range_end`,
+ *                              `pager:total` (also – — / "to", with an
+ *                              optional "Showing " prefix)
+ *   `Showing {a} of {n}`    -> `pager:shown`, `pager:total`
  */
 export function parseProseCounts(
   text: string,
@@ -549,8 +650,8 @@ export function parseProseCounts(
   if (page) {
     return labeledNumbers(
       [
-        ["page", page[1]],
-        ["pages", page[2]],
+        [`${PAGER_LABEL_PREFIX}page`, page[1]],
+        [`${PAGER_LABEL_PREFIX}pages`, page[2]],
       ],
       lang,
     );
@@ -558,11 +659,12 @@ export function parseProseCounts(
 
   const range = RANGE_DASH_OF_RE.exec(trimmed) ?? RANGE_TO_OF_RE.exec(trimmed);
   if (range) {
+    if (!nounTailOk(range[4])) return null;
     return labeledNumbers(
       [
-        ["range_start", range[1]],
-        ["range_end", range[2]],
-        ["total", range[3]],
+        [`${PAGER_LABEL_PREFIX}range_start`, range[1]],
+        [`${PAGER_LABEL_PREFIX}range_end`, range[2]],
+        [`${PAGER_LABEL_PREFIX}total`, range[3]],
       ],
       lang,
     );
@@ -570,46 +672,128 @@ export function parseProseCounts(
 
   const showing = SHOWING_OF_RE.exec(trimmed);
   if (showing) {
+    if (!nounTailOk(showing[3])) return null;
     return labeledNumbers(
       [
-        ["shown", showing[1]],
-        ["total", showing[2]],
+        [`${PAGER_LABEL_PREFIX}shown`, showing[1]],
+        [`${PAGER_LABEL_PREFIX}total`, showing[2]],
       ],
       lang,
     );
   }
 
+  // "Total 85 items" is a declared collection size. The trailing noun is
+  // REQUIRED and the number may carry no currency unit, so a rendered
+  // "Total $84.00" stays out of the pager namespace entirely.
+  const total = TOTAL_COUNT_RE.exec(trimmed);
+  if (total && total[2] !== undefined && nounTailOk(total[2])) {
+    const parsed = labeledNumbers(
+      [[`${PAGER_LABEL_PREFIX}total`, total[1]]],
+      lang,
+    );
+    if (parsed && parsed[0].unit === undefined) return parsed;
+  }
+
   const count = COUNT_NOUN_RE.exec(trimmed);
   if (count) {
-    const noun = count[2];
-    if (noun.split(" ").some((word) => PROSE_STOP_WORDS.has(word))) return null;
-    return labeledNumbers([[noun, count[1]]], lang);
+    const words = count[2].split(" ");
+    if (words.some((word) => PROSE_STOP_WORDS.has(word))) return null;
+    if (words.length === 2 && !COUNT_NOUN_QUALIFIERS.has(words[0])) return null;
+    return labeledNumbers(
+      [[`${COUNT_LABEL_PREFIX}${count[2]}`, count[1]]],
+      lang,
+    );
   }
   return null;
 }
 
 /**
- * Pager control state for a `button`/`a` whose accessible text is one of the
- * pager words. The item is `{ label: "control:<text>", value: 1 | 0 }`, where 1
- * means the control is actionable and 0 means it is disabled — a boolean, not
- * a count, distinguished from every other item by the `control:` prefix.
- * "Next is disabled on page one" is what separates a client that knows about
- * page two from one that does not, and it is not a number anywhere on screen.
+ * Reduce a control's accessible name to the single pager word it means, or
+ * null. Filler words are dropped and what remains must be exactly one pager
+ * word, one glyph, or "load more" — so "Go to next page" reduces to `next`
+ * while "Next step in setup" reduces to nothing.
+ */
+function pagerWordFromName(name: string): string | null {
+  const lowered = name.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!lowered || lowered.length > MAX_PROSE_TEXT_LENGTH) return null;
+  const symbols = new Set(
+    [...lowered].filter((char) => PAGER_SYMBOLS.has(char)),
+  );
+  const words = lowered
+    .split(/[^\p{Letter}]+/u)
+    .filter((word) => word.length > 0 && !PAGER_FILLER_WORDS.has(word));
+  if (words.length === 0) {
+    if (symbols.size !== 1) return null;
+    return PAGER_SYMBOLS.get([...symbols][0]) ?? null;
+  }
+  if (words.length === 1 && PAGER_WORDS.has(words[0])) return words[0];
+  if (
+    words.length === 2 &&
+    words[1] === "more" &&
+    (words[0] === "load" || words[0] === "show")
+  ) {
+    return "load_more";
+  }
+  return null;
+}
+
+/**
+ * Disabled state of a control, or null when it cannot be determined.
+ *
+ * Libraries express "disabled" four different ways and only one of them is the
+ * attribute. A `<button>` always answers (the attribute is present or it is
+ * not), while an anchor is only actionable when it has an href — a bare
+ * `<a>` with no href and no disabled marker is a control whose state we do not
+ * know, and a confident `1` there is worse than no evidence, because a
+ * detector would read it as "Next was clickable".
+ */
+function controlDisabledState(el: Element): boolean | null {
+  // Deliberately starts at the PARENT: a Bootstrap `a.page-link` matches a
+  // class selector for itself, and the state it needs lives on the `li` above.
+  const wrapper =
+    el.parentElement?.closest("li, [role='listitem'], [class*='pag']") ??
+    el.parentElement;
+  const ariaHost = el.hasAttribute("aria-disabled") ? el : wrapper;
+  if (
+    el.hasAttribute("disabled") ||
+    (el as Partial<HTMLButtonElement>).disabled === true ||
+    ariaHost?.getAttribute("aria-disabled") === "true" ||
+    DISABLED_CLASS_RE.test(el.getAttribute("class") ?? "") ||
+    DISABLED_CLASS_RE.test(wrapper?.getAttribute("class") ?? "")
+  ) {
+    return true;
+  }
+  if (el.tagName === "A") {
+    const href = el.getAttribute("href");
+    if (href === null) return null;
+    if (el.getAttribute("tabindex") === "-1") return true;
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Pager control state for a `button`/`a` that means one of the pager words.
+ * The item is `{ label: "control:<word>", value: 1 | 0 }`, where 1 means the
+ * control is actionable and 0 means it is disabled — a boolean, not a count,
+ * distinguished from every other item by the `control:` prefix. "Next is
+ * disabled on page one" is what separates a client that knows about page two
+ * from one that does not, and it is not a number anywhere on screen.
+ *
+ * Returns null when the element is not a pager control OR when its state
+ * cannot be established; an unknown state is never reported as enabled.
  */
 export function parsePagerControl(el: Element): UiNumItem | null {
   const tag = el.tagName;
   if (tag !== "BUTTON" && tag !== "A") return null;
-  const text = (el.getAttribute("aria-label") ?? el.textContent ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-  if (!PAGER_CONTROL_TEXTS.has(text)) return null;
-  const disabled =
-    el.hasAttribute("disabled") ||
-    el.getAttribute("aria-disabled") === "true" ||
-    (el as HTMLButtonElement).disabled === true;
+  const word = pagerWordFromName(
+    el.getAttribute("aria-label") ?? el.textContent ?? "",
+  );
+  if (!word) return null;
+  const disabled = controlDisabledState(el);
+  if (disabled === null) return null;
   return {
-    label: `${PAGER_CONTROL_LABEL_PREFIX}${text}`,
+    label: `${PAGER_CONTROL_LABEL_PREFIX}${word}`,
     value: disabled ? 0 : 1,
   };
 }
@@ -643,10 +827,20 @@ export function scanUiNumbers(
 ): UiNumScanResult | null {
   const elements = root.querySelectorAll("*");
   if (elements.length > maxElements) return null;
-  const regions = new Map<string, UiNumItem[]>();
+  // Token items and phrase/control items are budgeted separately. They answer
+  // different questions and only the token budget guards the arithmetic
+  // detector's completeness assumption, so a feed of thirty rows each stating
+  // "12 likes" must not push a region's currency tokens over the cap and
+  // delete evidence that was captured before phrases existed.
+  const perRegion = new Map<
+    string,
+    Array<{ item: UiNumItem; token: boolean }>
+  >();
   // Counted past the cap so the gap can report the magnitude it withheld: a
   // region of 51 and a region of 5,000 are different evidence problems.
-  const seenPerRegion = new Map<string, number>();
+  const tokenSeen = new Map<string, number>();
+  const tokenKept = new Map<string, number>();
+  const phraseKept = new Map<string, number>();
   for (const el of elements) {
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
@@ -655,6 +849,7 @@ export function scanUiNumbers(
     // leaf that IS a numeric token, and a leaf that is a short count phrase
     // ("31 people", "Page 1 of 1"). The last two are mutually exclusive.
     let produced: UiNumItem[] | null = null;
+    let token = false;
     const control = parsePagerControl(el);
     if (control) {
       produced = [control];
@@ -672,6 +867,7 @@ export function scanUiNumbers(
         const item: UiNumItem = { label, value: parsed.value };
         if (parsed.unit) item.unit = parsed.unit;
         produced = [item];
+        token = true;
       } else if (leaf) {
         produced = parseProseCounts(el.textContent ?? "", lang);
       }
@@ -688,25 +884,39 @@ export function scanUiNumbers(
     if (kept.length === 0) continue;
 
     const region = regionIdentifier(regionContainer(el, root));
-    let items = regions.get(region);
-    if (!items) {
-      items = [];
-      regions.set(region, items);
+    let entries = perRegion.get(region);
+    if (!entries) {
+      entries = [];
+      perRegion.set(region, entries);
     }
     for (const item of kept) {
-      seenPerRegion.set(region, (seenPerRegion.get(region) ?? 0) + 1);
-      if (items.length >= UI_NUM_MAX_ITEMS) continue;
-      items.push(item);
+      if (token) {
+        tokenSeen.set(region, (tokenSeen.get(region) ?? 0) + 1);
+        const already = tokenKept.get(region) ?? 0;
+        if (already >= UI_NUM_MAX_ITEMS) continue;
+        tokenKept.set(region, already + 1);
+      } else {
+        const already = phraseKept.get(region) ?? 0;
+        if (already >= UI_NUM_MAX_PHRASE_ITEMS) continue;
+        phraseKept.set(region, already + 1);
+      }
+      entries.push({ item, token });
     }
   }
 
-  // Withhold every over-cap region before returning: what the caller receives
-  // is only ever regions that were captured whole.
+  // Withhold every over-cap region's TOKENS before returning: what the caller
+  // receives is only ever a set of tokens that was captured whole. Phrase and
+  // control items are not part of that assumption and survive.
+  const regions = new Map<string, UiNumItem[]>();
   const truncated: UiNumTruncatedRegion[] = [];
-  for (const [region, seen] of seenPerRegion) {
-    if (seen <= UI_NUM_MAX_ITEMS) continue;
-    regions.delete(region);
-    truncated.push({ region, seen });
+  for (const [region, entries] of perRegion) {
+    const seen = tokenSeen.get(region) ?? 0;
+    const over = seen > UI_NUM_MAX_ITEMS;
+    if (over) truncated.push({ region, seen });
+    const items = (
+      over ? entries.filter((entry) => !entry.token) : entries
+    ).map((entry) => entry.item);
+    if (items.length > 0) regions.set(region, items);
   }
   return { regions, truncated };
 }

@@ -251,32 +251,44 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
  * Payload: `{ region, items: [{ label, value, unit? }] }` — labels and parsed
  * numbers only, never raw DOM/HTML.
  *
- * An item is one of two things, told apart by its label:
+ * An item is one of three things, told apart by its label's namespace. The
+ * namespaces are load-bearing: `ui.num` labels are matched by word downstream
+ * (the display-arithmetic detector treats any label containing "total" as a
+ * region's total), so a pager footer must never be able to mint a bare
+ * `total` and put a row count into a currency sum.
  *
- * 1. **A count.** `label` is the on-screen label or the noun of a rendered
- *    count phrase, `value` the parsed number. Beyond a leaf whose entire text
- *    is a numeric token, four whole-text phrase shapes are read, and their
- *    labels are RESERVED — they mean exactly this and nothing else:
- *      - `{n} {noun}` ("31 people")        -> `{ label: noun, value: n }`
- *      - `Page {a} of {b}`                 -> `page` = a, `pages` = b
- *      - `{a}-{b} of {n}` (also – — / "to",
- *        with an optional "Showing" prefix) -> `range_start`, `range_end`, `total`
- *      - `Showing {a} of {n}`              -> `shown` = a, `total` = n
- *    The noun is one to three lowercase words; no label is ever taken from
- *    surrounding prose, and a sentence that merely contains a number produces
- *    nothing.
+ * 1. **A rendered figure.** No prefix. `label` is the on-screen label resolved
+ *    from the DOM, `value` the number, `unit` the currency or percent symbol
+ *    when one was rendered. This is the original shape and is unchanged.
  *
- * 2. **A pager control's state.** `label` is `control:<text>` where `<text>` is
- *    the control's lowercased accessible text, one of `previous`, `prev`,
- *    `next`, `newer`, `older`, `first` or `last`. `value` is BOOLEAN, not a
- *    count: `1` means the control is actionable, `0` means it is disabled
- *    (the `disabled` attribute or `aria-disabled="true"`). A reader that sums
- *    or compares these as quantities is misreading them; the `control:` prefix
- *    is what marks the difference. `unit` is never set on a control item.
+ * 2. **A count phrase**, read only when it is the WHOLE text of a leaf:
+ *      - `{n} {noun}` ("31 people")   -> `count:<noun>`, e.g. `count:people`
+ *      - `Total {n} {noun}`           -> `pager:total`
+ *      - `Page {a} of {b}`            -> `pager:page`, `pager:pages`
+ *      - `{a}-{b} of {n}` (also – —,
+ *        "to", optional "Showing")    -> `pager:range_start`, `pager:range_end`,
+ *                                        `pager:total`
+ *      - `Showing {a} of {n}`         -> `pager:shown`, `pager:total`
+ *    A trailing unit noun ("… of 138 results") is accepted and ignored. The
+ *    noun of a `{n} {noun}` count is ONE word, optionally preceded by one of a
+ *    closed qualifier list (open, closed, new, unread, active, pending, total,
+ *    matching), so free text cannot become a label. No label is ever taken
+ *    from surrounding prose, and a sentence that merely contains a number
+ *    produces nothing.
  *
- * A control item is emitted for every such control that is visible, whatever
- * its state, so "no `control:next` item" means no pager control was on screen,
- * never "Next was enabled".
+ * 3. **A pager control's state.** `label` is `control:<word>` where `<word>` is
+ *    the pager word the control's accessible name reduces to — `previous`,
+ *    `prev`, `next`, `newer`, `older`, `first`, `last` or `load_more`. `value`
+ *    is BOOLEAN, not a count: `1` means the control is actionable, `0` means it
+ *    is disabled (the `disabled` attribute, `aria-disabled="true"`, a disabled
+ *    class on the control or its wrapper, or an anchor with `tabindex="-1"`).
+ *    A reader that sums or compares these as quantities is misreading them.
+ *    `unit` is never set on a control item.
+ *
+ * A control whose state cannot be established emits NO item, so an item is
+ * always a claim about state and never a guess. Equally, "no `control:next`
+ * item" means no such control was recognised on screen, never "Next was
+ * enabled".
  */
 export const UI_NUM_EVENT_KIND = "ui.num" as const;
 
