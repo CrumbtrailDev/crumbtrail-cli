@@ -15,9 +15,10 @@ public sealed class CapturedChanges(CaptureContext capture, ILogger<CapturedChan
     private sealed record Pending(EntityEntry Entry, string Table, string Operation, object? Before, object? Callsite);
     private readonly Dictionary<DbContext, (List<Pending> Rows, long Started)> pending = [];
     private readonly Dictionary<Guid, List<object>> transactions = [];
+    private readonly Dictionary<DbContext, Guid> openTransaction = [];
 
     private readonly object gate = new();
-    public void Dispose() { lock (gate) { pending.Clear(); transactions.Clear(); } }
+    public void Dispose() { lock (gate) { pending.Clear(); transactions.Clear(); openTransaction.Clear(); } }
     public void Before(DbContext? db) { lock (gate) BeforeCore(db); }
     public void After(DbContext? db) { lock (gate) AfterCore(db); }
     public void Failed(DbContext? db) { lock (gate) { if (db is not null) pending.Remove(db); } }
@@ -65,6 +66,15 @@ public sealed class CapturedChanges(CaptureContext capture, ILogger<CapturedChan
         try
         {
             var tx = db.Database.CurrentTransaction?.TransactionId;
+            // EF exposes no transaction dispose interception point, so an
+            // abandoned transaction - `using var tx = ...` with no Commit - is
+            // recognised here: a save under a different current transaction
+            // proves the earlier one can never commit. Releasing its images
+            // keeps them from holding the per scope budget against a later
+            // transaction that does commit.
+            if (openTransaction.TryGetValue(db, out var previous) && previous != tx)
+            { transactions.Remove(previous); openTransaction.Remove(db); }
+            if (tx is { } current) openTransaction[db] = current;
             foreach (var row in saved.Rows)
             {
                 var data = new Dictionary<string, object?>
@@ -135,8 +145,4 @@ public sealed class CaptureTransactions(CapturedChanges changes) : DbTransaction
     public override void TransactionRolledBack(DbTransaction transaction, TransactionEndEventData data) => changes.Complete(data.TransactionId,false);
     public override Task TransactionRolledBackAsync(DbTransaction transaction, TransactionEndEventData data, CancellationToken ct = default)
     { changes.Complete(data.TransactionId,false); return Task.CompletedTask; }
-    // An abandoned transaction never reaches commit or rollback, so its images
-    // are unreachable. Releasing them at dispose keeps them from holding the
-    // per-scope image budget against a later transaction that does commit.
-    public override void TransactionDisposed(DbTransaction transaction, TransactionEndEventData data) => changes.Complete(data.TransactionId,false);
 }

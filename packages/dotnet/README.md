@@ -98,9 +98,9 @@ how string escapes are interpreted.
 Tracked `SaveChanges` operations emit redacted before and after images only
 after a successful save or an observed explicit transaction commit. Bulk SQL
 and `ExecuteUpdate` provide command evidence without row images. Explicit
-rollback discards pending images. A transaction disposed without a commit
-releases its images. Savepoint rollback discards uncertain images
-and emits a capture gap. Ambient `TransactionScope` and explicitly enlisted transaction row images are unsupported
+rollback discards pending images. A transaction abandoned without a commit
+releases its images once a later save shows it is no longer current. Savepoint
+rollback discards uncertain images and emits a capture gap. Ambient `TransactionScope` and explicitly enlisted transaction row images are unsupported
 and emit a capture gap. Transactions committed outside EF interception cannot
 produce confirmed row images. Scoped disposal releases pending snapshots.
 
