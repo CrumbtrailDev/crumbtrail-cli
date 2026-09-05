@@ -17,7 +17,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail, REMOTE_POLICY_TIMEOUT_MS } from "../crumbtrail";
 import { installEarlyCapture, uninstallEarlyCapture } from "../early-capture";
-import { CAPTURE_GAP_EVENT_KIND, type BugEvent } from "../types";
+import {
+  CAPTURE_GAP_EVENT_KIND,
+  DEFAULT_CONFIG,
+  type BugEvent,
+  type CrumbtrailConfig,
+} from "../types";
+import { reapplyPolicyToHeldEvent } from "../admission-hold";
+import { WS_MAX_FRAME_BYTES } from "../collectors/websocket";
+import { WORKER_MAX_MESSAGE_BYTES } from "../collectors/worker";
 
 function makeTransport() {
   return {
@@ -479,8 +487,7 @@ describe("a policy that tightens while events are held", () => {
     expect(JSON.stringify(response)).not.toContain("SAVE50");
     // The size facts survive; the parsed view agrees with the redacted body.
     const meta = response?.d?.bodyMeta as
-      | { ct?: string; data?: Record<string, unknown> }
-      | undefined;
+      { ct?: string; data?: Record<string, unknown> } | undefined;
     expect(meta?.ct).toBe("json");
     // Rebuilt rather than deleted: the parsed view still exists and now shows
     // the placeholder, so a reader can see the field was there and was removed.
@@ -683,5 +690,130 @@ describe("the hold and the page lifecycle", () => {
         String(event.d?.url).includes("/api/participants"),
       ),
     ).toHaveLength(0);
+  });
+});
+
+// The release pass, exercised directly.
+//
+// Some of what it has to get right is only reachable end to end by driving a
+// DOM snapshot or a WebSocket frame through the whole init window. These call
+// it with a held event and the policy that arrived, which is exactly the pair
+// it sees in `releasePendingAdmissionEvents`.
+describe("the release pass, per event kind", () => {
+  const LOOSE = { maskAllText: false, maskAllInputs: false };
+  const CONTEXT = { heldMasking: LOOSE, samplingShed: false };
+
+  /**
+   * The event was held under LOOSE masking, and the arriving policy leaves it
+   * loose unless a case says otherwise. Masking is on by default, so without
+   * this baseline every case would read as a tightening and drop everything.
+   */
+  function apply(
+    event: BugEvent,
+    // `maskAllText` and `maskAllInputs` are typed as the literal `true`, so a
+    // config with either off cannot be written in TypeScript. A JavaScript host
+    // can still pass one — the CLI writes an init block into JS apps — which is
+    // the state the masking branch of the release pass exists for.
+    config: Record<string, unknown>,
+    context = CONTEXT,
+  ): BugEvent | undefined {
+    return reapplyPolicyToHeldEvent(
+      event,
+      { ...DEFAULT_CONFIG, ...LOOSE, ...config } as CrumbtrailConfig,
+      context,
+    );
+  }
+
+  // `snap` is the storage collector's snapshot and `dom.snap` is the DOM one.
+  // Reading either as the other drops the wrong events and guards neither.
+  it("routes snap to the storage switch and dom.snap to the DOM switch", () => {
+    const storageSnap: BugEvent = { t: 1, k: "snap", d: { keys: 3 } };
+    const domSnap: BugEvent = { t: 1, k: "dom.snap", d: { html: "<p>x</p>" } };
+
+    expect(apply(storageSnap, { storage: false })).toBeUndefined();
+    expect(apply(storageSnap, { domSnapshot: false })).toBeDefined();
+    expect(apply(domSnap, { domSnapshot: false })).toBeUndefined();
+    expect(apply(domSnap, { storage: false })).toBeDefined();
+  });
+
+  // Page content is masked as it is captured, from a DOM that is gone by
+  // release. A policy that tightens masking cannot be applied to it after the
+  // fact, so the event goes rather than shipping under the looser mode.
+  it("drops content built under looser masking when the policy tightens it", () => {
+    const tightened = { maskAllText: true, maskAllInputs: true };
+    const domSnap: BugEvent = {
+      t: 1,
+      k: "dom.snap",
+      d: { html: "<p>jane@acme.com</p>" },
+    };
+    expect(apply(domSnap, tightened)).toBeUndefined();
+    // Unchanged masking is not a tightening, so the same event survives.
+    expect(apply(domSnap, {})).toBeDefined();
+    // A storage snapshot is not page content and is not masking dependent.
+    expect(apply({ t: 1, k: "snap", d: { keys: 3 } }, tightened)).toBeDefined();
+  });
+
+  // An interaction carries the element's rendered label. A button reading
+  // "Continue as jane@acme.com" holds that address with nothing left to
+  // re-mask it from.
+  it("drops a held click and input when the policy tightens masking", () => {
+    const tightened = { maskAllText: true, maskAllInputs: true };
+    const click: BugEvent = {
+      t: 1,
+      k: "clk",
+      d: { text: "Continue as jane@acme.com", sel: "button" },
+    };
+    const input: BugEvent = { t: 1, k: "inp", d: { val: "Sofia" } };
+    expect(apply(click, tightened)).toBeUndefined();
+    expect(apply(input, tightened)).toBeUndefined();
+    expect(apply(click, {})).toBeDefined();
+    expect(apply(input, {})).toBeDefined();
+  });
+
+  // A frame and a worker message have their own ceilings, well under the
+  // network body limit. Re-capping them at the body limit would let a held
+  // frame out at a size the live collector never allows.
+  it("re-caps a held frame at the frame limit, not the body limit", () => {
+    const long = "x".repeat(WS_MAX_FRAME_BYTES + 500);
+    const frame: BugEvent = { t: 1, k: "net.ws", d: { body: long } };
+    const message: BugEvent = {
+      t: 1,
+      k: "worker.msg",
+      d: { body: "y".repeat(WORKER_MAX_MESSAGE_BYTES + 500) },
+    };
+    // The network body limit is far above both ceilings, so a pass that used it
+    // would leave these bodies whole.
+    const config = { networkMaxBodySize: 100_000 };
+    for (const [event, limit] of [
+      [frame, WS_MAX_FRAME_BYTES],
+      [message, WORKER_MAX_MESSAGE_BYTES],
+    ] as const) {
+      const released = apply(event, config);
+      expect(released?.d?.body).toBeUndefined();
+      expect(released?.d?.bodySummary).toMatchObject({
+        reason: "payload_too_large",
+        limit,
+      });
+    }
+  });
+
+  // A gap record is the thing that says capture lost something. It survives
+  // every tightening, including a sample rate that sheds everything else.
+  it("keeps a capture gap through a shed session", () => {
+    const gap: BugEvent = {
+      t: 1,
+      k: CAPTURE_GAP_EVENT_KIND,
+      d: { reason: "policy_tightened", droppedEventCount: 2 },
+    };
+    expect(apply(gap, {}, { heldMasking: LOOSE, samplingShed: true })).toBe(
+      gap,
+    );
+    expect(
+      apply(
+        { t: 1, k: "clk", d: {} },
+        {},
+        { heldMasking: LOOSE, samplingShed: true },
+      ),
+    ).toBeUndefined();
   });
 });

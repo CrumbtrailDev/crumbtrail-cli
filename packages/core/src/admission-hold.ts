@@ -107,7 +107,15 @@ function maxBodyLengthFor(kind: string, config: CrumbtrailConfig): number {
   return config.networkMaxBodySize;
 }
 
-/** The masking switches, as they stood when an event was held. Tighten-only. */
+/**
+ * The masking switches, as they stood when an event was held. Tighten-only.
+ *
+ * `CrumbtrailConfig` types both as the literal `true`, so a TypeScript host
+ * cannot turn either off and this pair is constant for it. A JavaScript host
+ * can — the CLI writes an init block into plain JS applications — and for that
+ * host a policy carrying `masking.mode: "all"` is a real tightening arriving
+ * after the first screen was captured unmasked.
+ */
 export interface MaskingState {
   maskAllText: boolean;
   maskAllInputs: boolean;

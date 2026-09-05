@@ -101,22 +101,24 @@ up recorded as responses with no calls behind them.
 Release re-asks the policy questions against the events it held, because they
 were built under the local config:
 
-| The response says                     | What happens to a held event                                     |
-| ------------------------------------- | ---------------------------------------------------------------- |
-| `collectors.<name>: false`            | Events of that collector are dropped.                            |
-| `network.excludeUrls`                 | A held request for a matching URL is dropped.                    |
-| `network.captureHeaders: false`       | `d.hdrs` is removed.                                             |
-| `network.maxBodySize`                 | Bodies over the new cap become a `payload_too_large` summary.    |
-| `redaction.denyFields`                | Bodies are re-redacted under the added names.                    |
-| `redaction.mode`                      | Bodies are re-redacted under the named mode.                     |
-| `redaction.captureInputValues: false` | A held input value becomes a placeholder.                        |
-| `masking.*` tightened                 | Held `snap`, `key` and `clip` events are dropped, not re-masked. |
-| `sampling.captureSampleRate` sheds    | The whole hold is discarded.                                     |
-| `killSwitch: true`                    | The whole hold is discarded.                                     |
+| The response says                     | What happens to a held event                                                                                                                    |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `collectors.<name>: false`            | Events of that collector are dropped.                                                                                                           |
+| `network.excludeUrls`                 | A held request for a matching URL is dropped. Matched against the URL the application asked for, not the redacted copy on the event.            |
+| `network.captureHeaders: false`       | `d.hdrs` is removed.                                                                                                                            |
+| `network.maxBodySize`                 | Bodies over the new cap become a `payload_too_large` summary. WebSocket frames and worker messages keep their own smaller ceilings.             |
+| `redaction.denyFields`                | Bodies are re-redacted under the added names, and the parsed response view in `d.bodyMeta` is rebuilt from the result.                          |
+| `redaction.mode`                      | Bodies are re-redacted under the named mode.                                                                                                    |
+| `redaction.captureInputValues: false` | A held input value becomes a placeholder.                                                                                                       |
+| `masking.*` tightened                 | Held `dom.snap`, `clk`, `inp`, `key` and `clip` events are dropped, not re-masked. They carry text rendered from a DOM that is gone by release. |
+| `sampling.captureSampleRate` sheds    | The whole hold is discarded.                                                                                                                    |
+| `killSwitch: true`                    | The whole hold is discarded.                                                                                                                    |
 
-Every drop is counted in one `capture_gap` with reason `buffer_overflow`, so a
-session says what release cost it. The hold itself is capped at 2,000 events and
-drops the oldest first.
+Drops are counted in a `capture_gap`, so a session says what release cost it.
+Events the policy dropped are reported under reason `policy_tightened`, and
+events the hold discarded to stay under its own 2,000 event cap under
+`buffer_overflow`. They mean opposite things: one says the policy worked, the
+other says the hold was too small for the page. The cap drops the oldest first.
 
 Global Privacy Control ends the wait rather than extending it: under the default
 `consentMode: "implicit"` a GPC visitor's hold is discarded on the first poll,

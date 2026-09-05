@@ -1286,9 +1286,12 @@ function wrapXHR(
 
     attachRedactionMetadata(reqData, ...reqMetadata);
 
-    bus.emit({ t: meta.startTime, k: "net.req", d: reqData }, {
-      rawUrl: meta.url,
-    });
+    bus.emit(
+      { t: meta.startTime, k: "net.req", d: reqData },
+      {
+        rawUrl: meta.url,
+      },
+    );
 
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
@@ -1516,9 +1519,12 @@ function emitEarlyRecord(
     if (record.traceId) errData.traceId = record.traceId;
     if (record.spanId) errData.spanId = record.spanId;
     attachRedactionMetadata(errData, urlResult.metadata);
-    bus.emit({ t: settledAt, k: "net.err", d: errData }, {
-      rawUrl: record.url,
-    });
+    bus.emit(
+      { t: settledAt, k: "net.err", d: errData },
+      {
+        rawUrl: record.url,
+      },
+    );
     return;
   }
 

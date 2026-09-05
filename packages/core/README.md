@@ -628,19 +628,29 @@ Events captured before the policy answers are held in memory and released once
 it does, in the order they happened and with their original timestamps, so the
 requests that render the first screen keep both halves of the pair rather than
 arriving as a response with no request behind it. The hold is bounded at 2,000
-events, drops the oldest first, and records a `buffer_overflow` gap counting
-whatever it dropped.
+events and drops the oldest first, recording a `buffer_overflow` gap counting
+what the cap cost. Events the arriving policy drops are counted separately,
+under a `policy_tightened` gap, because the two say opposite things about a
+deployment: one says the hold was too small for the page, the other says the
+policy did its job.
 
 Release is not a replay of what was captured, it is a re-ask under the policy
 that just arrived. A held event is dropped when its collector is now off, when
 its URL now matches `excludeUrls`, or when the session was shed by the sample
 rate the policy carried; its headers are dropped when the policy turns header
 capture off; its bodies are re-redacted under the policy's `denyFields`,
-redaction mode and body size cap; an input value becomes a placeholder when the
-policy sets `captureInputValues: false`; and a DOM snapshot, keystroke or
+redaction mode and size caps, along with the parsed copy of a response body in
+`d.bodyMeta`, which would otherwise carry the cleartext the deny rule was aimed
+at; an input value becomes a placeholder when the policy sets
+`captureInputValues: false`; and a DOM snapshot, click, input, keystroke or
 clipboard event is dropped outright when the policy tightened masking, because
-the content it holds was already rendered under the looser rule. A held event
-can lose detail or lose itself on release. It can never gain reach.
+the content it holds was rendered under the looser rule from a DOM that is gone
+by release. Two details in that list are easy to get backwards and are not:
+`excludeUrls` matches the URL the application asked for, held beside the event
+rather than on it, since every query value is redacted before an event is built;
+and a WebSocket frame or worker message is re-capped at its own ceiling rather
+than at the network body limit. A held event can lose detail or lose itself on
+release. It can never gain reach.
 
 A decision against capture empties the hold without sending anything:
 `stop()`, a `killSwitch`, `consent(false)`, a page hide that ends the session,
