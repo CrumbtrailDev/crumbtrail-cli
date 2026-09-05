@@ -230,7 +230,12 @@ function capSummaryValue(
  * shared body-redaction pipeline; it is parsed (never the raw text) and capped.
  * Returns undefined when nothing is known about the body at all.
  */
-function buildResponseBodyMeta(input: {
+/**
+ * Exported because the admission hold rebuilds `d.bodyMeta` at release time: it
+ * is a parsed copy of the response body, so a policy that re-redacts the body
+ * has to re-derive it or the cleartext survives in the parsed view.
+ */
+export function buildResponseBodyMeta(input: {
   contentType: string;
   contentLength?: string | null;
   text?: string;
@@ -695,7 +700,7 @@ function wrapFetch(
 
     attachRedactionMetadata(reqData, ...reqMetadata);
 
-    bus.emit({ t: startTime, k: "net.req", d: reqData });
+    bus.emit({ t: startTime, k: "net.req", d: reqData }, { rawUrl: url });
 
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
@@ -755,7 +760,7 @@ function wrapFetch(
       if (fetchArgs.traceId) errData.traceId = fetchArgs.traceId;
       if (fetchArgs.spanId) errData.spanId = fetchArgs.spanId;
       attachRedactionMetadata(errData, urlResult.metadata);
-      bus.emit({ t: now(), k: "net.err", d: errData });
+      bus.emit({ t: now(), k: "net.err", d: errData }, { rawUrl: url });
     }
 
     const dur = now() - startTime;
@@ -870,7 +875,7 @@ function wrapFetch(
 
     attachRedactionMetadata(resData, ...resMetadata);
 
-    bus.emit({ t: responseTime, k: "net.res", d: resData });
+    bus.emit({ t: responseTime, k: "net.res", d: resData }, { rawUrl: url });
 
     return response;
   };
@@ -1281,7 +1286,9 @@ function wrapXHR(
 
     attachRedactionMetadata(reqData, ...reqMetadata);
 
-    bus.emit({ t: meta.startTime, k: "net.req", d: reqData });
+    bus.emit({ t: meta.startTime, k: "net.req", d: reqData }, {
+      rawUrl: meta.url,
+    });
 
     // Fire-and-forget: describing and sniffing an upload never delays
     // dispatching the request it rides on. See `emitFilePartEvents`.
@@ -1385,7 +1392,7 @@ function wrapXHR(
 
       attachRedactionMetadata(resData, ...resMetadata);
 
-      bus.emit({ t: now(), k: "net.res", d: resData });
+      bus.emit({ t: now(), k: "net.res", d: resData }, { rawUrl: meta.url });
     };
 
     // error/timeout/abort settle the XHR without an HTTP response (status 0),
@@ -1405,7 +1412,7 @@ function wrapXHR(
       if (meta.traceId) errData.traceId = meta.traceId;
       if (meta.spanId) errData.spanId = meta.spanId;
       attachRedactionMetadata(errData, urlResult.metadata);
-      bus.emit({ t: now(), k: "net.err", d: errData });
+      bus.emit({ t: now(), k: "net.err", d: errData }, { rawUrl: meta.url });
     };
 
     this.addEventListener("load", emitResponse);
@@ -1490,7 +1497,7 @@ function emitEarlyRecord(
   }
 
   attachRedactionMetadata(reqData, ...reqMetadata);
-  bus.emit({ t: record.t, k: "net.req", d: reqData });
+  bus.emit({ t: record.t, k: "net.req", d: reqData }, { rawUrl: record.url });
 
   const settledAt = record.t + record.dur;
 
@@ -1509,7 +1516,9 @@ function emitEarlyRecord(
     if (record.traceId) errData.traceId = record.traceId;
     if (record.spanId) errData.spanId = record.spanId;
     attachRedactionMetadata(errData, urlResult.metadata);
-    bus.emit({ t: settledAt, k: "net.err", d: errData });
+    bus.emit({ t: settledAt, k: "net.err", d: errData }, {
+      rawUrl: record.url,
+    });
     return;
   }
 
@@ -1549,7 +1558,7 @@ function emitEarlyRecord(
   }
 
   attachRedactionMetadata(resData, ...resMetadata);
-  bus.emit({ t: settledAt, k: "net.res", d: resData });
+  bus.emit({ t: settledAt, k: "net.res", d: resData }, { rawUrl: record.url });
 }
 
 function isEarlyResourceError(record: EarlyRequestRecord): boolean {

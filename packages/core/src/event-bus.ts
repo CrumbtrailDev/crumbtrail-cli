@@ -1,5 +1,22 @@
 import type { BugEvent } from "./types";
 
+/**
+ * What the emitter knows that the built event no longer carries.
+ *
+ * Only the raw URL so far. `d.url` has already been through `redactUrl` by the
+ * time an event reaches the bus, so an admission rule written against a value
+ * that redaction replaced cannot match the event's own copy. The context is
+ * read by the admission predicate and never stored on the event, so nothing
+ * downstream — tap, buffer, transport, ring buffer — ever sees it.
+ */
+export interface EmitContext {
+  rawUrl?: string;
+}
+
+export interface EmitOptions extends EmitContext {
+  bypassAdmission?: boolean;
+}
+
 /** Matches the ring buffer's default ceiling; `Crumbtrail.init()` sets the real one. */
 const DEFAULT_MAX_BUFFERED_EVENTS = 50_000;
 
@@ -10,7 +27,10 @@ export class EventBus {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private paused = false;
   private flushBufferSize = 100;
-  private admissionPredicate: (event: BugEvent) => boolean = () => true;
+  private admissionPredicate: (
+    event: BugEvent,
+    context?: EmitContext,
+  ) => boolean = () => true;
   /**
    * Ceiling on events waiting for a flush. It only ever bites while the host
    * holds `pause()` — nothing flushes then, not the size trigger and not the
@@ -19,10 +39,10 @@ export class EventBus {
   private maxBufferedEvents = DEFAULT_MAX_BUFFERED_EVENTS;
   private droppedFromBuffer = 0;
 
-  emit(event: BugEvent, options?: { bypassAdmission?: boolean }): boolean {
+  emit(event: BugEvent, options?: EmitOptions): boolean {
     if (!options?.bypassAdmission) {
       try {
-        if (!this.admissionPredicate(event)) return false;
+        if (!this.admissionPredicate(event, options)) return false;
       } catch {
         return false;
       }
@@ -73,7 +93,9 @@ export class EventBus {
    * Controls admission before taps, batches, subscribers, and the ring buffer see an event.
    * Privacy and capture policy use this boundary so denied events never rest locally.
    */
-  setAdmissionPredicate(predicate: (event: BugEvent) => boolean): void {
+  setAdmissionPredicate(
+    predicate: (event: BugEvent, context?: EmitContext) => boolean,
+  ): void {
     this.admissionPredicate = predicate;
   }
 

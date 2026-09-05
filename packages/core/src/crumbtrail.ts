@@ -1,4 +1,4 @@
-import { EventBus } from "./event-bus";
+import { EventBus, type EmitContext } from "./event-bus";
 import { RingBuffer } from "./ring-buffer";
 import type {
   AddBugEventOptions,
@@ -105,8 +105,10 @@ import {
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
 import {
+  COLLECTOR_EVENT_KINDS,
   readMaskingState,
   reapplyPolicyToHeldEvent,
+  type HeldEvent,
   type MaskingState,
 } from "./admission-hold";
 import {
@@ -366,6 +368,19 @@ const REMOTE_COLLECTOR_KEYS = [
 ] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
 
 type RemoteCollectorKey = (typeof REMOTE_COLLECTOR_KEYS)[number];
+
+/**
+ * Every switch the policy can flip has to mean something when the admission
+ * hold releases events under it, or turning that collector off leaves its held
+ * events to ship anyway. This assignment is the only thing that catches a new
+ * switch added here and not there: it fails to compile until
+ * `COLLECTOR_EVENT_KINDS` covers the key.
+ */
+const _collectorKindsCoverEverySwitch: Record<
+  RemoteCollectorKey,
+  readonly string[]
+> = COLLECTOR_EVENT_KINDS;
+void _collectorKindsCoverEverySwitch;
 
 /**
  * Collectors a switch can stop mid-session but cannot start again.
@@ -628,8 +643,8 @@ export class Crumbtrail {
    * switch, `consent(false)`, Global Privacy Control) drops the events without
    * ever transporting them, which is the same outcome refusing them had.
    */
-  private pendingAdmissionEvents: BugEvent[] = [];
-  /** Events the hold discarded, by its cap or by the policy, as one `capture_gap`. */
+  private pendingAdmissionEvents: HeldEvent[] = [];
+  /** Events the hold discarded to stay under its cap, as one `capture_gap`. */
   private pendingAdmissionDropped = 0;
   /**
    * The masking switches in force when the hold started. A policy that tightens
@@ -947,7 +962,9 @@ export class Crumbtrail {
     bus.setMaxBufferedEvents(config.ringBufferMaxEvents);
     bus.start(config.flushIntervalMs, config.flushBufferSize);
 
-    bus.setAdmissionPredicate((event) => instance.shouldAdmitEvent(event));
+    bus.setAdmissionPredicate((event, context) =>
+      instance.shouldAdmitEvent(event, context),
+    );
 
     // Severity flush: error-class events must not wait out the batch interval —
     // an error captured in the final seconds before tab close would otherwise
@@ -2437,9 +2454,9 @@ export class Crumbtrail {
     return this.sessionMetadataWrite;
   }
 
-  private shouldAdmitEvent(event: BugEvent): boolean {
+  private shouldAdmitEvent(event: BugEvent, context?: EmitContext): boolean {
     if (!this.canTransport()) {
-      if (this.isAdmissionUndecided()) this.holdForAdmission(event);
+      if (this.isAdmissionUndecided()) this.holdForAdmission(event, context);
       return false;
     }
     if (this.isFlightRecorderTerminal()) return false;
@@ -2663,7 +2680,7 @@ export class Crumbtrail {
   }
 
   /** Parks one event until {@link settleAdmissionWaiters} decides its fate. */
-  private holdForAdmission(event: BugEvent): void {
+  private holdForAdmission(event: BugEvent, context?: EmitContext): void {
     // A shed session records nothing but the gap that says it was shed, so
     // there is nothing here worth holding for it.
     if (this.samplingShed && event.k !== CAPTURE_GAP_EVENT_KIND) return;
@@ -2671,7 +2688,14 @@ export class Crumbtrail {
     // hold it came out of.
     if (this.releasingAdmissionHold) return;
     this.pendingAdmissionMasking ??= readMaskingState(this.config);
-    this.pendingAdmissionEvents.push(event);
+    // The raw URL rides on the hold entry, never on the event: it exists so the
+    // release pass can match `excludeUrls` against what the application asked
+    // for rather than against the redacted copy, and it is dropped with the
+    // entry.
+    this.pendingAdmissionEvents.push({
+      event,
+      ...(context?.rawUrl !== undefined ? { rawUrl: context.rawUrl } : {}),
+    });
     const overflow =
       this.pendingAdmissionEvents.length - MAX_PENDING_ADMISSION_EVENTS;
     if (overflow > 0) {
@@ -2684,12 +2708,15 @@ export class Crumbtrail {
 
   /**
    * Empties the hold. Admitted events are re-emitted in the order they were
-   * captured, with their original timestamps, so a request and its response sit
-   * where they happened rather than where the policy landed.
+   * held, which is the order they were captured in among themselves, with their
+   * original timestamps, so a request and its response sit where they happened
+   * rather than where the policy landed. It says nothing about where they sit
+   * relative to events captured after the gate opened, which are already out.
    */
   private releasePendingAdmissionEvents(admitted: boolean): void {
     const held = this.pendingAdmissionEvents;
-    let dropped = this.pendingAdmissionDropped;
+    let overflowDropped = this.pendingAdmissionDropped;
+    let policyDropped = 0;
     const heldMasking =
       this.pendingAdmissionMasking ?? readMaskingState(this.config);
     this.pendingAdmissionEvents = [];
@@ -2704,27 +2731,41 @@ export class Crumbtrail {
     // gates a released one.
     this.releasingAdmissionHold = true;
     try {
-      for (const event of held) {
-        const allowed = reapplyPolicyToHeldEvent(event, this.config, {
+      for (const entry of held) {
+        const allowed = reapplyPolicyToHeldEvent(entry.event, this.config, {
           heldMasking,
           samplingShed: this.samplingShed,
+          ...(entry.rawUrl !== undefined ? { rawUrl: entry.rawUrl } : {}),
         });
         if (!allowed) {
-          dropped += 1;
+          policyDropped += 1;
           continue;
         }
-        if (!this.bus.emit(allowed)) dropped += 1;
+        if (!this.bus.emit(allowed)) policyDropped += 1;
       }
     } finally {
       this.releasingAdmissionHold = false;
     }
 
-    if (dropped > 0) {
+    // Two reasons, two records. They mean opposite things about a deployment:
+    // the cap firing says the hold was too small for the page, the policy pass
+    // dropping events says the policy did its job.
+    if (overflowDropped > 0) {
       this.bus.emit(
         buildCaptureGapEvent({
           surface: "browser",
           reason: "buffer_overflow",
-          droppedEventCount: dropped,
+          droppedEventCount: overflowDropped,
+          sessionId: this.sessionId,
+        }),
+      );
+    }
+    if (policyDropped > 0) {
+      this.bus.emit(
+        buildCaptureGapEvent({
+          surface: "browser",
+          reason: "policy_tightened",
+          droppedEventCount: policyDropped,
           sessionId: this.sessionId,
         }),
       );

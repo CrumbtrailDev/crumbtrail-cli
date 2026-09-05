@@ -379,6 +379,7 @@ describe("a policy that tightens while events are held", () => {
       url?: string;
       body?: string;
       init?: Record<string, unknown>;
+      appResponse?: () => Response;
     } = {},
   ): Promise<BugEvent[]> {
     let answerConfig: (() => void) | undefined;
@@ -387,7 +388,7 @@ describe("a policy that tightens while events are held", () => {
     });
     const fetchStub = vi.fn().mockImplementation((input: unknown) => {
       if (String(input).includes("/api/capture-config")) return configAnswer;
-      return Promise.resolve(appResponse());
+      return Promise.resolve((options.appResponse ?? appResponse)());
     });
     globalThis.fetch = fetchStub as unknown as typeof globalThis.fetch;
 
@@ -424,12 +425,68 @@ describe("a policy that tightens while events are held", () => {
     expect(
       events.filter((event) => String(event.d?.url).includes("/api/kyc")),
     ).toHaveLength(0);
-    // The loss is declared rather than silent.
+    // The loss is declared rather than silent, and under the reason that says
+    // the policy dropped it rather than the reason that says a buffer filled.
     expect(
       events
         .filter((event) => event.k === CAPTURE_GAP_EVENT_KIND)
         .map((event) => event.d?.reason),
-    ).toContain("buffer_overflow");
+    ).toContain("policy_tightened");
+  });
+
+  // Every query value is redacted before an event is built, so an exclusion
+  // pattern written against one can only match the URL the application asked
+  // for. That copy lives on the hold entry and nowhere else.
+  it("matches an exclusion against the raw URL, not the redacted one", async () => {
+    const events = await holdThenApply(
+      { killSwitch: false, network: { excludeUrls: ["plan=gold"] } },
+      { url: "/api/kyc?plan=gold" },
+    );
+    expect(
+      events.filter((event) => event.k === "net.req" || event.k === "net.res"),
+    ).toHaveLength(0);
+    // And the raw URL was not smuggled onto the released events to get there.
+    expect(JSON.stringify(events)).not.toContain("plan=gold");
+  });
+
+  // `bodyMeta.data` is a parsed copy of the response body. Re-redacting `d.body`
+  // and leaving it alone ships the cleartext through the parsed view, which is
+  // the field the deny rule was aimed at.
+  it("rebuilds the parsed response view after re-redacting the body", async () => {
+    const secretResponse = () =>
+      new Response(JSON.stringify({ coupon: "SAVE50", ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const before = await holdThenApply(
+      { killSwitch: false },
+      { appResponse: secretResponse },
+    );
+    const held = before.find((event) => event.k === "net.res");
+    // Guard: without the deny rule the parsed view really does carry the field,
+    // so the assertion below is testing the pass and not an empty object.
+    expect(
+      (held?.d?.bodyMeta as { data?: Record<string, unknown> } | undefined)
+        ?.data,
+    ).toMatchObject({ coupon: "SAVE50" });
+
+    const events = await holdThenApply(
+      { killSwitch: false, redaction: { denyFields: ["coupon"] } },
+      { appResponse: secretResponse },
+    );
+    const response = events.find((event) => event.k === "net.res");
+    expect(response).toBeDefined();
+    expect(JSON.stringify(response)).not.toContain("SAVE50");
+    // The size facts survive; the parsed view agrees with the redacted body.
+    const meta = response?.d?.bodyMeta as
+      | { ct?: string; data?: Record<string, unknown> }
+      | undefined;
+    expect(meta?.ct).toBe("json");
+    // Rebuilt rather than deleted: the parsed view still exists and now shows
+    // the placeholder, so a reader can see the field was there and was removed.
+    expect(meta?.data).toMatchObject({ ok: true });
+    expect(JSON.stringify(meta?.data)).toContain("[REDACTED]");
+    expect(JSON.stringify(meta?.data)).not.toContain("SAVE50");
   });
 
   it("drops held events of a collector the policy turned off", async () => {

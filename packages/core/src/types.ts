@@ -372,6 +372,14 @@ export interface CaptureGapEventData {
     /** Events were dropped from the pending batch because the bus buffer hit its cap. */
     | "buffer_overflow"
     /**
+     * Events captured before the remote capture policy arrived were dropped by
+     * that policy on release rather than by any cap: a collector it turned off,
+     * a URL it excluded, or content built under masking it tightened. It is a
+     * separate reason from `buffer_overflow` because it means the opposite
+     * thing about the deployment — the policy worked, nothing overflowed.
+     */
+    | "policy_tightened"
+    /**
      * A capture policy lowered the ring buffer's retention mid-session and the
      * shrink evicted events that were already held. The window a later report
      * is cut from is shorter than the session that led to it, and this is what
