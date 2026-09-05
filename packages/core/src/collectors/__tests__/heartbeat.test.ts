@@ -44,11 +44,17 @@ describe("heartbeatCollector", () => {
   });
 
   it("stops emitting after cleanup", () => {
-    cleanup();
+    // Fire once first so cleanup runs against the recursively re-armed timer
+    // set up by fire() at heartbeat.ts:56, not just the original setTimeout.
     vi.advanceTimersByTime(30_000);
     bus.flush();
+    expect(events).toHaveLength(1);
 
-    expect(events).toHaveLength(0);
+    cleanup();
+    vi.advanceTimersByTime(120_000);
+    bus.flush();
+
+    expect(events).toHaveLength(1);
     // reassign so afterEach cleanup doesn't error on double-call
     cleanup = () => {};
   });
@@ -87,6 +93,27 @@ describe("heartbeatCollector", () => {
     bus.flush();
 
     expect(heartbeats()[3].d.intervalMs).toBe(30_000);
+  });
+
+  it("does not re-arm when a tap stops the collector synchronously during emit", () => {
+    // bus.tap handlers run synchronously inside bus.emit. If one of them
+    // calls cleanup() on seeing the hb event, fire() must not re-arm a
+    // timer after emit returns (heartbeat.ts:49-56).
+    const stopOnHeartbeat = bus.tap((event) => {
+      if (event.k === "hb") cleanup();
+    });
+
+    vi.advanceTimersByTime(30_000);
+    bus.flush();
+    expect(events).toHaveLength(1);
+
+    vi.advanceTimersByTime(120_000);
+    bus.flush();
+
+    expect(events).toHaveLength(1);
+    stopOnHeartbeat();
+    // reassign so afterEach cleanup doesn't error on double-call
+    cleanup = () => {};
   });
 
   it("does not count its own heartbeats as activity", () => {

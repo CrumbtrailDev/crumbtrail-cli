@@ -26,6 +26,7 @@ export function heartbeatCollector(
   let interval = BASE_INTERVAL_MS;
   let sawActivity = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
 
   // Any admitted event other than the heartbeat's own counts as the session
   // being alive; the heartbeat's own emit below must not count as its own
@@ -35,6 +36,10 @@ export function heartbeatCollector(
   });
 
   function fire(): void {
+    // intervalMs is the cadence that produced this heartbeat. No cloud path
+    // reads it today (ingest-routes.ts and evidence-index.ts in the main
+    // product only check the `hb` event kind); it is emitted for a future
+    // reader that wants to tell "quiet but alive" from "gone".
     const d: Record<string, unknown> = { intervalMs: interval };
 
     const heap = (performance as any).memory?.usedJSHeapSize;
@@ -48,6 +53,12 @@ export function heartbeatCollector(
 
     bus.emit({ t: now(), k: "hb", d });
 
+    // bus.emit runs its subscribers synchronously, and one of them may call
+    // this collector's own cleanup (e.g. a tap that stops the logger on the
+    // event it just saw). Re-arming below would otherwise leave one more
+    // heartbeat scheduled past teardown.
+    if (stopped) return;
+
     interval = sawActivity
       ? BASE_INTERVAL_MS
       : Math.min(interval * 2, MAX_INTERVAL_MS);
@@ -59,6 +70,7 @@ export function heartbeatCollector(
   timer = setTimeout(fire, interval);
 
   return () => {
+    stopped = true;
     if (timer !== null) clearTimeout(timer);
     untap();
   };

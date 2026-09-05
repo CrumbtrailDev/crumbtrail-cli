@@ -219,11 +219,15 @@ describe("the window between init() and the first capture policy", () => {
   });
 
   // Same first-screen loss, but through the config an installed app actually
-  // ships: `PRESET_PASSIVE` merged with `remoteConfig: true`, not a hand
-  // built QUIET config that disables every other collector. Matches the
-  // plan's A2 proof (docs/progress/incentiveflow-dogfood-fix-plan.md) that
-  // four `net.req`/`net.res` pairs, ids 1 to 4, survive the admission window
-  // under the preset IncentiveFlow and every other passive-mode app use.
+  // ships: `PRESET_PASSIVE` merged with `remoteConfig: true`. Unlike `QUIET`
+  // above, `PRESET_PASSIVE` only sets two auto flag booleans and leaves
+  // every other collector on, so this is the harder admission case: console,
+  // interaction, and every other collector are live and competing for the
+  // admission window while these four requests need to survive it. Matches
+  // the plan's A2 proof (docs/progress/incentiveflow-dogfood-fix-plan.md)
+  // that four `net.req`/`net.res` pairs, ids 1 to 4, survive the admission
+  // window under the preset IncentiveFlow and every other passive-mode app
+  // use.
   it("records both halves of every first screen request under PRESET_PASSIVE with remoteConfig", async () => {
     let answerConfig: (() => void) | undefined;
     const configAnswer = new Promise<Response>((resolve) => {
