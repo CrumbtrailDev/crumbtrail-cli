@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { NATIVE_PACKAGES } from "../../native-owned";
 import { STACK_IDS, type Stack } from "crumbtrail-core";
 import {
   BACKEND_JS_STACKS,
@@ -251,8 +252,8 @@ describe("install-instructions snippets", () => {
     expect(p).toContain('service: "payments-api"');
   });
 
-  it("agent prompt uses the OTLP path (no SDK) for non-JS backends", () => {
-    const p = buildAgentPrompt("django", keys);
+  it("agent prompt uses the OTLP path (no SDK) for a backend with no published package", () => {
+    const p = buildAgentPrompt("go", keys);
     expect(p).toContain(
       "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
     );
@@ -272,7 +273,7 @@ describe("install-instructions snippets", () => {
 
   // Every OTLP stack, not just django: the native path once returned early for
   // all six and made the whole block above unreachable for each of them.
-  it("keeps the OTLP prompt for every stack with no published native package", () => {
+  it("keeps the OTLP prompt reachable for every stack with no published package", () => {
     for (const stack of [
       "django",
       "flask",
@@ -285,6 +286,11 @@ describe("install-instructions snippets", () => {
       if (stack === "dotnet") {
         // dotnet has its own maintained package and answers before the OTLP path.
         expect(p).toContain("maintained ASP.NET Core package");
+        continue;
+      }
+      if (NATIVE_PACKAGES[stack]?.published) {
+        // A published package answers before the OTLP path, and names itself.
+        expect(p).toContain(NATIVE_PACKAGES[stack]!.package);
         continue;
       }
       expect(p).toContain(

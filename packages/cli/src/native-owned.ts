@@ -6,11 +6,11 @@ import type { Stack } from "crumbtrail-core";
  * `published` is the gate, and it is the whole reason this module is not a plain
  * lookup table. The setup wizard's standing invariant, stated in the root
  * README's "Other registries" section, is that it will not wire an app against a
- * package it cannot resolve. None of these artifacts exist on PyPI, RubyGems or
- * the Go module proxy yet: their source lives on unmerged branches, so a guide
- * that told a reader to install one would send them to a 404 and leave the app
- * with no capture at all. Until then every one of these stacks falls back to the
- * OTLP guidance, which works today.
+ * package it cannot resolve. `crumbtrail-python` is on PyPI and the `crumbtrail`
+ * gem is on RubyGems, so the Python and Ruby stacks now carry native guidance.
+ * The Go module has no tagged version, so `go get` resolves it only at a commit
+ * pseudo-version; it stays gated and falls back to the OTLP guidance, which
+ * works today.
  *
  * Flip an entry to `true` in the same change that publishes its artifact, and
  * check the registration lines against the package source at the same time.
@@ -30,7 +30,7 @@ export const NATIVE_PACKAGES: Partial<Record<Stack, NativePackage>> = {
   django: {
     package: "crumbtrail-python 0.1.0",
     docs: "python",
-    published: false,
+    published: true,
     registration: [
       "Create crumbtrail.Client(service=..., should_capture=...) after each worker forks.",
       "In wsgi.py use crumbtrail.django.wrap_wsgi(get_wsgi_application(), client).",
@@ -41,7 +41,7 @@ export const NATIVE_PACKAGES: Partial<Record<Stack, NativePackage>> = {
   flask: {
     package: "crumbtrail-python 0.1.0",
     docs: "python",
-    published: false,
+    published: true,
     registration: [
       "Create crumbtrail.Client(service=..., should_capture=...) after each worker forks.",
       "Register crumbtrail.flask.install(app, client) before serving requests.",
@@ -52,7 +52,7 @@ export const NATIVE_PACKAGES: Partial<Record<Stack, NativePackage>> = {
   fastapi: {
     package: "crumbtrail-python 0.1.0",
     docs: "python",
-    published: false,
+    published: true,
     registration: [
       "Create crumbtrail.Client(service=..., should_capture=...) after each worker forks.",
       "Register app.add_middleware(crumbtrail.ASGIMiddleware, client=client).",
@@ -63,7 +63,7 @@ export const NATIVE_PACKAGES: Partial<Record<Stack, NativePackage>> = {
   rails: {
     package: "crumbtrail gem 0.1.0",
     docs: "ruby",
-    published: false,
+    published: true,
     registration: [
       "Read the package README and insert Crumbtrail::Middleware into the Rack middleware stack with its sink, service and route arguments.",
       "Call Crumbtrail::ActiveRecord.install(engine:) once with the database engine name.",

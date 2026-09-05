@@ -31,9 +31,9 @@ each is a real SDK with platform peer dependencies behind it.
 ### Other registries
 
 The native SDKs are not npm packages and cannot be subpaths of one. Each has a
-single home on its own platform's registry. Three of them are built and tested
-here but not released yet, so the status column is the one to read first: the
-setup wizard will not wire an app against a package it cannot resolve.
+single home on its own platform's registry. Some are built and tested here but
+not released yet, so the status column is the one to read first: the setup
+wizard will not wire an app against a package it cannot resolve.
 
 | SDK                                                   | Registry                                                                                   | Status                |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
@@ -43,6 +43,9 @@ setup wizard will not wire an app against a package it cannot resolve.
 | [`crumbtrail_flutter`](packages/flutter)              | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet     |
 | [`crumbtrail_flutter_http`](packages/flutter-http)    | pub.dev. `package:http` capture for Flutter. Optional, so an app never resolves a client it does not use. | Not published yet     |
 | [`crumbtrail_flutter_dio`](packages/flutter-dio)      | pub.dev. Dio capture for Flutter. Optional, so an app never resolves a client it does not use. | Not published yet     |
+| [`crumbtrail-python`](packages/python)                | PyPI. Maintained WSGI, ASGI and SQLAlchemy capture for Python services.                    | Published             |
+| [`crumbtrail`](packages/ruby)                         | RubyGems. Maintained Rack and ActiveRecord capture for Ruby services.                      | Published             |
+| [`crumbtrail-cli/packages/go`](packages/go)           | Go module proxy. Maintained net/http and database/sql capture. No tagged version yet, so `go get` resolves it at a commit. | Untagged              |
 
 ## Quick start
 
