@@ -226,9 +226,14 @@ func TestSenderTLSRetryAndClose(t *testing.T) {
 		}
 		if n == 1 {
 			w.WriteHeader(404)
-		} else {
-			w.WriteHeader(200)
+			return
 		}
+		// The 404 is permanent, so the second request is the gap that declares the loss, not a
+		// repeat of a batch the cloud has already said it will never accept.
+		if len(batch.Events) != 1 || batch.Events[0].K != "capture_gap" || batch.Events[0].D["detail"] != "HTTP 404" {
+			t.Errorf("second request is %v, want the capture gap", batch.Events)
+		}
+		w.WriteHeader(200)
 	}))
 	defer server.Close()
 	sender, err := NewSender(SenderConfig{Endpoint: server.URL, Key: "test-key", HTTPClient: server.Client()})
@@ -415,6 +420,59 @@ func TestOnlyMatchedRouteTemplateCaptured(t *testing.T) {
 	Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), r)
 	if find(t, sink, "backend.req.start")["url"] != "/" {
 		t.Fatal("unmatched raw path recorded")
+	}
+}
+
+// r.Pattern is set only by net/http.ServeMux on Go 1.22+. Every other router leaves it empty,
+// so without the callback a chi or gorilla application reports "/" for every request and loses
+// the grouping the route template exists to provide.
+func TestRouteCallbackNamesTemplateWithoutServeMux(t *testing.T) {
+	sink := &memorySink{}
+	options := Options{Sink: sink, Service: "test", ShouldCapture: captureAll,
+		Route: func(*http.Request) string { return "/api/users/{email}" }}
+	r := request("")
+	r.URL.Path = "/api/users/private@example.com"
+	Middleware(options)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), r)
+	if r.Pattern != "" {
+		t.Fatal("this test only means something while Pattern is empty")
+	}
+	if find(t, sink, "backend.req.start")["route"] != "/api/users/{email}" {
+		t.Fatal("the route callback was ignored")
+	}
+	encoded, _ := json.Marshal(sink.events())
+	if strings.Contains(string(encoded), "private@example.com") {
+		t.Fatal("raw path leaked")
+	}
+	// A callback that returns junk, panics, or names a raw path must not put it on the wire.
+	for _, callback := range []func(*http.Request) string{
+		func(*http.Request) string { return "/api/users/private@example.com" },
+		func(*http.Request) string { panic("router blew up") },
+		func(*http.Request) string { return "" },
+	} {
+		sink = &memorySink{}
+		options.Sink, options.Route = sink, callback
+		Middleware(options)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), request(""))
+		if find(t, sink, "backend.req.start")["route"] != "/" {
+			t.Fatalf("callback result reached the wire: %v", find(t, sink, "backend.req.start")["route"])
+		}
+	}
+}
+
+// A full sender queue refuses. The gap batch is accepted so the hole can still be declared.
+type refusingSink struct{ memorySink }
+
+func (s *refusingSink) Enqueue(b Batch) bool {
+	s.memorySink.Enqueue(b)
+	return len(b.Events) == 1 && b.Events[0].K == "capture_gap"
+}
+
+func TestRefusedSinkDeclaresTheHole(t *testing.T) {
+	sink := &refusingSink{}
+	Middleware(Options{Sink: sink, Service: "test", ShouldCapture: captureAll})(
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), request(""))
+	gap := find(t, &sink.memorySink, "capture_gap")
+	if gap["reason"] != "buffer_overflow" || gap["surface"] != "queue" || gap["droppedEventCount"] != 2 {
+		t.Fatalf("gap %v", gap)
 	}
 }
 
