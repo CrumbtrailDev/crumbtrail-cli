@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>Crumbtrail.AspNetCore</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Description>Bounded, correlated ASP.NET Core request evidence for Crumbtrail.</Description>
     <Authors>Crumbtrail</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
