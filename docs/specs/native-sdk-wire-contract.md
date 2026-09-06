@@ -24,17 +24,17 @@ cannot be joined. Fixtures turn that silent drift into a failing test.
 All requests are `POST`. `{endpoint}` is the configured base URL with trailing
 slashes stripped.
 
-| Path | Body | When |
-| --- | --- | --- |
-| `/api/session/start` | `{ sessionId, metadata }` | Once, when the session opens |
-| `/api/events` | `{ sessionId, events }` | Per batch |
-| `/api/session/end` | `{ sessionId }` | Once, when the session closes |
+| Path                 | Body                      | When                          |
+| -------------------- | ------------------------- | ----------------------------- |
+| `/api/session/start` | `{ sessionId, metadata }` | Once, when the session opens  |
+| `/api/events`        | `{ sessionId, events }`   | Per batch                     |
+| `/api/session/end`   | `{ sessionId }`           | Once, when the session closes |
 
 Headers on every request:
 
-| Header | Value |
-| --- | --- |
-| `Content-Type` | `application/json` |
+| Header              | Value                                                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------ |
+| `Content-Type`      | `application/json`                                                                               |
 | `X-Crumbtrail-Auth` | The ingest key. Omit the header entirely when no key is configured — never send an empty string. |
 
 The key is an **ingest** key (`ctkey_`). It is write only by design. A native SDK
@@ -88,18 +88,18 @@ the loss instead.
 One event is a JSON object. Field names are short because a session is thousands
 of them.
 
-| Field | Type | Required | Meaning |
-| --- | --- | --- | --- |
-| `t` | integer | yes | Unix timestamp in **milliseconds**. Not seconds. |
-| `k` | string | yes | Event kind (see below) |
-| `d` | object | yes | Kind specific payload. May be empty, never null. |
-| `schemaVersion` | integer | no | Currently `1`. Absent means 1. Native SDKs **must** send it. |
-| `platform` | string | no | `web`, `react-native`, `ios`, `android`, `flutter`, `webview`, `node`, `dotnet`, `ruby`, `go`. Absent means `web`. Native SDKs **must** send it. |
-| `sdk` | object | no | `{ name, version }`. Native SDKs **must** send both. |
-| `capabilities` | string[] | no | Capability names this SDK has active |
-| `target` | object | no | Normalised UI target (see below) |
-| `sessionId` | string | no | Only when an extension workflow session owns the event |
-| `offsetMs` | integer | no | Milliseconds since the session's canonical start |
+| Field           | Type     | Required | Meaning                                                                                                                                          |
+| --------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `t`             | integer  | yes      | Unix timestamp in **milliseconds**. Not seconds.                                                                                                 |
+| `k`             | string   | yes      | Event kind (see below)                                                                                                                           |
+| `d`             | object   | yes      | Kind specific payload. May be empty, never null.                                                                                                 |
+| `schemaVersion` | integer  | no       | Currently `1`. Absent means 1. Native SDKs **must** send it.                                                                                     |
+| `platform`      | string   | no       | `web`, `react-native`, `ios`, `android`, `flutter`, `webview`, `node`, `dotnet`, `ruby`, `go`. Absent means `web`. Native SDKs **must** send it. |
+| `sdk`           | object   | no       | `{ name, version }`. Native SDKs **must** send both.                                                                                             |
+| `capabilities`  | string[] | no       | Capability names this SDK has active                                                                                                             |
+| `target`        | object   | no       | Normalised UI target (see below)                                                                                                                 |
+| `sessionId`     | string   | no       | Only when an extension workflow session owns the event                                                                                           |
+| `offsetMs`      | integer  | no       | Milliseconds since the session's canonical start                                                                                                 |
 
 `platform` reports the **concrete OS** wherever the SDK can know it. A hybrid
 SDK running in a WebView reports `ios` or `android`, not `webview`, and falls
@@ -121,20 +121,20 @@ added to the consumer allow list and deployed before any SDK sends it.
 Kinds are open, but these are the shared ones. An SDK that invents a kind
 outside this list gets no cross platform treatment on the ingest side.
 
-| `k` | Meaning | Common `d` keys |
-| --- | --- | --- |
-| `err` | An error or crash | `msg`, `stk`, `fatal`, `source` |
-| `rej` | An unhandled async failure | `msg`, `stk`, `source` |
-| `con` | A console/log line | `lv` (`log`/`warn`/`err`/`dbg`/`info`), `args` |
-| `net` | A completed request | `url`, `method`, `status`, `ok`, `dur`, `durTo`, `source`, `error` |
-| `net-status` | Connectivity state or change | `connected`, `type`, `kind` |
-| `env` | Environment snapshot | `kind`, `device`, `app`, `battery`, `locale` |
-| `navigation` | A screen or route change | `name`, `path`, `key`, `url`, `source` |
-| `nav-intent` | A navigation the user asked for | `action`, `source` |
-| `app-lifecycle` | Foreground/background transitions | `state`, `source`, `kind` |
-| `native-crash` | A native crash captured on next launch | `msg`, `stk`, `signal`, `thread`, `at`, `source` |
-| `native-hang` | A bounded watchdog or previous-launch hang observation | `source`, `thresholdMs`, `observedDurationMs`, `recovered`, `previousLaunch`, `stk` |
-| `view-snapshot` | A view tree snapshot | `nodes`, `w`, `h` |
+| `k`             | Meaning                                                | Common `d` keys                                                                     |
+| --------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `err`           | An error or crash                                      | `msg`, `stk`, `fatal`, `source`                                                     |
+| `rej`           | An unhandled async failure                             | `msg`, `stk`, `source`                                                              |
+| `con`           | A console/log line                                     | `lv` (`log`/`warn`/`err`/`dbg`/`info`), `args`                                      |
+| `net`           | A completed request                                    | `url`, `method`, `status`, `ok`, `dur`, `durTo`, `source`, `error`                  |
+| `net-status`    | Connectivity state or change                           | `connected`, `type`, `kind`                                                         |
+| `env`           | Environment snapshot                                   | `kind`, `device`, `app`, `battery`, `locale`                                        |
+| `navigation`    | A screen or route change                               | `name`, `path`, `key`, `url`, `source`                                              |
+| `nav-intent`    | A navigation the user asked for                        | `action`, `source`                                                                  |
+| `app-lifecycle` | Foreground/background transitions                      | `state`, `source`, `kind`                                                           |
+| `native-crash`  | A native crash captured on next launch                 | `msg`, `stk`, `signal`, `thread`, `at`, `source`                                    |
+| `native-hang`   | A bounded watchdog or previous-launch hang observation | `source`, `thresholdMs`, `observedDurationMs`, `recovered`, `previousLaunch`, `stk` |
+| `view-snapshot` | A view tree snapshot                                   | `nodes`, `w`, `h`                                                                   |
 
 `err` carries `fatal: true` only for a failure that actually terminated the
 process. A caught and reported exception is `fatal: false`.
@@ -149,11 +149,11 @@ omits it.
 
 `dur` is milliseconds, and `durTo` says which phase it covers:
 
-| `durTo`     | Meaning                                                              |
-| ----------- | -------------------------------------------------------------------- |
-| `headers`   | Request start until the response head is available                   |
-| `body`      | Request start until the body has been received and decoded           |
-| *(absent)*  | The SDK does not state a phase                                       |
+| `durTo`    | Meaning                                                    |
+| ---------- | ---------------------------------------------------------- |
+| `headers`  | Request start until the response head is available         |
+| `body`     | Request start until the body has been received and decoded |
+| _(absent)_ | The SDK does not state a phase                             |
 
 The distinction is not cosmetic. An adapter sitting on a streaming seam
 (`URLProtocol`, an OkHttp interceptor, a `package:http` client) reports
@@ -230,12 +230,12 @@ across a cold start within the idle window.
 
 Persistence must survive an app restart and an OS storage reclaim:
 
-| Platform | Store | Not this |
-| --- | --- | --- |
-| iOS native | `UserDefaults` | — |
-| Android native | `SharedPreferences` | — |
-| Flutter | `SharedPreferences` via the platform channel | — |
-| Capacitor / hybrid | `@capacitor/preferences` | WebView `localStorage`, which iOS can evict |
+| Platform           | Store                                        | Not this                                    |
+| ------------------ | -------------------------------------------- | ------------------------------------------- |
+| iOS native         | `UserDefaults`                               | —                                           |
+| Android native     | `SharedPreferences`                          | —                                           |
+| Flutter            | `SharedPreferences` via the platform channel | —                                           |
+| Capacitor / hybrid | `@capacitor/preferences`                     | WebView `localStorage`, which iOS can evict |
 
 ### Expiry
 
@@ -256,12 +256,12 @@ is rewritten on activity, in the same millisecond unit as `t`.
 when configured, plus any identity fields. A native SDK has no URL or user
 agent, so it sends what it does have:
 
-| Key | Value |
-| --- | --- |
-| `service` | The configured service name, when set |
+| Key        | Value                                    |
+| ---------- | ---------------------------------------- |
+| `service`  | The configured service name, when set    |
 | `platform` | Same value as the event `platform` field |
-| `app` | `{ id, version, build }` |
-| `device` | `{ model, manufacturer, os, osVersion }` |
+| `app`      | `{ id, version, build }`                 |
+| `device`   | `{ model, manufacturer, os, osVersion }` |
 
 Omit any key whose value is unknown. Do not send empty strings as placeholders:
 an absent field and a field that is present but blank mean different things on

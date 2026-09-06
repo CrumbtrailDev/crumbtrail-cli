@@ -13,7 +13,11 @@
         "metadata": {
           "service": "app",
           "platform": "ios",
-          "app": { "id": "ai.crumbtrail.demo", "version": "1.4.0", "build": "204" },
+          "app": {
+            "id": "ai.crumbtrail.demo",
+            "version": "1.4.0",
+            "build": "204"
+          },
           "device": {
             "model": "iPhone15,2",
             "manufacturer": "Apple",

@@ -551,7 +551,11 @@ export class HttpTransport implements CrumbtrailTransport {
         ? undefined
         : drainingRetryAfterMs(response);
       if (retryAfterMs !== undefined)
-        throw new EventDeliveryError(response.status, events.length, retryAfterMs);
+        throw new EventDeliveryError(
+          response.status,
+          events.length,
+          retryAfterMs,
+        );
       // The server already wrote the sentence that explains this ("A project
       // API key is required", the cap wall, the pause wall). Reporting a bare
       // status instead sent the integrator to guess at a cause the response

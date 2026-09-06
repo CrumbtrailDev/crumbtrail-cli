@@ -162,7 +162,8 @@ describe("backend intake client", () => {
       ok: false,
       status: 401,
       json: vi.fn().mockResolvedValue({
-        error: "This project API key was not accepted. It may have been revoked.",
+        error:
+          "This project API key was not accepted. It may have been revoked.",
         code: "unauthorized",
       }),
     });
@@ -530,10 +531,14 @@ function drainingResponse(retryAfter: string) {
   return {
     ok: false,
     status: 503,
-    headers: { get: (name: string) => (name === "Retry-After" ? retryAfter : null) },
+    headers: {
+      get: (name: string) => (name === "Retry-After" ? retryAfter : null),
+    },
     json: vi
       .fn()
-      .mockResolvedValue({ error: "This instance is draining and is not accepting new requests" }),
+      .mockResolvedValue({
+        error: "This instance is draining and is not accepting new requests",
+      }),
   };
 }
 
