@@ -274,6 +274,7 @@ describe("transport envelope conformance", () => {
           "networkFailure",
           "non2xx",
           "capture202Shed",
+          "draining503",
           "sessionStart",
         ].sort(),
       );
