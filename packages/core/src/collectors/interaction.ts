@@ -25,6 +25,7 @@ import {
   truncate,
 } from "../utils";
 import { subscribeNavCommit } from "../nav-signal";
+import { buildCaptureGapEvent } from "../capture-gap";
 
 /**
  * The element's own identifier — `name`, else `id` — used as `keyName` for
@@ -56,9 +57,14 @@ function captionMatchesDenyField(
   denyFields: string[] | undefined,
 ): boolean {
   if (!denyFields || denyFields.length === 0) return false;
-  const denySet = new Set(denyFields.map((field) => field.trim().toLowerCase()).filter(Boolean));
+  const denySet = new Set(
+    denyFields.map((field) => field.trim().toLowerCase()).filter(Boolean),
+  );
   if (denySet.size === 0) return false;
-  const words = caption.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const words = caption
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
   return words.some((word) => denySet.has(word));
 }
 
@@ -280,6 +286,57 @@ function describeInteractionTarget(
 
 /** How many elements under the pointer are worth describing beneath the one that got the click. */
 const MAX_COVERED_ELEMENTS = 3;
+
+/**
+ * Ceiling on clicks synthesized from a pointer pair the browser never turned
+ * into a `click` event, per collector instance.
+ *
+ * Ordinary presses are bounded by the person making them, so this never binds
+ * on a real session. It binds on a page that dispatches synthetic pointer
+ * events in a loop — a carousel, a drag library, a test harness — where the
+ * lane would otherwise be an unbounded event source. Set well above any
+ * plausible number of dead controls one person presses in one session.
+ */
+export const MAX_INERT_CLICKS = 200;
+
+/**
+ * Window the inert-click ceiling is counted over.
+ *
+ * A per-collector total never reset, so one carousel that fired two hundred
+ * synthetic pointer pairs in its first minute silenced the lane for the rest of
+ * a session that might run for an hour — and silently, because nothing said the
+ * budget was gone. Counting per rolling minute keeps the bound that matters (a
+ * loop cannot become an unbounded event source) and lets a long session recover.
+ */
+export const INERT_CLICK_WINDOW_MS = 60_000;
+
+/**
+ * How long to wait for the browser's `click` after a pointer pair, by pointer type.
+ *
+ * A mouse click is dispatched in the same task as `pointerup`, so a `setTimeout`
+ * of 0 is a correct deadline there. Touch and pen are not: the compatibility
+ * mouse events and the `click` arrive in a LATER task, historically after the
+ * 300ms tap delay that a page without `touch-action` or a viewport meta still
+ * gets. A same-task deadline therefore fired before every tap's real click, so
+ * each tap emitted an `inert` press and then a second, unmarked one when the
+ * click finally landed.
+ *
+ * 400ms covers the legacy tap delay plus dispatch slack, and still resolves the
+ * pair well inside a person's next gesture.
+ */
+export const INERT_CLICK_DEADLINE_MS = { pointer: 0, deferred: 400 } as const;
+
+/**
+ * Why the browser dispatched no `click` for a pointer pair, carried as `d.inert_reason`.
+ *
+ * `inert` says a click was never dispatched. It does NOT say the press did
+ * nothing, and conflating the two mis-reads two ordinary cases as dead controls:
+ * a menu, drag or canvas library that calls `preventDefault()` on `pointerdown`
+ * suppresses the click while handling the gesture, and a target the handler
+ * removes on `pointerup` has no element left to receive one. Both are the press
+ * working. Only `no_click` is the reading this lane exists to produce.
+ */
+export type InertClickReason = "prevented" | "target_removed" | "no_click";
 
 /**
  * What was actually under the pointer, and what actually received the event.
@@ -505,13 +562,90 @@ export function interactionCollector(
     });
 
   // --- Clicks ---
-  const onClick = (e: MouseEvent) => {
-    const target = e.target;
-    if (!(target instanceof Element)) return;
-    if (isBlocked(target)) return;
-    if (isIgnored(target)) return;
+  /** One pointer pair awaiting the browser's verdict; see the inert-click note below. */
+  interface PendingInertClick {
+    target: Element;
+    event: PointerEvent;
+    timer: ReturnType<typeof setTimeout>;
+    /**
+     * Descriptor and integrity read at `pointerup`, not at emission.
+     *
+     * `composedPath()` is empty once dispatch has finished, and the DOM is read
+     * a task or more later, so deferring these lost `deep` on every inert click
+     * and could lose `box` and `covered` too when the handler re-rendered. An
+     * inert `clk` has to carry the same fields as an ordinary one, or a reader
+     * comparing the two mistakes the missing integrity record for a finding.
+     */
+    el: Record<string, unknown>;
+    integrity: Record<string, unknown>;
+    /**
+     * `defaultPrevented` on the pointerdown, read at `pointerup`.
+     *
+     * The capture-phase listener runs before any page handler, so it cannot see
+     * the flag. The Event object keeps it after dispatch, so the pointerup
+     * handler reads the same object and gets the settled value.
+     */
+    downPrevented: boolean;
+  }
+  let pendingInert: PendingInertClick | undefined;
+  let pointerDownTarget: Element | undefined;
+  let pointerDownEvent: PointerEvent | undefined;
+  // Ceiling on synthesized clicks per rolling window. Real presses are bounded
+  // by the person doing them; a page that synthesizes pointer events in a loop
+  // is not, and this lane must not become an unbounded event source.
+  let inertWindowStart = 0;
+  let inertInWindow = 0;
+  let inertCapReported = false;
 
-    const el = describeInteractionTarget(target, config);
+  /** Whether this press may be synthesized, and the ledger update that says so. */
+  const takeInertBudget = (): boolean => {
+    const at = now();
+    if (at - inertWindowStart >= INERT_CLICK_WINDOW_MS) {
+      inertWindowStart = at;
+      inertInWindow = 0;
+    }
+    if (inertInWindow >= MAX_INERT_CLICKS) {
+      // Once per collector, the way the other lanes report a cap: exhaustion
+      // that reads as "this page has no dead controls" is the one outcome this
+      // lane must never produce silently.
+      if (!inertCapReported) {
+        inertCapReported = true;
+        bus.emit(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "scan_budget_exceeded",
+            droppedEventCount: 1,
+          }),
+        );
+      }
+      return false;
+    }
+    inertInWindow += 1;
+    return true;
+  };
+
+  /**
+   * Ordered most specific first: a gesture handler that both cancelled the
+   * pointerdown and tore its target down is still a handler that ran, and
+   * `prevented` is the fact a reader needs to stop treating it as a dead
+   * control.
+   */
+  const inertReason = (pending: PendingInertClick): InertClickReason => {
+    if (pending.downPrevented) return "prevented";
+    try {
+      if (pending.target.isConnected === false) return "target_removed";
+    } catch {
+      // A target that throws on a property read is not worth a lost event.
+    }
+    return "no_click";
+  };
+
+  const emitClick = (
+    e: MouseEvent,
+    target: Element,
+    pending?: PendingInertClick,
+  ): void => {
+    const el = pending?.el ?? describeInteractionTarget(target, config);
     const d: Record<string, unknown> = {
       el,
       pos: [e.clientX, e.clientY],
@@ -519,7 +653,13 @@ export function interactionCollector(
       // what was underneath it. Spread so the fields are absent rather than null
       // when the page gives us nothing — an absent field reads as "not captured",
       // and a null would read as "captured, nothing there".
-      ...describeClickIntegrity(e, target, config),
+      ...(pending?.integrity ?? describeClickIntegrity(e, target, config)),
+      // Present only when true, so a reader never has to distinguish `false`
+      // from an older SDK that did not carry the field at all. `inert_reason`
+      // is what keeps `inert` honest: see InertClickReason.
+      ...(pending
+        ? { inert: true, inert_reason: inertReason(pending) }
+        : {}),
     };
     attachRedactionMetadata(d, readDescriptorMetadata(el));
 
@@ -529,8 +669,131 @@ export function interactionCollector(
       d,
     });
   };
+
+  const onClick = (e: MouseEvent) => {
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    // A real click closes out whatever pointer pair produced it, even for an
+    // element this collector will not describe: the pending synthesis must not
+    // outlive the gesture just because its target was blocked or ignored.
+    clearPendingInert();
+    if (isBlocked(target)) return;
+    if (isIgnored(target)) return;
+    emitClick(e, target);
+  };
   document.addEventListener("click", onClick, true);
   cleanups.push(() => document.removeEventListener("click", onClick, true));
+
+  // --- Clicks the browser refuses to dispatch ---
+  //
+  // A disabled form control receives no `mousedown`, no `mouseup` and no
+  // `click` — not on itself and not on any ancestor, so a capture-phase click
+  // listener on `document` sees nothing at all. The person pressed Next, the
+  // screen did not move, and the session recorded that they never pressed it.
+  // That is the exact report ("the button does nothing") this collector exists
+  // to answer, and it was the one press it could not see.
+  //
+  // Pointer events are still dispatched, and they carry the disabled control
+  // itself as `target`. So the pair is recorded on `pointerup` and released
+  // after a deadline: a `click` that arrives first cancels it — the ordinary
+  // case, where the browser did dispatch and `onClick` already emitted — and
+  // its absence means the gesture was swallowed, which is emitted as a `clk`
+  // marked `inert`. The deadline is pointer-type dependent, because only a
+  // mouse dispatches its click in the same task as `pointerup`; see
+  // INERT_CLICK_DEADLINE_MS.
+  //
+  // `inert` is a statement about dispatch, not about the press being dead, so
+  // every synthesized click carries `inert_reason` saying which of the three it
+  // is; see InertClickReason.
+  //
+  // Deliberately not a disabled-attribute test. `disabled`, `aria-disabled`, a
+  // `disabled` class, `fieldset[disabled]`, a handler that returns early and a
+  // control the framework never wired up all end the same way for the person
+  // pressing it, and only some of them are visible in the DOM. Asking the
+  // browser whether it dispatched a click covers every one of them without
+  // enumerating any.
+  const clearPendingInert = (): void => {
+    if (!pendingInert) return;
+    clearTimeout(pendingInert.timer);
+    observationTimers.delete(pendingInert.timer);
+    pendingInert = undefined;
+  };
+
+  const onPointerDown = (e: PointerEvent) => {
+    clearPendingInert();
+    const eligible =
+      e.isPrimary !== false && e.button === 0 && e.target instanceof Element;
+    pointerDownTarget = eligible ? (e.target as Element) : undefined;
+    // Kept, not read, until `pointerup`: `defaultPrevented` is still false here
+    // because this capture-phase listener runs before every page handler.
+    pointerDownEvent = eligible ? e : undefined;
+  };
+
+  const onPointerUp = (e: PointerEvent) => {
+    const target = e.target;
+    const downTarget = pointerDownTarget;
+    const downEvent = pointerDownEvent;
+    pointerDownTarget = undefined;
+    pointerDownEvent = undefined;
+    // Same element down and up, primary button only. A drag that starts on one
+    // element and ends on another produces no click either, and inventing one
+    // there would report a press that never happened.
+    if (
+      !(target instanceof Element) ||
+      target !== downTarget ||
+      e.isPrimary === false ||
+      e.button !== 0
+    ) {
+      return;
+    }
+    if (isBlocked(target) || isIgnored(target)) return;
+    // Read now, while the gesture's DOM is still the one the person pressed.
+    const el = describeInteractionTarget(target, config);
+    const integrity = describeClickIntegrity(e, target, config);
+    // `pointerType` is "" on a synthesized event and on older engines. Anything
+    // that is not explicitly touch or pen keeps the same-task deadline, so the
+    // longer wait is opt-in by evidence rather than by absence of evidence.
+    const deferred = e.pointerType === "touch" || e.pointerType === "pen";
+    const deadline = deferred
+      ? INERT_CLICK_DEADLINE_MS.deferred
+      : INERT_CLICK_DEADLINE_MS.pointer;
+    const timer = setTimeout(() => {
+      observationTimers.delete(timer);
+      const pending = pendingInert;
+      pendingInert = undefined;
+      // Cancelled by `onClick` if the browser dispatched one; still set here
+      // means it did not.
+      if (!pending || pending.timer !== timer) return;
+      // Charged at emission, not at press, so an ordinary click never spends it.
+      if (!takeInertBudget()) return;
+      emitClick(pending.event, pending.target, pending);
+    }, deadline);
+    observationTimers.add(timer);
+    pendingInert = {
+      target,
+      event: e,
+      timer,
+      el,
+      integrity,
+      downPrevented: downEvent?.defaultPrevented === true,
+    };
+  };
+
+  const onPointerCancel = () => {
+    pointerDownTarget = undefined;
+    pointerDownEvent = undefined;
+    clearPendingInert();
+  };
+
+  document.addEventListener("pointerdown", onPointerDown, true);
+  document.addEventListener("pointerup", onPointerUp, true);
+  document.addEventListener("pointercancel", onPointerCancel, true);
+  cleanups.push(() => {
+    document.removeEventListener("pointerdown", onPointerDown, true);
+    document.removeEventListener("pointerup", onPointerUp, true);
+    document.removeEventListener("pointercancel", onPointerCancel, true);
+    clearPendingInert();
+  });
 
   // --- Input / Change ---
   const isInputControl = (

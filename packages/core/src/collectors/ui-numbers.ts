@@ -1227,6 +1227,9 @@ function startUiNumbersCollector(
   // from the observer-setup catch) can release it without a TDZ reference.
   // eslint-disable-next-line prefer-const
   let unsubscribeNav: (() => void) | undefined;
+  // Same reason: assigned after the observer starts, released by `disable`.
+  // eslint-disable-next-line prefer-const
+  let removeInteractionListeners: (() => void) | undefined;
 
   // Failure policy: the collector self-disables inside its own scan path and
   // degrades to a single `capture_gap` event, rather than relying on
@@ -1251,6 +1254,7 @@ function startUiNumbersCollector(
       // Already broken — nothing to release.
     }
     unsubscribeNav?.();
+    removeInteractionListeners?.();
     bus.emit(buildCaptureGapEvent({ surface: "browser", reason, detail }));
   };
 
@@ -1360,11 +1364,59 @@ function startUiNumbersCollector(
       childList: true,
       subtree: true,
       characterData: true,
+      // A pager that stays mounted and only flips `disabled` changes no node
+      // and no text, so a childList/characterData observer never rescans and
+      // `control:next` keeps the value it had on the first render — a screen
+      // that has since gained a second page still reads as "Next is disabled".
+      // Filtered rather than open: these five are the only attributes the scan
+      // reads (disabled state, the numbered pager's current link, and the two
+      // ways a subtree is hidden), and an unfiltered attribute observer would
+      // schedule a scan on every hover class a large table toggles.
+      attributes: true,
+      attributeFilter: [
+        "disabled",
+        "aria-disabled",
+        "aria-current",
+        "hidden",
+        "aria-hidden",
+      ],
     });
   } catch (error) {
     disableOnException(error);
     return () => {};
   }
+
+  // Interaction settle: a press schedules a scan through the same debounce.
+  //
+  // The attribute filter above deliberately excludes `class`, and a component
+  // library that says "disabled" only in a class name (Bootstrap's
+  // `li.page-item.disabled`) therefore changes nothing this observer watches.
+  // A press is the moment that state is worth re-reading, so the press itself
+  // schedules the scan. It costs no events on a screen that did not move: the
+  // per-region change check drops an identical snapshot, so the ceiling this
+  // adds is one scan per settle window, not one event per click.
+  //
+  // The key trigger is Enter and Space only, and that restriction is
+  // load-bearing rather than tidiness. `keyup` fires on every keystroke, so
+  // typing in a filter box re-armed the debounce on each letter; the deferral
+  // ceiling then forced a full document scan every UI_NUM_MAX_WAIT_MS for as
+  // long as the person kept typing. Enter and Space are the keys that ACTIVATE
+  // a control — the keyboard equivalent of the press this trigger exists for —
+  // and neither is produced by ordinary typing into a text field, where the
+  // MutationObserver already covers whatever the keystrokes change.
+  const onInteraction = (): void => scheduleScan();
+  const onActivationKey = (event: KeyboardEvent): void => {
+    // "Spacebar" is the legacy value older engines report for the space key.
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+      scheduleScan();
+    }
+  };
+  document.addEventListener("pointerup", onInteraction, true);
+  document.addEventListener("keyup", onActivationKey, true);
+  removeInteractionListeners = () => {
+    document.removeEventListener("pointerup", onInteraction, true);
+    document.removeEventListener("keyup", onActivationKey, true);
+  };
 
   // Navigation commit: SPA route changes (history API) and hash/pop
   // navigations schedule a scan through the same settle debounce so the new
@@ -1398,5 +1450,6 @@ function startUiNumbersCollector(
       // Observer already failed; cleanup must not throw.
     }
     unsubscribeNav?.();
+    removeInteractionListeners?.();
   };
 }
