@@ -55,6 +55,10 @@ Every SDK must distinguish four outcomes and record the last two:
    SDK's queue policy.
 3. **Non-2xx** — the server refused. Do not retry the identical batch; surface
    it as a capture gap so the missing window is declared rather than implied.
+   One exception: a **503 carrying `Retry-After`** is an instance that a deploy
+   is draining while its replacement already serves. Wait the header's value,
+   capped at three seconds, and post the identical batch once more. The retry's
+   own refusal is final. A 503 without the header is an ordinary refusal.
 4. **202 capture shed** — the server accepted the request and discarded the
    evidence. The body carries `{ "capture": "shed", "reason", "retryAfterSeconds" }`
    and a `Retry-After` header. 202 passes an "is this a success" test, so an SDK

@@ -395,6 +395,68 @@ describe("backend intake client", () => {
     expect(warnings).toEqual([]);
   });
 
+  it("retries once after the pause a draining instance asks for", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(drainingResponse("2"))
+      .mockResolvedValue(okJsonResponse());
+    const sleeps: number[] = [];
+    const warnings: BackendIntakeWarning[] = [];
+
+    await expect(
+      sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+        onWarning: (warning) => warnings.push(warning),
+      }),
+    ).resolves.toBe(true);
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([2_000]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("caps a rewritten Retry-After so a handler never parks for minutes", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(drainingResponse("600"))
+      .mockResolvedValue(okJsonResponse());
+    const sleeps: number[] = [];
+
+    await sendBackendEvent({
+      event: baseEvent,
+      fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    expect(sleeps).toEqual([3_000]);
+  });
+
+  it("treats a 503 without Retry-After as final", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: vi.fn().mockResolvedValue({ error: "upstream down" }),
+    });
+    const warnings: BackendIntakeWarning[] = [];
+
+    await expect(
+      sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        onWarning: (warning) => warnings.push(warning),
+      }),
+    ).resolves.toBe(false);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(warnings[0]).toMatchObject({ kind: "http-error", status: 503 });
+  });
+
   it("bounds an unresolved session-start race without duplicating delivery", async () => {
     vi.useFakeTimers();
     try {
@@ -461,6 +523,17 @@ function okJsonResponse() {
     ok: true,
     status: 200,
     text: vi.fn().mockResolvedValue('{"ok":true}'),
+  };
+}
+
+function drainingResponse(retryAfter: string) {
+  return {
+    ok: false,
+    status: 503,
+    headers: { get: (name: string) => (name === "Retry-After" ? retryAfter : null) },
+    json: vi
+      .fn()
+      .mockResolvedValue({ error: "This instance is draining and is not accepting new requests" }),
   };
 }
 

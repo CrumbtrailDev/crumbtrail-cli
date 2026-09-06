@@ -262,6 +262,37 @@ describe("endSession", () => {
       warn.mock.calls.map((c: unknown[]) => String(c[0])).join("\n"),
     ).toContain("409");
   });
+
+  it("retries the close once when the instance is draining", async () => {
+    vi.useFakeTimers();
+    try {
+      let refusals = 0;
+      const fetchMock = vi.fn(async (url: string) => {
+        if (!url.includes("/api/session/end")) return ok();
+        if (refusals === 0) {
+          refusals += 1;
+          return new Response("draining", {
+            status: 503,
+            headers: { "Retry-After": "2" },
+          });
+        }
+        return ok();
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+      await transport.startSession("ses_test", {});
+      fetchMock.mockClear();
+
+      const closing = transport.endSession("ses_test");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(closing).resolves.toBeUndefined();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(warn.mock.calls).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("the authenticated sendBeacon unload path", () => {
@@ -387,6 +418,85 @@ describe("byte aware batching", () => {
     ]);
 
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries once after the pause a draining instance asks for", async () => {
+    vi.useFakeTimers();
+    try {
+      let refusals = 0;
+      const fetchMock = vi.fn(async (url: string) => {
+        if (!url.includes("/api/events")) return ok();
+        if (refusals === 0) {
+          refusals += 1;
+          return new Response("draining", {
+            status: 503,
+            headers: { "Retry-After": "2" },
+          });
+        }
+        return ok();
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+      await transport.startSession("ses_test", {});
+      fetchMock.mockClear();
+
+      const delivery = transport.sendEvents([{ t: 1, k: "con", d: {} }]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(delivery).resolves.toBeUndefined();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // The batch landed, so nothing is worth a console line.
+      expect(warn.mock.calls).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up after the retry is refused too, and says so once", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        routed({
+          "/api/events": () =>
+            new Response("draining", {
+              status: 503,
+              headers: { "Retry-After": "2" },
+            }),
+        }),
+      );
+      const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+      await transport.startSession("ses_test", {});
+
+      const delivery = transport
+        .sendEvents([{ t: 1, k: "con", d: {} }])
+        .catch((caught) => caught as EventDeliveryError);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const error = await delivery;
+
+      expect(error).toBeInstanceOf(EventDeliveryError);
+      expect((error as EventDeliveryError).status).toBe(503);
+      expect((error as EventDeliveryError).retryAfterMs).toBeUndefined();
+      const lines = warn.mock.calls.map((c: unknown[]) => String(c[0]));
+      expect(lines.filter((l: string) => l.includes("503"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a 503 that carries no Retry-After", async () => {
+    const fetchMock = routed({
+      "/api/events": () => new Response("down", { status: 503 }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+    await transport.startSession("ses_test", {});
+    fetchMock.mockClear();
+
+    await expect(
+      transport.sendEvents([{ t: 1, k: "con", d: {} }]),
+    ).rejects.toBeInstanceOf(EventDeliveryError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("bisects on a 413 instead of dropping the batch whole", async () => {

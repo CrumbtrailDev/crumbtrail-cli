@@ -14,8 +14,14 @@ export class EventDeliveryError extends Error {
   /** HTTP status, or 0 when the request never produced a response. */
   readonly status: number;
   readonly eventCount: number;
+  /**
+   * Set when the server asked for one more try: a 503 carrying Retry-After,
+   * which is what an instance answers while a deploy drains it. Absent on
+   * every other refusal, and on the retry's own refusal.
+   */
+  readonly retryAfterMs?: number;
 
-  constructor(status: number, eventCount: number) {
+  constructor(status: number, eventCount: number, retryAfterMs?: number) {
     super(
       status > 0
         ? `capture endpoint rejected ${eventCount} event(s) with ${status}`
@@ -24,7 +30,30 @@ export class EventDeliveryError extends Error {
     this.name = "EventDeliveryError";
     this.status = status;
     this.eventCount = eventCount;
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
   }
+}
+
+/**
+ * Longest the transport will wait on a draining instance's Retry-After before
+ * the one retry. The server sends two seconds; a proxy that rewrites the header
+ * to minutes must not park a flush, and an unload flush cannot wait long at all.
+ */
+export const DRAINING_RETRY_MAX_MS = 3_000;
+
+/**
+ * The retry delay a refusal asks for, or undefined when it is final.
+ *
+ * Only a 503 with Retry-After qualifies. Every other non-2xx is a decision
+ * about this project or this payload and does not change by asking again.
+ */
+function drainingRetryAfterMs(response: Response): number | undefined {
+  if (response.status !== 503) return undefined;
+  const raw = response.headers?.get?.("Retry-After");
+  if (raw === null || raw === undefined || raw.trim() === "") return undefined;
+  const header = Number(raw);
+  if (!Number.isFinite(header) || header < 0) return undefined;
+  return Math.min(Math.ceil(header * 1000), DRAINING_RETRY_MAX_MS);
 }
 
 /**
@@ -409,6 +438,18 @@ export class HttpTransport implements CrumbtrailTransport {
     try {
       await this.postEvents(events, sessionId, allowPreviousSession);
     } catch (error) {
+      // A draining instance is a few seconds from gone and its replacement is
+      // already serving, so one retry after the pause it asked for lands the
+      // batch instead of recording it as a capture gap. Exactly once: the
+      // retry's own refusal is final, and only that one reaches the console.
+      if (
+        error instanceof EventDeliveryError &&
+        error.retryAfterMs !== undefined
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, error.retryAfterMs));
+        await this.postEvents(events, sessionId, allowPreviousSession, true);
+        return;
+      }
       const oversized =
         error instanceof EventDeliveryError &&
         error.status === 413 &&
@@ -447,6 +488,7 @@ export class HttpTransport implements CrumbtrailTransport {
     events: BugEvent[],
     sessionId: string,
     allowPreviousSession = false,
+    finalAttempt = false,
   ): Promise<void> {
     if (!allowPreviousSession && sessionId !== this.sessionId) return;
     const body = this.eventsBody(events, sessionId);
@@ -505,6 +547,11 @@ export class HttpTransport implements CrumbtrailTransport {
     // A refusal is not a delivery. Retrying by beacon would be refused the same
     // way, so surface it instead: the caller turns this into a capture gap.
     if (!response.ok) {
+      const retryAfterMs = finalAttempt
+        ? undefined
+        : drainingRetryAfterMs(response);
+      if (retryAfterMs !== undefined)
+        throw new EventDeliveryError(response.status, events.length, retryAfterMs);
       // The server already wrote the sentence that explains this ("A project
       // API key is required", the cap wall, the pause wall). Reporting a bare
       // status instead sent the integrator to guess at a cause the response
@@ -700,12 +747,20 @@ export class HttpTransport implements CrumbtrailTransport {
       // `keepalive` is what makes this survive an unload. A plain fetch is
       // cancelled the moment the document goes away. This fetch keeps the
       // header and is well inside the 64KB cap this body uses.
-      response = await fetch(`${this.endpoint}/api/session/end`, {
+      const init: RequestInit = {
         method: "POST",
         headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
         body,
         keepalive: true,
-      });
+      };
+      response = await fetch(`${this.endpoint}/api/session/end`, init);
+      // A draining instance asks for one more try. Finalization is what turns
+      // a session into evidence, so it gets the same single retry as a batch.
+      const retryAfterMs = drainingRetryAfterMs(response);
+      if (retryAfterMs !== undefined) {
+        await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+        response = await fetch(`${this.endpoint}/api/session/end`, init);
+      }
     } catch {
       // Only reached when keepalive itself is unavailable or refused. A beacon
       // carries the public ingest key in the JSON body because it cannot carry
