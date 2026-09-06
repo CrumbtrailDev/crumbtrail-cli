@@ -282,6 +282,18 @@ function describeInteractionTarget(
 const MAX_COVERED_ELEMENTS = 3;
 
 /**
+ * Ceiling on clicks synthesized from a pointer pair the browser never turned
+ * into a `click` event, per collector instance.
+ *
+ * Ordinary presses are bounded by the person making them, so this never binds
+ * on a real session. It binds on a page that dispatches synthetic pointer
+ * events in a loop — a carousel, a drag library, a test harness — where the
+ * lane would otherwise be an unbounded event source. Set well above any
+ * plausible number of dead controls one person presses in one session.
+ */
+export const MAX_INERT_CLICKS = 200;
+
+/**
  * What was actually under the pointer, and what actually received the event.
  *
  * "The button does nothing" is one of the most common reports a support desk
@@ -505,12 +517,24 @@ export function interactionCollector(
     });
 
   // --- Clicks ---
-  const onClick = (e: MouseEvent) => {
-    const target = e.target;
-    if (!(target instanceof Element)) return;
-    if (isBlocked(target)) return;
-    if (isIgnored(target)) return;
+  /** One pointer pair awaiting the browser's verdict; see the inert-click note below. */
+  interface PendingInertClick {
+    target: Element;
+    event: PointerEvent;
+    timer: ReturnType<typeof setTimeout>;
+  }
+  let pendingInert: PendingInertClick | undefined;
+  let pointerDownTarget: Element | undefined;
+  // Ceiling on synthesized clicks per session. Real presses are bounded by the
+  // person doing them; a page that synthesizes pointer events in a loop is not,
+  // and this lane must not become an unbounded event source.
+  let inertBudget = MAX_INERT_CLICKS;
 
+  const emitClick = (
+    e: MouseEvent,
+    target: Element,
+    inert: boolean,
+  ): void => {
     const el = describeInteractionTarget(target, config);
     const d: Record<string, unknown> = {
       el,
@@ -520,6 +544,9 @@ export function interactionCollector(
       // when the page gives us nothing — an absent field reads as "not captured",
       // and a null would read as "captured, nothing there".
       ...describeClickIntegrity(e, target, config),
+      // Present only when true, so a reader never has to distinguish `false`
+      // from an older SDK that did not carry the field at all.
+      ...(inert ? { inert: true } : {}),
     };
     attachRedactionMetadata(d, readDescriptorMetadata(el));
 
@@ -529,8 +556,103 @@ export function interactionCollector(
       d,
     });
   };
+
+  const onClick = (e: MouseEvent) => {
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    // A real click closes out whatever pointer pair produced it, even for an
+    // element this collector will not describe: the pending synthesis must not
+    // outlive the gesture just because its target was blocked or ignored.
+    pendingInert = undefined;
+    if (isBlocked(target)) return;
+    if (isIgnored(target)) return;
+    emitClick(e, target, false);
+  };
   document.addEventListener("click", onClick, true);
   cleanups.push(() => document.removeEventListener("click", onClick, true));
+
+  // --- Clicks the browser refuses to dispatch ---
+  //
+  // A disabled form control receives no `mousedown`, no `mouseup` and no
+  // `click` — not on itself and not on any ancestor, so a capture-phase click
+  // listener on `document` sees nothing at all. The person pressed Next, the
+  // screen did not move, and the session recorded that they never pressed it.
+  // That is the exact report ("the button does nothing") this collector exists
+  // to answer, and it was the one press it could not see.
+  //
+  // Pointer events are still dispatched, and they carry the disabled control
+  // itself as `target`. So the pair is recorded on `pointerup` and released one
+  // task later: a `click` that follows cancels it — the ordinary case, where
+  // the browser did dispatch and `onClick` already emitted — and its absence
+  // means the gesture was swallowed, which is emitted as a `clk` marked
+  // `inert`.
+  //
+  // Deliberately not a disabled-attribute test. `disabled`, `aria-disabled`, a
+  // `disabled` class, `fieldset[disabled]`, a handler that returns early and a
+  // control the framework never wired up all end the same way for the person
+  // pressing it, and only some of them are visible in the DOM. Asking the
+  // browser whether it dispatched a click covers every one of them without
+  // enumerating any.
+  const clearPendingInert = (): void => {
+    if (!pendingInert) return;
+    clearTimeout(pendingInert.timer);
+    observationTimers.delete(pendingInert.timer);
+    pendingInert = undefined;
+  };
+
+  const onPointerDown = (e: PointerEvent) => {
+    clearPendingInert();
+    pointerDownTarget =
+      e.isPrimary !== false && e.button === 0 && e.target instanceof Element
+        ? e.target
+        : undefined;
+  };
+
+  const onPointerUp = (e: PointerEvent) => {
+    const target = e.target;
+    const downTarget = pointerDownTarget;
+    pointerDownTarget = undefined;
+    // Same element down and up, primary button only. A drag that starts on one
+    // element and ends on another produces no click either, and inventing one
+    // there would report a press that never happened.
+    if (
+      !(target instanceof Element) ||
+      target !== downTarget ||
+      e.isPrimary === false ||
+      e.button !== 0
+    ) {
+      return;
+    }
+    if (isBlocked(target) || isIgnored(target)) return;
+    if (inertBudget <= 0) return;
+    const timer = setTimeout(() => {
+      observationTimers.delete(timer);
+      const pending = pendingInert;
+      pendingInert = undefined;
+      // Cancelled by `onClick` if the browser dispatched one; still set here
+      // means it did not.
+      if (!pending || pending.timer !== timer) return;
+      inertBudget -= 1;
+      emitClick(pending.event, pending.target, true);
+    }, 0);
+    observationTimers.add(timer);
+    pendingInert = { target, event: e, timer };
+  };
+
+  const onPointerCancel = () => {
+    pointerDownTarget = undefined;
+    clearPendingInert();
+  };
+
+  document.addEventListener("pointerdown", onPointerDown, true);
+  document.addEventListener("pointerup", onPointerUp, true);
+  document.addEventListener("pointercancel", onPointerCancel, true);
+  cleanups.push(() => {
+    document.removeEventListener("pointerdown", onPointerDown, true);
+    document.removeEventListener("pointerup", onPointerUp, true);
+    document.removeEventListener("pointercancel", onPointerCancel, true);
+    clearPendingInert();
+  });
 
   // --- Input / Change ---
   const isInputControl = (
