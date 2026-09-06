@@ -505,12 +505,25 @@ git remote and `HEAD`) the callsite also resolves to a GitHub permalink; without
 still works.
 
 ```ts
+import { instrumentPgClient, postBackendEvent } from "crumbtrail-node";
+
 instrumentPgClient(pool, {
   captureCallsite: true,
   callsiteRoot: repoRoot,
-  emit: (event) => sendBackendEvent(event),
+  emit: (event) =>
+    void postBackendEvent({ event, endpoint, authToken: process.env.CRUMBTRAIL_KEY }),
 });
 ```
+
+An `emit` you write yourself must post through `postBackendEvent`, not a bare `fetch`. The
+browser sends `/api/session/start` in parallel with its first API calls, so a database event
+from one of those calls can reach the cloud before the session exists, and the cloud answers
+`404 Session not found` until it does. `postBackendEvent` retries that one refusal (and a
+draining instance during a deploy) and reports every other refusal through `onWarning`. Over a
+real network the window is a few hundred milliseconds wide and a single fetch loses the race
+on most requests, which shows up as sessions with request events but no `db.*` events. Without
+`autoCapture` there is no process session to fall back to, so a statement outside a correlated
+request is not posted; `onWarning` names that case.
 
 ### Read capture and query fan-out
 
