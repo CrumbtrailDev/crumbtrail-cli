@@ -1178,6 +1178,125 @@ describe("uiNumbersCollector", () => {
     window.history.replaceState(null, "", "/");
   });
 
+  // The D4 shape: a dashboard, a client-side route change to a list screen,
+  // and the list's count phrase and pager arriving after the route committed.
+  it("captures the pager a route change renders after it commits", async () => {
+    document.body.innerHTML = `
+      <main class="content"><dl class="kv"><dt>People</dt><dd>21</dd></dl></main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+
+    // Route commits first and the new screen is still empty, exactly as a
+    // client-side router leaves it while the list request is in flight.
+    history.pushState({}, "", "/people");
+    document.body.innerHTML = `<main class="content"></main>`;
+    await settle(bus);
+
+    // The list lands one render later.
+    document.querySelector("main")!.innerHTML = `
+      <div class="toolbar"><span class="sub">30 people</span></div>
+      <div class="toolbar">
+        <button disabled>Previous</button>
+        <span class="sub">Page 1 of 1</span>
+        <button disabled>Next</button>
+      </div>`;
+    await settle(bus);
+
+    const last = uiNumEvents(events).at(-1)!;
+    expect(last.d.region).toBe("main.content");
+    expect(last.d.items).toEqual([
+      { label: "count:people", value: 30 },
+      { label: "control:previous", value: 0 },
+      { label: "pager:page", value: 1 },
+      { label: "pager:pages", value: 1 },
+      { label: "control:next", value: 0 },
+    ]);
+
+    window.history.replaceState(null, "", "/");
+  });
+
+  // A pager that stays mounted and only flips `disabled` changes no node and no
+  // text, so a childList/characterData observer never rescans and the control
+  // state stays at whatever the first render said.
+  it("rescans when a pager control's disabled attribute flips in place", async () => {
+    document.body.innerHTML = `
+      <main>
+        <span>Page 1 of 4</span>
+        <button id="next" disabled>Next</button>
+      </main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events).at(-1)!.d.items).toContainEqual({
+      label: "control:next",
+      value: 0,
+    });
+
+    document.querySelector("#next")!.removeAttribute("disabled");
+    await settle(bus);
+
+    expect(uiNumEvents(events)).toHaveLength(2);
+    expect(uiNumEvents(events).at(-1)!.d.items).toContainEqual({
+      label: "control:next",
+      value: 1,
+    });
+  });
+
+  // Bootstrap-style pagers say "disabled" in a class name only. `class` is
+  // excluded from the attribute filter because a large table toggles it on
+  // every hover, so the press itself is what schedules the re-read.
+  it("rescans after a press when the control state lives in a class name", async () => {
+    document.body.innerHTML = `
+      <main>
+        <span>Page 1 of 4</span>
+        <ul class="pagination"><li><a href="#" id="next">Next</a></li></ul>
+      </main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events).at(-1)!.d.items).toContainEqual({
+      label: "control:next",
+      value: 1,
+    });
+    const before = uiNumEvents(events).length;
+
+    document.querySelector("li")!.className = "disabled";
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(before);
+
+    document
+      .querySelector("#next")!
+      .dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    await settle(bus);
+
+    expect(uiNumEvents(events).at(-1)!.d.items).toContainEqual({
+      label: "control:next",
+      value: 0,
+    });
+  });
+
+  // The press schedules a scan, not an event: a screen that did not move still
+  // costs nothing, which is what keeps the added lane bounded.
+  it("emits nothing for a press that changed no figure", async () => {
+    document.body.innerHTML = `
+      <main><span>Page 1 of 1</span><button disabled>Next</button></main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    const before = uiNumEvents(events).length;
+
+    for (let press = 0; press < 5; press += 1) {
+      document
+        .querySelector("button")!
+        .dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+      await settle(bus);
+    }
+
+    expect(uiNumEvents(events)).toHaveLength(before);
+  });
+
   it("no-ops cleanly when MutationObserver is unavailable", () => {
     const original = globalThis.MutationObserver;
     vi.stubGlobal("MutationObserver", undefined);

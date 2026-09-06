@@ -56,9 +56,14 @@ function captionMatchesDenyField(
   denyFields: string[] | undefined,
 ): boolean {
   if (!denyFields || denyFields.length === 0) return false;
-  const denySet = new Set(denyFields.map((field) => field.trim().toLowerCase()).filter(Boolean));
+  const denySet = new Set(
+    denyFields.map((field) => field.trim().toLowerCase()).filter(Boolean),
+  );
   if (denySet.size === 0) return false;
-  const words = caption.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const words = caption
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
   return words.some((word) => denySet.has(word));
 }
 
@@ -530,11 +535,7 @@ export function interactionCollector(
   // and this lane must not become an unbounded event source.
   let inertBudget = MAX_INERT_CLICKS;
 
-  const emitClick = (
-    e: MouseEvent,
-    target: Element,
-    inert: boolean,
-  ): void => {
+  const emitClick = (e: MouseEvent, target: Element, inert: boolean): void => {
     const el = describeInteractionTarget(target, config);
     const d: Record<string, unknown> = {
       el,

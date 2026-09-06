@@ -586,7 +586,11 @@ describe("deny fields applied to a running ui.num collector", () => {
     const installed = internals.collectorTeardowns.get("uiNumbers");
     const observer = observers.find((entry) =>
       entry.observe.mock.calls.some(
-        (call) => call[1]?.characterData === true && !call[1]?.attributes,
+        // The ui.num observer is the one watching text plus the attributes its
+        // scan reads; rendered-error watches text without them.
+        (call) =>
+          call[1]?.characterData === true &&
+          call[1]?.attributeFilter?.includes("aria-disabled") === true,
       ),
     )!;
     expect(observer).toBeDefined();
