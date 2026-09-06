@@ -4,6 +4,8 @@ import type { BugEvent, CrumbtrailConfig } from "../types";
 import { DEFAULT_CONFIG } from "../types";
 import { maskText } from "../masking";
 import {
+  INERT_CLICK_DEADLINE_MS,
+  INERT_CLICK_WINDOW_MS,
   interactionCollector,
   MAX_INERT_CLICKS,
 } from "../collectors/interaction";
@@ -251,17 +253,20 @@ describe("interactionCollector inert clicks", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    delete (document as unknown as Record<string, unknown>).elementsFromPoint;
     document.body.innerHTML = "";
   });
 
-  function pointerPair(el: Element): void {
+  function pointerPair(el: Element, pointerType?: string): void {
     el.dispatchEvent(
       new PointerEvent("pointerdown", {
         bubbles: true,
+        cancelable: true,
         button: 0,
         isPrimary: true,
         clientX: 7,
         clientY: 9,
+        ...(pointerType ? { pointerType } : {}),
       }),
     );
     el.dispatchEvent(
@@ -271,8 +276,20 @@ describe("interactionCollector inert clicks", () => {
         isPrimary: true,
         clientX: 7,
         clientY: 9,
+        ...(pointerType ? { pointerType } : {}),
       }),
     );
+  }
+
+  /**
+   * jsdom has no hit testing, so the element stack is supplied. It is computed
+   * on each call rather than fixed, which is the point: the integrity record
+   * has to be read while the gesture's DOM is still standing, and a stub that
+   * answered the same way forever could not tell the two reads apart.
+   */
+  function stubElementStack(stack: () => Element[]): void {
+    (document as unknown as Record<string, unknown>).elementsFromPoint = () =>
+      stack();
   }
 
   function clicks(events: BugEvent[]): BugEvent[] {
@@ -395,6 +412,205 @@ describe("interactionCollector inert clicks", () => {
     bus.flush();
 
     expect(clicks(events)).toHaveLength(MAX_INERT_CLICKS);
+
+    cleanup();
+  });
+
+  // Exhaustion used to be silent, so a page that burned the ceiling read
+  // downstream exactly like a page with no dead controls on it.
+  it("reports the ceiling once, and recovers in the next window", () => {
+    document.body.innerHTML = `<button disabled>Next</button>`;
+    const button = document.querySelector("button")!;
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    for (let press = 0; press < MAX_INERT_CLICKS + 5; press += 1) {
+      pointerPair(button);
+      vi.advanceTimersByTime(1);
+    }
+    bus.flush();
+
+    const gaps = events.filter((event) => event.k === "capture_gap");
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].d).toMatchObject({
+      surface: "browser",
+      reason: "scan_budget_exceeded",
+    });
+
+    // A budget that never resets silences the lane for the rest of a long
+    // session. The window is what lets a real press be recorded again.
+    events.length = 0;
+    vi.advanceTimersByTime(INERT_CLICK_WINDOW_MS);
+    pointerPair(button);
+    vi.advanceTimersByTime(1);
+    bus.flush();
+
+    expect(clicks(events)).toHaveLength(1);
+    expect(events.filter((event) => event.k === "capture_gap")).toHaveLength(0);
+
+    cleanup();
+  });
+
+  // Only a mouse dispatches its click in the same task as pointerup. A touch
+  // tap's compatibility click arrives in a later macrotask, historically after
+  // the 300ms tap delay, so a same-task deadline marked every tap inert and
+  // then emitted a second, unmarked clk when the real click landed.
+  it("waits for a touch tap's compatibility click instead of synthesizing one", () => {
+    document.body.innerHTML = `<button>Next</button>`;
+    const button = document.querySelector("button")!;
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    pointerPair(button, "touch");
+    vi.advanceTimersByTime(1);
+    bus.flush();
+    expect(clicks(events)).toHaveLength(0);
+
+    setTimeout(() => {
+      button.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, clientX: 7, clientY: 9 }),
+      );
+    }, 300);
+    vi.advanceTimersByTime(1000);
+    bus.flush();
+
+    const recorded = clicks(events);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].d.inert).toBeUndefined();
+
+    cleanup();
+  });
+
+  it("still records a touch tap the browser never turned into a click", () => {
+    document.body.innerHTML = `<button disabled>Next</button>`;
+    const button = document.querySelector("button")!;
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    pointerPair(button, "touch");
+    vi.advanceTimersByTime(INERT_CLICK_DEADLINE_MS.deferred - 1);
+    bus.flush();
+    expect(clicks(events)).toHaveLength(0);
+
+    vi.advanceTimersByTime(2);
+    bus.flush();
+
+    const recorded = clicks(events);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].d.inert).toBe(true);
+    expect(recorded[0].d.inert_reason).toBe("no_click");
+
+    cleanup();
+  });
+
+  // `inert` means no click was dispatched, not that the press did nothing. A
+  // menu, drag or canvas library cancels pointerdown and handles the gesture
+  // itself; reading that as a dead control sends an engineer after a bug that
+  // is not there.
+  it("names a cancelled pointerdown rather than calling the press dead", () => {
+    document.body.innerHTML = `<button>Open menu</button>`;
+    const button = document.querySelector("button")!;
+    button.addEventListener("pointerdown", (event) => event.preventDefault());
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    pointerPair(button);
+    vi.advanceTimersByTime(1);
+    bus.flush();
+
+    const recorded = clicks(events);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].d.inert).toBe(true);
+    expect(recorded[0].d.inert_reason).toBe("prevented");
+
+    cleanup();
+  });
+
+  it("names a target the handler removed on pointerup", () => {
+    document.body.innerHTML = `<button>Dismiss</button>`;
+    const button = document.querySelector("button")!;
+    button.addEventListener("pointerup", () => button.remove());
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    pointerPair(button);
+    vi.advanceTimersByTime(1);
+    bus.flush();
+
+    const recorded = clicks(events);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].d.inert).toBe(true);
+    expect(recorded[0].d.inert_reason).toBe("target_removed");
+
+    cleanup();
+  });
+
+  // The integrity record is read at pointerup, not at emission. Read a task
+  // later, `composedPath()` is already empty and the DOM has moved on, so an
+  // inert click arrived without the integrity fields an ordinary one carries —
+  // and a reader comparing the two mistook the absence for a finding.
+  it("carries the same field set on an inert click as on a real one", () => {
+    document.body.innerHTML = `<div id="overlay"></div><button id="live">Go</button><button id="dead" disabled>Next</button>`;
+    const overlay = document.querySelector("#overlay")!;
+    const live = document.querySelector("#live")!;
+    const dead = document.querySelector("#dead")!;
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    stubElementStack(() => [live, overlay, document.body]);
+    pointerPair(live);
+    live.dispatchEvent(
+      new MouseEvent("click", { bubbles: true, clientX: 7, clientY: 9 }),
+    );
+    vi.advanceTimersByTime(1);
+
+    stubElementStack(() => [dead, overlay, document.body]);
+    pointerPair(dead);
+    vi.advanceTimersByTime(1);
+    bus.flush();
+
+    const recorded = clicks(events);
+    expect(recorded).toHaveLength(2);
+    const [real, synthesized] = recorded;
+    expect(real.d.inert).toBeUndefined();
+    expect(synthesized.d.inert).toBe(true);
+    expect(new Set(Object.keys(synthesized.d))).toEqual(
+      new Set([...Object.keys(real.d), "inert", "inert_reason"]),
+    );
+    expect(synthesized.d.covered).toBeDefined();
+
+    cleanup();
+  });
+
+  it("reads the integrity record from the gesture, not from the DOM a task later", () => {
+    document.body.innerHTML = `<div id="overlay"></div><button disabled>Next</button>`;
+    const overlay = document.querySelector("#overlay")!;
+    const button = document.querySelector("button")!;
+    // The page tears the overlay down as the press ends. Our capture-phase
+    // listener has already read the stack by the time this bubble-phase
+    // handler runs, which is exactly the ordering a real dismissal has.
+    button.addEventListener("pointerup", () => overlay.remove());
+    stubElementStack(() =>
+      overlay.isConnected ? [button, overlay, document.body] : [button, document.body],
+    );
+
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    pointerPair(button);
+    vi.advanceTimersByTime(1);
+    bus.flush();
+
+    const recorded = clicks(events);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].d.covered).toMatchObject([{ id: "overlay" }]);
 
     cleanup();
   });

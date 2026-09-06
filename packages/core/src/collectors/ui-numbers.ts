@@ -1395,12 +1395,27 @@ function startUiNumbersCollector(
   // schedules the scan. It costs no events on a screen that did not move: the
   // per-region change check drops an identical snapshot, so the ceiling this
   // adds is one scan per settle window, not one event per click.
+  //
+  // The key trigger is Enter and Space only, and that restriction is
+  // load-bearing rather than tidiness. `keyup` fires on every keystroke, so
+  // typing in a filter box re-armed the debounce on each letter; the deferral
+  // ceiling then forced a full document scan every UI_NUM_MAX_WAIT_MS for as
+  // long as the person kept typing. Enter and Space are the keys that ACTIVATE
+  // a control — the keyboard equivalent of the press this trigger exists for —
+  // and neither is produced by ordinary typing into a text field, where the
+  // MutationObserver already covers whatever the keystrokes change.
   const onInteraction = (): void => scheduleScan();
+  const onActivationKey = (event: KeyboardEvent): void => {
+    // "Spacebar" is the legacy value older engines report for the space key.
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+      scheduleScan();
+    }
+  };
   document.addEventListener("pointerup", onInteraction, true);
-  document.addEventListener("keyup", onInteraction, true);
+  document.addEventListener("keyup", onActivationKey, true);
   removeInteractionListeners = () => {
     document.removeEventListener("pointerup", onInteraction, true);
-    document.removeEventListener("keyup", onInteraction, true);
+    document.removeEventListener("keyup", onActivationKey, true);
   };
 
   // Navigation commit: SPA route changes (history API) and hash/pop

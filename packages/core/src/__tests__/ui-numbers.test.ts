@@ -1277,6 +1277,47 @@ describe("uiNumbersCollector", () => {
     });
   });
 
+  // `keyup` fires on every keystroke, so an unrestricted key trigger re-armed
+  // the debounce on each letter typed into a filter box; the deferral ceiling
+  // then forced a full document scan every UI_NUM_MAX_WAIT_MS for as long as
+  // the person kept typing. Enter and Space activate a control; letters do not.
+  it("rescans on an activation key and ignores ordinary typing", async () => {
+    document.body.innerHTML = `
+      <main>
+        <input id="filter" />
+        <span>Page 1 of 4</span>
+        <ul class="pagination"><li><a href="#" id="next">Next</a></li></ul>
+      </main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    const before = uiNumEvents(events).length;
+
+    // A class-name flip is invisible to the observer's attribute filter, so
+    // only a scheduled scan can pick it up.
+    document.querySelector("li")!.className = "disabled";
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(before);
+
+    const filter = document.querySelector("#filter")!;
+    for (const key of ["a", "b", "Backspace", "Shift", "ArrowDown"]) {
+      filter.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key }));
+      await settle(bus);
+    }
+    expect(uiNumEvents(events)).toHaveLength(before);
+
+    document
+      .querySelector("#next")!
+      .dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
+    await settle(bus);
+
+    expect(uiNumEvents(events)).toHaveLength(before + 1);
+    expect(uiNumEvents(events).at(-1)!.d.items).toContainEqual({
+      label: "control:next",
+      value: 0,
+    });
+  });
+
   // The press schedules a scan, not an event: a screen that did not move still
   // costs nothing, which is what keeps the added lane bounded.
   it("emits nothing for a press that changed no figure", async () => {
