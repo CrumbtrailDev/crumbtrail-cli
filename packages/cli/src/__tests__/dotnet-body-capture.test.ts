@@ -40,7 +40,7 @@ it("uses the owned package in the shared hosted and single service setup prompt"
     { endpoint: "https://capture.example", apiKey: "never-inline" },
     { serviceName: "orders" },
   );
-  expect(prompt).toContain("Crumbtrail.AspNetCore 0.1.0");
+  expect(prompt).toContain("Crumbtrail.AspNetCore 0.2.0");
   expect(prompt).toContain("crumbtrail dotnet install");
   expect(prompt).toContain("ShouldCapture");
   expect(prompt).not.toContain("never-inline");
