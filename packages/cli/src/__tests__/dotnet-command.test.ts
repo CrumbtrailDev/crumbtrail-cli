@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import { runDotnetCommand } from "../dotnet-command";
+import { DOTNET_PACKAGE, DOTNET_VERSION } from "../dotnet-package";
 
 vi.mock("node:child_process", () => ({ spawnSync: vi.fn() }));
 const dirs: string[] = [];
@@ -33,9 +34,9 @@ it("installs the pinned package without shell interpolation", () => {
       "add",
       file,
       "package",
-      "Crumbtrail.AspNetCore",
+      DOTNET_PACKAGE,
       "--version",
-      "0.1.0",
+      DOTNET_VERSION,
       "--source",
       "/tmp/feed with spaces",
     ],
