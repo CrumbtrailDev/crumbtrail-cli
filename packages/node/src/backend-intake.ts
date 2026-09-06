@@ -45,6 +45,7 @@ interface FetchInitLike {
 interface ResponseLike {
   ok: boolean;
   status: number;
+  headers?: { get?: (name: string) => string | null };
   text?: () => Promise<string>;
   json?: () => Promise<unknown>;
 }
@@ -79,6 +80,26 @@ export const DEFAULT_BACKEND_INTAKE_RETRIES = 2;
 export const DEFAULT_BACKEND_INTAKE_RETRY_DELAY_MS = 25;
 /** Delay for the exact race where a correlated request beats session start. */
 export const SESSION_START_RACE_RETRY_DELAY_MS = 500;
+/**
+ * Longest wait honoured from a draining instance's Retry-After. The server
+ * sends two seconds; a proxy that rewrites the header must not park a request
+ * handler's event for minutes.
+ */
+export const DRAINING_RETRY_MAX_MS = 3_000;
+
+/**
+ * The delay a 503 with Retry-After asks for, or undefined for any other
+ * refusal. The delay loop multiplies by the attempt number, so the cap is on
+ * the base.
+ */
+function drainingRetryDelayMs(response: ResponseLike): number | undefined {
+  if (response.status !== 503) return undefined;
+  const raw = response.headers?.get?.("Retry-After");
+  if (raw === null || raw === undefined || raw.trim() === "") return undefined;
+  const header = Number(raw);
+  if (!Number.isFinite(header) || header < 0) return undefined;
+  return Math.min(Math.ceil(header * 1000), DRAINING_RETRY_MAX_MS);
+}
 
 /**
  * Simultaneous POSTs to the intake. The transport, not the intake, is the limit:
@@ -398,15 +419,20 @@ async function attemptDelivery(
       const reason = await readRefusalReason(response);
       const sessionStartRace =
         status === 404 && reason?.trim() === "Session not found";
+      const drainingRetryMs = drainingRetryDelayMs(response);
       return {
         ok: false,
-        // Every endpoint refusal is terminal except the exact session-start
-        // race. A separate browser handshake is creating that row, so this
-        // event becomes valid once the handshake lands.
-        retryable: sessionStartRace,
+        // Every endpoint refusal is terminal except two. The session-start
+        // race: a separate browser handshake is creating that row, so this
+        // event becomes valid once the handshake lands. And a draining
+        // instance: a deploy is replacing it and the replacement already
+        // serves, so the same post lands there after the pause it asked for.
+        retryable: sessionStartRace || drainingRetryMs !== undefined,
         ...(sessionStartRace
           ? { retryDelayMs: SESSION_START_RACE_RETRY_DELAY_MS }
-          : {}),
+          : drainingRetryMs !== undefined
+            ? { retryDelayMs: drainingRetryMs }
+            : {}),
         warning: {
           kind: "http-error",
           message:
