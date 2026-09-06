@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-crumbtrail"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Tauri v2 plugin for Crumbtrail: capture desktop app sessions over native IPC, no server process required"
 license = "MIT"
