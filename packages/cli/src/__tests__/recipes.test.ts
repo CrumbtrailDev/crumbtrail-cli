@@ -1479,8 +1479,13 @@ describe("buildPlan — Remix", () => {
 });
 
 describe("buildPlan — Astro", () => {
-  it("always falls back to a guided snippet reading the Astro PUBLIC env key", () => {
-    const io = fakeInjectIO({ [p("package.json")]: "{}" });
+  const ASTRO_CONFIG = 'import { defineConfig } from "astro/config";\n\nexport default defineConfig({});\n';
+
+  it("writes the client module and registers the integration in astro.config.mjs", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("astro.config.mjs")]: ASTRO_CONFIG,
+    });
     const plan = buildPlan(
       {
         cwd: CWD,
@@ -1491,25 +1496,92 @@ describe("buildPlan — Astro", () => {
       },
       io,
     );
+    expect(plan.kind).toBe("create");
+    expect(plan.targetPath).toBe(p("src", "crumbtrail.client.ts"));
+    expect(plan.content).toContain(`httpEndpoint: "${ENDPOINT}"`);
+    expect(plan.content).toContain(
+      "httpAuthToken: import.meta.env.PUBLIC_CRUMBTRAIL_KEY",
+    );
+    expectNoKeyLiteral(plan.content);
+    expect(plan.keyEnvVar).toBe("PUBLIC_CRUMBTRAIL_KEY");
+
+    // The config edit is the whole mechanism: without the integration Astro
+    // never loads the client module and the build stays green while the page
+    // captures nothing.
+    const edit = (plan.extraEdits ?? []).find(
+      (e) => e.path === p("astro.config.mjs"),
+    );
+    expect(edit).toBeDefined();
+    expect(edit?.mode).toBe("update");
+    expect(edit?.content).toContain("astro:config:setup");
+    expect(edit?.content).toContain(
+      'injectScript("page", \'import "/src/crumbtrail.client.ts";\')',
+    );
+    expect(edit?.content).toContain("integrations: [crumbtrailIntegration]");
+  });
+
+  it("merges into an existing integrations array rather than replacing it", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("astro.config.mjs")]:
+        'import { defineConfig } from "astro/config";\nimport mdx from "@astrojs/mdx";\n\nexport default defineConfig({ integrations: [mdx()] });\n',
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "astro", endpoint: ENDPOINT, entryFile: null },
+      io,
+    );
+    expect(plan.kind).toBe("create");
+    const edit = (plan.extraEdits ?? [])[0];
+    expect(edit?.content).toContain("mdx()");
+    expect(edit?.content).toContain("crumbtrailIntegration");
+  });
+
+  it("falls back to guidance when there is no astro config to register into", () => {
+    const io = fakeInjectIO({ [p("package.json")]: "{}" });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "astro", endpoint: ENDPOINT, entryFile: null },
+      io,
+    );
     expect(plan.kind).toBe("fallback-ai");
-    expect(plan.snippet).toContain(`httpEndpoint: "${ENDPOINT}"`);
     expect(plan.snippet).toContain(
       "httpAuthToken: import.meta.env.PUBLIC_CRUMBTRAIL_KEY",
     );
     expectNoKeyLiteral(plan.snippet);
-    expect(plan.snippet).toContain('from "crumbtrail-core"');
-    expect(plan.snippet).toContain('import "crumbtrail-core/early";');
-    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
-    expect(plan.warnings.join(" ")).toMatch(/layout/i);
     expect(plan.keyEnvVar).toBe("PUBLIC_CRUMBTRAIL_KEY");
+  });
+
+  it("falls back to guidance when the config shape is not recognisable", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("astro.config.mjs")]:
+        'import { defineConfig } from "astro/config";\nconst cfg = buildIt();\nexport default cfg;\n',
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "astro", endpoint: ENDPOINT, entryFile: null },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+  });
+
+  it("skips a project that already references Crumbtrail in its config", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("astro.config.mjs")]:
+        'import { defineConfig } from "astro/config";\nexport default defineConfig({ integrations: [crumbtrailIntegration] });\n',
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "astro", endpoint: ENDPOINT, entryFile: null },
+      io,
+    );
+    expect(plan.kind).toBe("skip-already-wired");
   });
 });
 
 describe("buildPlan — Angular", () => {
-  // Angular has no browser-safe env-var mechanism (no import.meta.env /
-  // process.env), so there is NO keyRef in the registry. planAngular always hands
-  // off with guidance to add the key to environment.ts — never a prepend/create.
-  it("always hands off with environment.ts guidance (never prepends)", () => {
+  // Angular has no browser-safe env-var mechanism (no import.meta.env, no
+  // process.env), so the key ships as a source literal placeholder the user
+  // pastes over — the same mechanism the `static` recipe uses.
+  it("prepends the init above bootstrapApplication with a literal key placeholder", () => {
     const io = fakeInjectIO({
       [p("package.json")]: "{}",
       [p("src", "main.ts")]: "bootstrapApplication(AppComponent);\n",
@@ -1524,17 +1596,19 @@ describe("buildPlan — Angular", () => {
       },
       io,
     );
-    expect(plan.kind).toBe("fallback-ai");
-    // The snippet reads the key from environment.ts, not an env var or literal.
-    expect(plan.snippet).toContain("httpAuthToken: environment.crumbtrailKey");
-    expect(plan.snippet).toContain('import "crumbtrail-core/early";');
-    expectNoKeyLiteral(plan.snippet);
-    expect(plan.warnings.join(" ")).toMatch(/environment\.ts/i);
-    // No browser-safe env var → no keyEnvVar guidance.
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe(p("src", "main.ts"));
+    expect(plan.content).toContain(`httpEndpoint: "${ENDPOINT}"`);
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
+    // src/main.ts is committed, so the minted key must never land in it.
+    expectNoKeyLiteral(plan.content);
+    expect(plan.content).toContain("<your-ingest-key>");
+    expect(plan.keyIsSourceLiteral).toBe(true);
+    // No browser-safe env var → nothing for the wizard to write to an env file.
     expect(plan.keyEnvVar).toBeUndefined();
   });
 
-  it("still hands off with guidance when the Angular entry is unresolved", () => {
+  it("hands off with guidance when the Angular entry is unresolved", () => {
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
     const plan = buildPlan(
       {
@@ -1547,6 +1621,7 @@ describe("buildPlan — Angular", () => {
     );
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.snippet).toContain(ENDPOINT);
+    expect(plan.warnings.join(" ")).toMatch(/bootstrapApplication/);
     expect(plan.keyEnvVar).toBeUndefined();
   });
 });

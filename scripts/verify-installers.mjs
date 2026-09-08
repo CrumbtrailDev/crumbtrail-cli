@@ -741,12 +741,45 @@ async function runRecipeBrowser({ name, packed, tmpRoot }) {
   if (applied.skipped || applied.written.length === 0) {
     throw new Error(`executePlan wrote nothing (${applied.message})`);
   }
+  // A recipe whose wiring only works because a SECOND file was edited (Astro's
+  // integration registration) is not proven by the entry file alone: the build
+  // stays green and the page captures nothing when that edit is missing. Assert
+  // the executor really wrote it.
+  for (const rel of recipe.extraEditPaths ?? []) {
+    const full = path.join(appDir, rel);
+    if (!applied.written.includes(full)) {
+      throw new Error(
+        `plan did not write the required extra edit ${rel}\n--- written ---\n${applied.written.join("\n")}`,
+      );
+    }
+  }
+
   const clientEntryPath = path.join(appDir, recipe.clientEntry);
-  const clientEntryText = (await readFileSafe(clientEntryPath)) ?? "";
+  let clientEntryText = (await readFileSafe(clientEntryPath)) ?? "";
   if (!/crumbtrail-core/.test(clientEntryText)) {
     throw new Error(
       `client entry ${recipe.clientEntry} was NOT wired (no crumbtrail-core reference)`,
     );
+  }
+
+  // Targets with no browser env mechanism (Angular) get the key as a source
+  // literal placeholder, and the plan says so. Stand in for the human who
+  // pastes the key — that substitution is part of the shipped flow, so the
+  // harness has to perform it before the built page can authenticate.
+  if (recipe.sourceLiteralKey) {
+    if (plan.keyIsSourceLiteral !== true) {
+      throw new Error(
+        `expected a source-literal key plan, but plan.keyIsSourceLiteral=${plan.keyIsSourceLiteral} (keyEnvVar=${plan.keyEnvVar})`,
+      );
+    }
+    if (!clientEntryText.includes(SOURCE_KEY_PLACEHOLDER)) {
+      throw new Error(
+        `client entry ${recipe.clientEntry} carries no '${SOURCE_KEY_PLACEHOLDER}' to replace`,
+      );
+    }
+    clientEntryText = clientEntryText.split(SOURCE_KEY_PLACEHOLDER).join(stub.apiKey);
+    await fs.writeFile(clientEntryPath, clientEntryText, "utf8");
+    phase("PASS", `${name}:key-paste`, `substituted the source-literal key`);
   }
   phase(
     "PASS",
@@ -947,6 +980,13 @@ function backendReqState(ingest) {
 /** Header the frontend SDK stamps on its requests; the middleware needs it. */
 const HARNESS_SESSION_HEADER = "x-crumbtrail-session-id";
 
+/**
+ * The literal the CLI writes where a target has no env mechanism at all
+ * (packages/cli src/inject/recipes.ts SOURCE_KEY_PLACEHOLDER). Kept in sync by
+ * the assertion in runRecipeBrowser, which fails loudly if it stops matching.
+ */
+const SOURCE_KEY_PLACEHOLDER = "<your-ingest-key>";
+
 /** True once the ingest stub recorded an auto-captured backend error event. */
 function hasBoomErrorEvent(ingest) {
   for (const rec of ingest.seen("/api/events")) {
@@ -1124,9 +1164,9 @@ async function runRecipeGuidance({ name, tmpRoot }) {
   phase("START", `${name}:materialize`, `app=${appDir}`);
   // Copy files only, never npm: a guidance recipe installs nothing, so the
   // materialized tree must stay byte-identical to the fixture (see diffTrees
-  // below). Some guidance fixtures DO carry a package.json — astro and angular
-  // are ordinary JS apps whose plans happen not to mutate — so the absence of
-  // one is not what makes a row guidance-only.
+  // below). A guidance fixture may still carry a package.json — what makes a
+  // row guidance-only is that its plan mutates nothing, not the absence of a
+  // manifest.
   await fs.cp(recipe.fixtureDir, appDir, {
     recursive: true,
     filter: (src) => !src.includes(`${path.sep}node_modules${path.sep}`),

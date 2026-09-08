@@ -18,6 +18,11 @@
 //                         "active"    — enforced this checkpoint
 //                         "todo-cp1"  — encoded now, enforced from CP1 (skipped)
 //   portSlot          — dedicated 496xx port so parallel recipes never clash
+//   extraEditPaths    — files BESIDES clientEntry the plan must write for the
+//                       wiring to work at all (Astro's integration registration)
+//   sourceLiteralKey  — the target has no browser env var, so the CLI writes a
+//                       key placeholder the user pastes over; the harness does
+//                       that substitution itself before building
 //
 // Port block: 49610–49659, one slot per recipe (leave room for CP1–5 fixtures).
 
@@ -733,24 +738,27 @@ INSTALLER_RECIPES["deno-deploy"] = serverlessGuidance({
 // ── CP6: the frontend recipes the matrix never proved ────────────────────────
 // Before this block the harness covered 21 of the 28 recipes. Of the seven that
 // were missing, three are named in `crumbtrail --help` under "Browser" and had
-// no end-to-end row at all: SvelteKit, Astro and Angular. They do not all get
-// the same kind of row, because the installer does not treat them the same way:
+// no end-to-end row at all: SvelteKit, Astro and Angular. All three now inject
+// for real, so all three get full browser rows — build, serve, load in
+// chromium, assert an authed session reached ingest — but each proves a
+// different mechanism:
 //
-//   sveltekit — INJECTS. planSvelteKit creates src/hooks.client.ts, so it earns
-//               a full browser row: build, serve, load in chromium, assert an
-//               authed session reached ingest.
-//   astro     — GUIDANCE. Astro has no single client entry, so planAstro emits a
-//               fallback-ai plan and mutates nothing. The thing worth asserting
-//               is that it still mutates nothing and still names PUBLIC_ (the
-//               only prefix Astro exposes to the browser) plus the manual step.
-//   angular   — GUIDANCE. An Angular browser build exposes neither
-//               import.meta.env nor process.env, so planAngular emits a
-//               fallback-ai plan reading environment.crumbtrailKey. Same shape.
-//
-// A guidance row is not a weaker test of the same thing — it is the test that
-// catches the failure that actually matters here: a future change that starts
-// writing files for a framework whose key mechanism does not exist, leaving a
-// build referencing an undefined variable while every printed step says done.
+//   sveltekit — planSvelteKit creates src/hooks.client.ts, the framework's own
+//               client hook. One file, one env var, nothing else.
+//   astro     — Astro has no single client entry, so the plan writes TWO files:
+//               src/crumbtrail.client.ts plus a registration of an inline
+//               integration in astro.config.mjs whose astro:config:setup hook
+//               injectScript()s it onto every page. The config edit is asserted
+//               by name (extraEditPaths): without it the build is green and the
+//               page captures nothing.
+//   angular   — An Angular browser build exposes neither import.meta.env nor
+//               process.env, so the key cannot come from the environment at
+//               all. The plan prepends the init above bootstrapApplication in
+//               src/main.ts carrying a literal placeholder, and the harness
+//               pastes the key over it the way a user does (sourceLiteralKey).
+//               src/main.ts is committed, so the minted key must never be
+//               written there — the plan-level assertion for that lives in the
+//               CLI unit tests.
 
 INSTALLER_RECIPES["sveltekit"] = {
   recipe: "sveltekit",
@@ -785,26 +793,31 @@ INSTALLER_RECIPES["sveltekit"] = {
 INSTALLER_RECIPES["astro"] = {
   recipe: "astro",
   fixtureDir: path.join(fixturesRoot, "astro"),
-  guidanceOnly: true,
-  expectedPlanKind: "fallback-ai",
-  buildCmd: null,
-  runCmd: null,
+  // `create`: the init lands in a new src/crumbtrail.client.ts, and the config
+  // gains the integration that injects it (an extraEdit, asserted below).
+  expectedPlanKind: "create",
+  browserLoad: true,
+  clientEntry: path.join("src", "crumbtrail.client.ts"),
+  bundleDir: "dist",
+  buildCmd: ["npm", "run", "build"],
+  runCmd: ["npx", "astro", "preview", "--host", "127.0.0.1"],
+  portFlag: "--port",
   portSlot: 49624,
-  // PUBLIC_ is the only prefix Astro inlines into browser code. A snippet that
-  // named any other variable would build clean and capture nothing.
-  snippetMustContain: [
-    "crumbtrail-core",
-    "import.meta.env.PUBLIC_CRUMBTRAIL_KEY",
-    "PRESET_PASSIVE",
-  ],
-  // The manual step IS the deliverable for a guidance recipe: without it the
-  // reader is handed a snippet and no idea where it goes.
-  warningMustContain: ["client-side <script>", "shared layout"],
+  // The config edit is the whole mechanism: without the integration Astro never
+  // loads the client module and the page captures nothing while the build is
+  // green. Assert the file it must land in.
+  extraEditPaths: ["astro.config.mjs"],
   wireAssertions: [
     {
-      id: "astro-guidance-snippet",
+      id: "client-bundle-shipped",
       description:
-        "detect() resolves astro and buildPlan() emits a non-mutating fallback-ai plan whose snippet reads PUBLIC_CRUMBTRAIL_KEY and whose warning names the layout step",
+        "the injected Crumbtrail.init + ingest endpoint ship in the built Astro client bundle (only true when the integration is registered in astro.config.mjs)",
+      status: "active",
+    },
+    {
+      id: "authed-session-start",
+      description:
+        "loading the built page in a browser pushes an authed session/start + event batch to the ingest stub",
       status: "active",
     },
   ],
@@ -813,25 +826,31 @@ INSTALLER_RECIPES["astro"] = {
 INSTALLER_RECIPES["angular"] = {
   recipe: "angular",
   fixtureDir: path.join(fixturesRoot, "angular"),
-  guidanceOnly: true,
-  expectedPlanKind: "fallback-ai",
-  buildCmd: null,
-  runCmd: null,
+  // `prepend`: the init goes above bootstrapApplication in the resolved
+  // src/main.ts, exactly like every other browser recipe with a real entry.
+  expectedPlanKind: "prepend",
+  browserLoad: true,
+  clientEntry: path.join("src", "main.ts"),
+  bundleDir: path.join("dist", "angular-app", "browser"),
+  buildCmd: ["npm", "run", "build"],
+  runCmd: ["npx", "http-server", "dist/angular-app/browser", "-a", "127.0.0.1"],
+  portFlag: "-p",
   portSlot: 49625,
-  // environment.crumbtrailKey, NOT an env var: an Angular browser build exposes
-  // neither import.meta.env nor process.env, and a snippet naming one of those
-  // compiles to a reference to nothing.
-  snippetMustContain: [
-    "crumbtrail-core",
-    "environment.crumbtrailKey",
-    "PRESET_PASSIVE",
-  ],
-  warningMustContain: ["src/environments/environment.ts", "bootstrapApplication"],
+  // Angular has no browser env var, so the key is a source literal. The harness
+  // must substitute it the way hosted setup does before the built page can
+  // authenticate — nothing else in the matrix exercises that path.
+  sourceLiteralKey: true,
   wireAssertions: [
     {
-      id: "angular-guidance-snippet",
+      id: "client-bundle-shipped",
       description:
-        "detect() resolves angular and buildPlan() emits a non-mutating fallback-ai plan reading environment.crumbtrailKey, with the environment.ts + bootstrapApplication steps stated",
+        "the injected Crumbtrail.init + ingest endpoint ship in the built Angular browser bundle",
+      status: "active",
+    },
+    {
+      id: "authed-session-start",
+      description:
+        "loading the built page in a browser pushes an authed session/start + event batch to the ingest stub",
       status: "active",
     },
   ],
@@ -869,7 +888,10 @@ const FIXTURE_PROVENANCE = {
     outDir: "app",
     postGen: ["npm install --package-lock-only --no-audit --no-fund"],
     prune: [".git", ".vscode", ".editorconfig", "README.md", "node_modules", "dist"],
-    note: "pinned to @angular/cli@20: the current major refuses Node below 24.15, which the CI image does not guarantee.",
+    note:
+      "pinned to @angular/cli@20: the current major refuses Node below 24.15, which the CI image does not guarantee. " +
+      "src/app/app.html replaced with a two-line template carrying the fixture marker (the generated welcome page is 19KB of unrelated markup), " +
+      "and http-server added to devDependencies to serve the built browser bundle.",
   },
   nest: {
     generator:

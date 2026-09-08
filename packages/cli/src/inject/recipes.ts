@@ -1588,7 +1588,115 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
  * it into a client-side `<script>` in a shared layout (`.astro`). Honest
  * guidance, not an apology.
  */
-function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
+/** Config filenames Astro loads, in the order Astro itself resolves them. */
+const ASTRO_CONFIG_FILES = [
+  "astro.config.mjs",
+  "astro.config.js",
+  "astro.config.ts",
+  "astro.config.mts",
+  "astro.config.cjs",
+];
+
+/** The integration binding Crumbtrail's client module into every page. */
+const ASTRO_INTEGRATION_NAME = "crumbtrailIntegration";
+
+/** The client module the integration injects, relative to the Astro root. */
+const ASTRO_CLIENT_MODULE = path.join("src", "crumbtrail.client.ts");
+
+/**
+ * Add `${ASTRO_INTEGRATION_NAME}` to the `integrations` array of the config's
+ * default export, returning the whole new file body.
+ *
+ * Text splice at AST offsets rather than a regex: `integrations` may already
+ * hold entries, may be absent, and may sit inside a `defineConfig()` call or a
+ * bare object literal. Returns null for any shape this cannot edit with
+ * certainty — a spread, a variable, a config built by a function — because a
+ * config this writes wrongly is a build that fails on the user's next command.
+ */
+function addAstroIntegration(source: string): string | null {
+  let ast;
+  try {
+    ast = parse(source, {
+      sourceType: "module",
+      plugins: ["typescript"],
+      ranges: true,
+    });
+  } catch {
+    return null;
+  }
+  const exported = ast.program.body.find(
+    (node) => node.type === "ExportDefaultDeclaration",
+  );
+  if (!exported) return null;
+  const declaration = exported.declaration;
+  const configObject =
+    declaration.type === "CallExpression" &&
+    declaration.callee.type === "Identifier" &&
+    declaration.callee.name === "defineConfig"
+      ? declaration.arguments[0]
+      : declaration;
+  if (!configObject || configObject.type !== "ObjectExpression") return null;
+
+  const existing = configObject.properties.find(
+    (property) =>
+      property.type === "ObjectProperty" &&
+      !property.computed &&
+      ((property.key.type === "Identifier" &&
+        property.key.name === "integrations") ||
+        (property.key.type === "StringLiteral" &&
+          property.key.value === "integrations")),
+  );
+
+  const splice = (at: number, text: string): string =>
+    `${source.slice(0, at)}${text}${source.slice(at)}`;
+
+  if (existing) {
+    // Only a literal array can be extended in place. `integrations: someArray`
+    // would silently drop the injection.
+    if (
+      existing.type !== "ObjectProperty" ||
+      existing.value.type !== "ArrayExpression" ||
+      existing.value.start == null
+    )
+      return null;
+    const isEmpty = existing.value.elements.length === 0;
+    return splice(
+      existing.value.start + 1,
+      isEmpty
+        ? ASTRO_INTEGRATION_NAME
+        : `${ASTRO_INTEGRATION_NAME}, `,
+    );
+  }
+
+  if (configObject.start == null) return null;
+  const isEmpty = configObject.properties.length === 0;
+  return splice(
+    configObject.start + 1,
+    isEmpty
+      ? ` integrations: [${ASTRO_INTEGRATION_NAME}] `
+      : `\n  integrations: [${ASTRO_INTEGRATION_NAME}],`,
+  );
+}
+
+/**
+ * Astro. The recipe used to print a snippet and change nothing, on the grounds
+ * that Astro has no single client entry. It does have a single client HOOK:
+ * an integration's `astro:config:setup` can `injectScript("page", ...)`, which
+ * Astro runs on every page it renders. That is the mechanism `@sentry/astro`
+ * and every other analytics integration uses, and the installer can write it.
+ *
+ * Two files, applied together: the init lives in a normal module
+ * (src/crumbtrail.client.ts) and the config only gains an integration whose
+ * injected script imports it. Keeping the init out of the config string means
+ * no escaping, a one-line config diff, and a file the user can read and edit
+ * like any other source file.
+ *
+ * Falls back to guidance — the old behaviour — whenever the config cannot be
+ * edited with certainty, because a config this writes wrongly breaks the very
+ * next `astro build`.
+ */
+function planAstro(input: BuildPlanInput, io: InjectIO): Plan {
+  const { cwd } = input;
   const block = clientInitSnippet(
     input.endpoint,
     keyExprFor(input)!,
@@ -1596,9 +1704,89 @@ function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
     input.backendOrigins,
     input.sdkVersion,
   );
-  return fallbackPlan(input, block, [
-    "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
-  ]);
+  const manualStep =
+    "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.";
+
+  const configName = ASTRO_CONFIG_FILES.find((name) =>
+    io.exists(path.join(cwd, name)),
+  );
+  if (!configName) {
+    return fallbackPlan(input, block, [
+      `No Astro config file found in ${cwd} (looked for ${ASTRO_CONFIG_FILES.join(", ")}), so there is nowhere to register the integration. ${manualStep}`,
+    ]);
+  }
+  const configPath = path.join(cwd, configName);
+  const source = io.readFile(configPath);
+  if (source == null) {
+    return fallbackPlan(input, block, [
+      `Could not read ${configName}. ${manualStep}`,
+    ]);
+  }
+  // Already ours: re-running must not add the integration twice.
+  if (source.includes(ASTRO_INTEGRATION_NAME)) {
+    return { recipe: input.recipe, kind: "skip-already-wired", targetPath: configPath, content: null, warnings: [] };
+  }
+
+  const clientTarget = path.join(cwd, ASTRO_CLIENT_MODULE);
+  if (io.exists(clientTarget)) {
+    const existing = io.readFile(clientTarget);
+    if (existing) {
+      const existingPlan = existingIntegrationPlan(
+        input,
+        io,
+        existing,
+        clientTarget,
+      );
+      if (existingPlan) return existingPlan;
+    }
+    return fallbackPlan(input, block, [
+      `${ASTRO_CLIENT_MODULE} already exists and isn't Crumbtrail's — wire it manually. ${manualStep}`,
+    ]);
+  }
+
+  const rewritten = addAstroIntegration(source);
+  if (rewritten == null) {
+    return fallbackPlan(input, block, [
+      `${configName} does not export a plain \`defineConfig({ ... })\` object, so the integration could not be registered safely. ${manualStep}`,
+    ]);
+  }
+
+  const integrationBlock = [
+    "// Crumbtrail — runs the browser capture init on every page. `injectScript",
+    '// ("page")` is Astro\'s own per-page client hook; the init itself lives in',
+    `// ${ASTRO_CLIENT_MODULE} so this config keeps a one-line diff.`,
+    `const ${ASTRO_INTEGRATION_NAME} = {`,
+    '  name: "crumbtrail",',
+    "  hooks: {",
+    '    "astro:config:setup": ({ injectScript }) => {',
+    `      injectScript("page", 'import "/${ASTRO_CLIENT_MODULE.split(path.sep).join("/")}";');`,
+    "    },",
+    "  },",
+    "};",
+    "",
+  ].join("\n");
+
+  const exportIndex = rewritten.search(/^export default /m);
+  const configContent =
+    exportIndex === -1
+      ? `${integrationBlock}\n${rewritten}`
+      : `${rewritten.slice(0, exportIndex)}${integrationBlock}${rewritten.slice(exportIndex)}`;
+
+  return {
+    recipe: input.recipe,
+    kind: "create",
+    targetPath: clientTarget,
+    content: withTrailingNewline(block),
+    extraEdits: [
+      {
+        path: configPath,
+        mode: "update",
+        content: withTrailingNewline(configContent),
+        label: `registered the Crumbtrail integration in ${configName}`,
+      },
+    ],
+    warnings: [],
+  };
 }
 
 /**
@@ -1606,21 +1794,38 @@ function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
  * `bootstrapApplication`/`platformBrowserDynamic` call in the resolved
  * `src/main.ts`; fall back when the entry is unresolved.
  */
-function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
-  // A standard Angular browser build exposes neither import.meta.env nor
-  // process.env, so there is no hands-off env var to read (hence no keyRef in the
-  // registry). Emit guidance to add the key to environment.ts and wire it by hand
-  // rather than injecting code that would reference an undefined variable.
+/**
+ * Angular. The recipe used to print a snippet and change nothing, because an
+ * Angular browser build exposes neither `import.meta.env` nor `process.env` and
+ * so has no env var the injected code could read.
+ *
+ * That is a reason to write the key differently, not a reason to write nothing.
+ * Angular's own answer — and Sentry's, and every other browser SDK's on this
+ * framework — is a value in source, so the recipe carries its key as a LITERAL
+ * (`literalKey` in the registry) exactly like the bundler-less `static` recipe
+ * already does. The installer writes every line: the import, the init, and the
+ * placement above `bootstrapApplication`. What the user supplies is one string.
+ *
+ * The placeholder, rather than the minted key, is deliberate and is the one
+ * thing this does not automate. `src/main.ts` is a committed file; a wizard that
+ * mints a live credential into it has written the user's key into their git
+ * history on their behalf. Hosted setup substitutes the real key at download
+ * time, and a local run prints the one replacement step.
+ */
+function planAngular(input: BuildPlanInput, io: InjectIO): Plan {
   const block = clientInitSnippet(
     input.endpoint,
-    "environment.crumbtrailKey",
+    `"${KEY_PLACEHOLDER}"`,
     input.serviceName,
     input.backendOrigins,
     input.sdkVersion,
   );
-  return fallbackPlan(input, block, [
-    "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
-  ]);
+  if (!input.entryFile) {
+    return fallbackPlan(input, block, [
+      "Could not resolve the Angular entry (src/main.ts) — prepend the snippet above your bootstrapApplication call.",
+    ]);
+  }
+  return prependWithPreflight(input, io, input.entryFile, block);
 }
 
 /**
@@ -3944,6 +4149,14 @@ export function buildPlan(
   if (keyRef) {
     if (plan.keyEnvVar === undefined) plan.keyEnvVar = keyRef.envVar;
     if (keyRef.compileTime) plan.keyIsCompileTime = true;
+  }
+  // A recipe with no env mechanism carries its key as a source literal instead
+  // (static, angular). Stamped from the registry rather than per plan-builder so
+  // the flag can never disagree with the code the builder actually emitted: the
+  // same table decides both. The wizard reads it to print the one replacement
+  // step and to keep the run's bar honest — nothing captures until it is done.
+  if (!keyRef && RECIPE_REGISTRY[input.recipe].literalKey) {
+    plan.keyIsSourceLiteral = true;
   }
 
   // A server entry commonly imports its CORS middleware from a focused module.
