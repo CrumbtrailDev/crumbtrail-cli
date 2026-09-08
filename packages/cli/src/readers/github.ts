@@ -102,6 +102,15 @@ const TARGET_CANDIDATES = [
     `src/instrumentation-client${ext}`,
   ]),
   ...SOURCE_EXTENSIONS.map((ext) => `src/hooks.client${ext}`),
+  // Astro: planAstro reads the config to register its integration, and reads
+  // the client module to tell an existing Crumbtrail wiring from someone
+  // else's file. Neither is returned by detection as the entry file.
+  "astro.config.mjs",
+  "astro.config.js",
+  "astro.config.ts",
+  "astro.config.mts",
+  "astro.config.cjs",
+  ...SOURCE_EXTENSIONS.map((ext) => `src/crumbtrail.client${ext}`),
   ...SOURCE_EXTENSIONS.map((ext) => `plugins/crumbtrail.client${ext}`),
   ...SOURCE_EXTENSIONS.map((ext) => `app/plugins/crumbtrail.client${ext}`),
   ...[

@@ -436,8 +436,16 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     sdkPackages: ["crumbtrail-core"],
     serviceName: "web",
     kind: "inject",
-    // No keyRef: a standard Angular browser build has no import.meta.env /
-    // process.env, so planAngular hands off with guidance to use environment.ts.
+    // No keyRef, and a literal instead: a standard Angular browser build has no
+    // import.meta.env and no process.env, so there is no variable the injected
+    // code could read. planAngular wires src/main.ts in full and carries the key
+    // as a source literal, the same shape the bundler-less `static` recipe uses.
+    // Hosted setup replaces the unique placeholder with the minted project key;
+    // a local run leaves the single replacement step in its summary.
+    literalKey: {
+      delivery: "inlined",
+      placeholder: SOURCE_KEY_PLACEHOLDER,
+    },
   },
   "vite-spa": {
     stack: "vite",
