@@ -12,6 +12,15 @@
 
 import { chromium } from "playwright";
 
+// The stub cloud answers no /api/capture-config route, so a wired page holds
+// capture until the SDK's own REMOTE_POLICY_TIMEOUT_MS (5s, packages/core
+// crumbtrail.ts) opens the gate on the local policy. A settle window shorter
+// than that expires before the first session/start can leave the page, and
+// every browser-loaded recipe fails with "no POST /api/session/start reached
+// the stub" while the wiring under test is correct. 9s = the 5s fallback plus
+// room for the session start and the batch flush behind it.
+const DEFAULT_SETTLE_MS = 9_000;
+
 /**
  * Load `url` in headless chromium and (by default) trigger a client error so the
  * wired SDK flushes at least one event batch.
@@ -19,7 +28,7 @@ import { chromium } from "playwright";
  * @param {object} opts
  * @param {string} opts.url                 the running app URL to load
  * @param {boolean} [opts.triggerError]     throw an uncaught error to exercise autoFlagOnError (default true)
- * @param {number} [opts.settleMs]          how long to wait after load/trigger for the flush (default 3500)
+ * @param {number} [opts.settleMs]          how long to wait after load/trigger for the flush (default 9000)
  * @param {number} [opts.navTimeoutMs]      goto timeout (default 30000)
  * @returns {Promise<{ html: string, pageErrors: string[] }>}
  */
@@ -27,7 +36,7 @@ export async function loadAndCapture(opts) {
   const {
     url,
     triggerError = true,
-    settleMs = 3500,
+    settleMs = DEFAULT_SETTLE_MS,
     navTimeoutMs = 30_000,
   } = opts;
 
