@@ -244,6 +244,76 @@ function skipPlan(
   };
 }
 
+/**
+ * The hand-off prompt for a recipe whose key mechanism the generic JS prompt
+ * cannot describe.
+ *
+ * `buildAgentPrompt` reads the recipe's coarse `stack`, and every browser recipe
+ * without a bundler-specific Stack id is registered as `vite`. For a recipe that
+ * also has no `keyRef` that combination resolves to the Vite default and the
+ * prompt names `VITE_CRUMBTRAIL_KEY` and `import.meta.env` — neither of which
+ * exists in a Tauri app (whose events never leave the machine) or an Angular one
+ * (whose browser build exposes no env of any kind). The printed snippet said one
+ * thing and the prompt directly under it said another.
+ *
+ * Both prompts here embed the snippet this plan already emitted, so the two can
+ * never disagree, and both carry the manual steps the snippet alone does not do.
+ */
+function recipeAgentPrompt(
+  input: BuildPlanInput,
+  snippet: string,
+): string | undefined {
+  const indented = snippet
+    .split("\n")
+    .map((line) => (line.trim() === "" ? "" : `       ${line}`));
+  if (input.recipe === "tauri") {
+    return [
+      "You are setting up Crumbtrail in this Tauri v2 app. Make ONLY the changes",
+      "below, do not refactor or touch anything else, then verify the build passes.",
+      "",
+      "There is no ingest endpoint and no ingest key in this app: TauriTransport",
+      "hands events to the app's own Rust plugin, which stores them on the local",
+      "machine. Add no HTTP endpoint, no auth token, and no environment variable",
+      "for a key — none of them applies here. The init call below is complete as",
+      "written.",
+      "",
+      "  1. Install the SDK:  npm install crumbtrail-core",
+      "  2. Prepend this block at the VERY TOP of the frontend entry module — the",
+      "     script index.html loads — above the other imports, so capture is",
+      "     installed before anything can throw:",
+      ...indented,
+      "  3. Register the Rust plugin: add `tauri-plugin-crumbtrail` to",
+      "     src-tauri/Cargo.toml and `.plugin(tauri_plugin_crumbtrail::init())` to",
+      "     the builder chain in src-tauri/src/lib.rs. Without it the JS above has",
+      "     nothing to hand events to.",
+      "  4. Grant the plugin permission: add `crumbtrail:default` to the permissions",
+      "     array in src-tauri/capabilities/default.json, or every Crumbtrail invoke",
+      "     fails at runtime.",
+      "  5. Change nothing else, then verify the app builds and runs.",
+    ].join("\n");
+  }
+  if (input.recipe === "angular") {
+    return [
+      "You are setting up Crumbtrail in this Angular app. Make ONLY the changes",
+      "below, do not refactor or touch anything else, then verify the build passes.",
+      "",
+      "An Angular browser build exposes no build-time environment object at all,",
+      "so the key travels as a literal in source rather than through an",
+      "environment variable. Reference no bundler env global here: none of them",
+      "exists in this build.",
+      "",
+      "  1. Install the SDK:  npm install crumbtrail-core",
+      "  2. Prepend this block at the top of src/main.ts, above the",
+      "     bootstrapApplication / platformBrowserDynamic call:",
+      ...indented,
+      `  3. Replace the ${KEY_PLACEHOLDER} string with the ingest key from the`,
+      "     Crumbtrail dashboard. Nothing is captured until that is done.",
+      "  4. Change nothing else, then verify the build still passes.",
+    ].join("\n");
+  }
+  return undefined;
+}
+
 function fallbackPlan(
   input: BuildPlanInput,
   snippet: string,
@@ -275,18 +345,20 @@ function fallbackPlan(
     // the recipe's exact keyRef so the prompt names the same env var the injected
     // snippet reads (e.g. Astro's PUBLIC_, Expo's EXPO_PUBLIC_) — the coarse Stack
     // alone can't distinguish those.
-    agentPrompt: buildAgentPrompt(
-      RECIPE_REGISTRY[input.recipe].stack,
-      {
-        endpoint: input.endpoint,
-        apiKey: KEY_PLACEHOLDER,
-      },
-      {
-        keyEnv: keyRefFor(input),
-        serviceName: input.serviceName,
-        backendOrigins: input.backendOrigins,
-      },
-    ),
+    agentPrompt:
+      recipeAgentPrompt(input, snippet) ??
+      buildAgentPrompt(
+        RECIPE_REGISTRY[input.recipe].stack,
+        {
+          endpoint: input.endpoint,
+          apiKey: KEY_PLACEHOLDER,
+        },
+        {
+          keyEnv: keyRefFor(input),
+          serviceName: input.serviceName,
+          backendOrigins: input.backendOrigins,
+        },
+      ),
     warnings,
   };
 }
@@ -1662,9 +1734,7 @@ function addAstroIntegration(source: string): string | null {
     const isEmpty = existing.value.elements.length === 0;
     return splice(
       existing.value.start + 1,
-      isEmpty
-        ? ASTRO_INTEGRATION_NAME
-        : `${ASTRO_INTEGRATION_NAME}, `,
+      isEmpty ? ASTRO_INTEGRATION_NAME : `${ASTRO_INTEGRATION_NAME}, `,
     );
   }
 
@@ -1724,7 +1794,13 @@ function planAstro(input: BuildPlanInput, io: InjectIO): Plan {
   }
   // Already ours: re-running must not add the integration twice.
   if (source.includes(ASTRO_INTEGRATION_NAME)) {
-    return { recipe: input.recipe, kind: "skip-already-wired", targetPath: configPath, content: null, warnings: [] };
+    return {
+      recipe: input.recipe,
+      kind: "skip-already-wired",
+      targetPath: configPath,
+      content: null,
+      warnings: [],
+    };
   }
 
   const clientTarget = path.join(cwd, ASTRO_CLIENT_MODULE);
@@ -2630,7 +2706,8 @@ const TAURI_RUST_WARNINGS = [
 
 function planTauri(input: BuildPlanInput, io: InjectIO): Plan {
   // The Tauri transport routes to the local Rust store, so the block needs no
-  // endpoint/apiKey — but they still thread through fallbackPlan's agent prompt.
+  // endpoint/apiKey — and neither does the hand-off prompt, which is Tauri
+  // shaped (see recipeAgentPrompt) rather than the generic JS/HTTP one.
   const block = tauriInitSnippet(input.sdkVersion);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
