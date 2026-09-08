@@ -1184,6 +1184,35 @@ describe("buildPlan — Tauri", () => {
     expect(warnings).toContain("crumbtrail:default");
   });
 
+  // The generic JS hand-off prompt is built from the registry's coarse stack,
+  // which for Tauri is "vite" — so it used to print "read it from the
+  // VITE_CRUMBTRAIL_KEY environment variable" and an httpAuthEndpoint/token
+  // init, directly under a snippet that says the transport is local and takes
+  // no key. On a Next-frontend Tauri app import.meta.env does not even exist.
+  it("hands off with Tauri-shaped guidance, never the Vite env-var prompt", () => {
+    const io = fakeInjectIO({ [p("package.json")]: "{}" });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "tauri",
+        endpoint: ENDPOINT,
+        entryFile: null,
+      },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    const prompt = plan.agentPrompt ?? "";
+    expect(prompt).not.toContain("VITE_CRUMBTRAIL_KEY");
+    expect(prompt).not.toContain("httpAuthToken");
+    expect(prompt).not.toContain("import.meta.env");
+    expect(prompt).not.toContain("httpEndpoint");
+    // It must instead carry the transport plus both Rust-side steps.
+    expect(prompt).toContain("transportInstance: new TauriTransport()");
+    expect(prompt).toContain("tauri-plugin-crumbtrail");
+    expect(prompt).toContain("crumbtrail:default");
+    expectNoKeyLiteral(prompt);
+  });
+
   it("does not treat a Tauri dependency alone as complete", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({
@@ -1479,7 +1508,8 @@ describe("buildPlan — Remix", () => {
 });
 
 describe("buildPlan — Astro", () => {
-  const ASTRO_CONFIG = 'import { defineConfig } from "astro/config";\n\nexport default defineConfig({});\n';
+  const ASTRO_CONFIG =
+    'import { defineConfig } from "astro/config";\n\nexport default defineConfig({});\n';
 
   it("writes the client module and registers the integration in astro.config.mjs", () => {
     const io = fakeInjectIO({
@@ -1623,6 +1653,28 @@ describe("buildPlan — Angular", () => {
     expect(plan.snippet).toContain(ENDPOINT);
     expect(plan.warnings.join(" ")).toMatch(/bootstrapApplication/);
     expect(plan.keyEnvVar).toBeUndefined();
+  });
+
+  // Same defect as Tauri: no keyRef plus a "vite" registry stack resolved to
+  // the Vite default, so the hand-off prompt named an env var this build cannot
+  // read, directly under a snippet carrying a literal key placeholder.
+  it("hands off with literal-key guidance, never the Vite env-var prompt", () => {
+    const io = fakeInjectIO({ [p("package.json")]: "{}" });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "angular",
+        endpoint: ENDPOINT,
+        entryFile: null,
+      },
+      io,
+    );
+    const prompt = plan.agentPrompt ?? "";
+    expect(prompt).not.toContain("VITE_CRUMBTRAIL_KEY");
+    expect(prompt).not.toContain("import.meta.env");
+    expect(prompt).toContain(KEY_PLACEHOLDER);
+    expect(prompt).toMatch(/bootstrapApplication/);
+    expectNoKeyLiteral(prompt);
   });
 });
 
