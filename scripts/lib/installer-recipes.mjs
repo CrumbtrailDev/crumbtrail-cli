@@ -730,6 +730,113 @@ INSTALLER_RECIPES["deno-deploy"] = serverlessGuidance({
 //   postGen:   extra commands run inside the app dir after generation
 //   prune:     paths removed post-generation (template cruft / heavy artifacts)
 //   note:      free-text caveat (manual trims the refresh diff will surface)
+// ── CP6: the frontend recipes the matrix never proved ────────────────────────
+// Before this block the harness covered 21 of the 28 recipes. Of the seven that
+// were missing, three are named in `crumbtrail --help` under "Browser" and had
+// no end-to-end row at all: SvelteKit, Astro and Angular. They do not all get
+// the same kind of row, because the installer does not treat them the same way:
+//
+//   sveltekit — INJECTS. planSvelteKit creates src/hooks.client.ts, so it earns
+//               a full browser row: build, serve, load in chromium, assert an
+//               authed session reached ingest.
+//   astro     — GUIDANCE. Astro has no single client entry, so planAstro emits a
+//               fallback-ai plan and mutates nothing. The thing worth asserting
+//               is that it still mutates nothing and still names PUBLIC_ (the
+//               only prefix Astro exposes to the browser) plus the manual step.
+//   angular   — GUIDANCE. An Angular browser build exposes neither
+//               import.meta.env nor process.env, so planAngular emits a
+//               fallback-ai plan reading environment.crumbtrailKey. Same shape.
+//
+// A guidance row is not a weaker test of the same thing — it is the test that
+// catches the failure that actually matters here: a future change that starts
+// writing files for a framework whose key mechanism does not exist, leaving a
+// build referencing an undefined variable while every printed step says done.
+
+INSTALLER_RECIPES["sveltekit"] = {
+  recipe: "sveltekit",
+  fixtureDir: path.join(fixturesRoot, "sveltekit"),
+  // `create`: SvelteKit's client hook file is not in the minimal template, so
+  // the plan writes a new src/hooks.client.ts rather than prepending anywhere.
+  expectedPlanKind: "create",
+  browserLoad: true,
+  clientEntry: path.join("src", "hooks.client.ts"),
+  bundleDir: path.join("build", "client"),
+  buildCmd: ["npm", "run", "build"],
+  // adapter-node's server reads PORT from the environment (portFlag: null).
+  runCmd: ["node", "build/index.js"],
+  portFlag: null,
+  portSlot: 49623,
+  wireAssertions: [
+    {
+      id: "client-bundle-shipped",
+      description:
+        "the injected Crumbtrail.init + ingest endpoint ship in the built SvelteKit client bundle (only true when the hook lands in src/hooks.client.ts)",
+      status: "active",
+    },
+    {
+      id: "authed-session-start",
+      description:
+        "loading the built page in a browser pushes an authed session/start + event batch to the ingest stub",
+      status: "active",
+    },
+  ],
+};
+
+INSTALLER_RECIPES["astro"] = {
+  recipe: "astro",
+  fixtureDir: path.join(fixturesRoot, "astro"),
+  guidanceOnly: true,
+  expectedPlanKind: "fallback-ai",
+  buildCmd: null,
+  runCmd: null,
+  portSlot: 49624,
+  // PUBLIC_ is the only prefix Astro inlines into browser code. A snippet that
+  // named any other variable would build clean and capture nothing.
+  snippetMustContain: [
+    "crumbtrail-core",
+    "import.meta.env.PUBLIC_CRUMBTRAIL_KEY",
+    "PRESET_PASSIVE",
+  ],
+  // The manual step IS the deliverable for a guidance recipe: without it the
+  // reader is handed a snippet and no idea where it goes.
+  warningMustContain: ["client-side <script>", "shared layout"],
+  wireAssertions: [
+    {
+      id: "astro-guidance-snippet",
+      description:
+        "detect() resolves astro and buildPlan() emits a non-mutating fallback-ai plan whose snippet reads PUBLIC_CRUMBTRAIL_KEY and whose warning names the layout step",
+      status: "active",
+    },
+  ],
+};
+
+INSTALLER_RECIPES["angular"] = {
+  recipe: "angular",
+  fixtureDir: path.join(fixturesRoot, "angular"),
+  guidanceOnly: true,
+  expectedPlanKind: "fallback-ai",
+  buildCmd: null,
+  runCmd: null,
+  portSlot: 49625,
+  // environment.crumbtrailKey, NOT an env var: an Angular browser build exposes
+  // neither import.meta.env nor process.env, and a snippet naming one of those
+  // compiles to a reference to nothing.
+  snippetMustContain: [
+    "crumbtrail-core",
+    "environment.crumbtrailKey",
+    "PRESET_PASSIVE",
+  ],
+  warningMustContain: ["src/environments/environment.ts", "bootstrapApplication"],
+  wireAssertions: [
+    {
+      id: "angular-guidance-snippet",
+      description:
+        "detect() resolves angular and buildPlan() emits a non-mutating fallback-ai plan reading environment.crumbtrailKey, with the environment.ts + bootstrapApplication steps stated",
+      status: "active",
+    },
+  ],
+};
+
 const FIXTURE_PROVENANCE = {
   // Hand-authored minimal backends — no generator to re-run.
   "express-cjs": { generator: null },
@@ -740,6 +847,30 @@ const FIXTURE_PROVENANCE = {
   // Hand-authored non-JS OTLP backend fixture.
   "otlp-fastapi": { generator: null },
   // Real scaffolders.
+  sveltekit: {
+    generator:
+      "npx --yes sv@latest create app --template minimal --types ts --no-add-ons --no-install",
+    outDir: "app",
+    postGen: ["npm install --package-lock-only --no-audit --no-fund"],
+    prune: [".git", ".vscode", "README.md", "node_modules", ".svelte-kit", "build"],
+    note: "adapter-auto swapped for adapter-node in vite.config.ts (+ package.json) so the built app starts under plain `node build/index.js`; +page.svelte carries the fixture marker.",
+  },
+  astro: {
+    generator:
+      "npm create astro@latest app -- --template minimal --install false --git false --skip-houston --yes",
+    outDir: "app",
+    postGen: ["npm install --package-lock-only --no-audit --no-fund"],
+    prune: [".git", ".vscode", "README.md", "AGENTS.md", "CLAUDE.md", "node_modules", "dist"],
+    note: "index.astro h1 carries the fixture marker.",
+  },
+  angular: {
+    generator:
+      "npx --yes @angular/cli@20 new app --skip-install --skip-git --defaults --style=css --ssr=false",
+    outDir: "app",
+    postGen: ["npm install --package-lock-only --no-audit --no-fund"],
+    prune: [".git", ".vscode", ".editorconfig", "README.md", "node_modules", "dist"],
+    note: "pinned to @angular/cli@20: the current major refuses Node below 24.15, which the CI image does not guarantee.",
+  },
   nest: {
     generator:
       "npx --yes @nestjs/cli@latest new app --skip-install --package-manager npm",
