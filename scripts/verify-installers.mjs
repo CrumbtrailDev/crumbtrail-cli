@@ -1122,7 +1122,11 @@ async function runRecipeGuidance({ name, tmpRoot }) {
   await fs.mkdir(appDir, { recursive: true });
 
   phase("START", `${name}:materialize`, `app=${appDir}`);
-  // Guidance fixtures are non-JS (no package.json); copy files only, never npm.
+  // Copy files only, never npm: a guidance recipe installs nothing, so the
+  // materialized tree must stay byte-identical to the fixture (see diffTrees
+  // below). Some guidance fixtures DO carry a package.json — astro and angular
+  // are ordinary JS apps whose plans happen not to mutate — so the absence of
+  // one is not what makes a row guidance-only.
   await fs.cp(recipe.fixtureDir, appDir, {
     recursive: true,
     filter: (src) => !src.includes(`${path.sep}node_modules${path.sep}`),
@@ -1188,29 +1192,78 @@ async function runRecipeGuidance({ name, tmpRoot }) {
       );
     }
   }
-  // The fixed Bearer form must NOT regress to the unescaped-space encoding.
-  if (snippet.includes(`Authorization=Bearer ${apiKey}`)) {
+  // The warning IS the deliverable for a guidance recipe: a reader handed a
+  // snippet and no placement step has been handed nothing they can act on.
+  const warnings = (plan.warnings ?? []).join("\n");
+  for (const needle of recipe.warningMustContain ?? []) {
+    if (!warnings.includes(needle)) {
+      throw new Error(
+        `guidance warnings missing '${needle}'\n--- warnings ---\n${warnings}`,
+      );
+    }
+  }
+  // OTLP only: the fixed Bearer form must NOT regress to the unescaped-space
+  // encoding. Every other guidance recipe emits a JS snippet with no header.
+  if (
+    recipe.recipe === "otlp" &&
+    snippet.includes(`Authorization=Bearer ${apiKey}`)
+  ) {
     throw new Error(
       "guidance snippet still emits the unescaped 'Authorization=Bearer <key>' form (must be Bearer%20)",
     );
   }
-  phase("PASS", `${name}:wire:otlp-guidance-snippet`, `facts present`);
-
-  // Assert the entry sources were NOT wired (guidance never mutates): the
-  // fixture's main.py must stay byte-identical to the source fixture.
-  const appMainPy = await readFileSafe(path.join(appDir, "main.py"));
-  const fixtureMainPy = await readFileSafe(
-    path.join(recipe.fixtureDir, "main.py"),
+  phase(
+    "PASS",
+    `${name}:wire:${recipe.wireAssertions[0].id}`,
+    `snippet + warnings present`,
   );
-  if (appMainPy !== fixtureMainPy) {
-    throw new Error("guidance run unexpectedly mutated main.py");
+
+  // Guidance never mutates, so the WHOLE materialized tree must still match the
+  // committed fixture — not just the one entry file an earlier version checked.
+  // A plan that quietly starts writing a framework's entry (or a .env holding a
+  // live key) for a stack with no key mechanism is exactly the regression this
+  // row exists to catch, and it can land in any file.
+  const drift = await diffTrees(recipe.fixtureDir, appDir);
+  if (drift.length > 0) {
+    throw new Error(
+      `guidance run mutated the app tree: ${drift.slice(0, 10).join(", ")}`,
+    );
   }
-  if (await readFileSafe(path.join(appDir, ".env"))) {
-    throw new Error("guidance run unexpectedly wrote a .env");
-  }
-  phase("PASS", `${name}:non-mutating`, `no source/.env writes`);
+  phase("PASS", `${name}:non-mutating`, `${drift.length} files differ`);
 
   return { name, ok: true };
+}
+
+/**
+ * Every path under `actual` whose bytes differ from `expected`, plus anything
+ * present in one tree and not the other. node_modules is skipped: the guidance
+ * runner never installs, but a stray cache directory must not read as a mutation.
+ */
+async function diffTrees(expected, actual) {
+  const listFiles = async (root) => {
+    const out = new Map();
+    const walk = async (dir, prefix) => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        const rel = prefix ? path.join(prefix, entry.name) : entry.name;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full, rel);
+        else out.set(rel, await fs.readFile(full));
+      }
+    };
+    await walk(root, "");
+    return out;
+  };
+  const [want, got] = await Promise.all([listFiles(expected), listFiles(actual)]);
+  const differing = [];
+  for (const [rel, bytes] of want) {
+    const other = got.get(rel);
+    if (!other) differing.push(`${rel} (removed)`);
+    else if (!bytes.equals(other)) differing.push(`${rel} (modified)`);
+  }
+  for (const rel of got.keys()) if (!want.has(rel)) differing.push(`${rel} (added)`);
+  return differing;
 }
 
 function assertServerlessPlan(name, recipe, plan) {
