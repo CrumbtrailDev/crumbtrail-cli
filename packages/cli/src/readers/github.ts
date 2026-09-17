@@ -23,9 +23,9 @@ import {
   SERVERLESS_DETECTION_CONFIG_FILES,
   serverlessDetectionSourceFiles,
 } from "../detect";
-import { DEPLOY_CONFIG_RE } from "../inject/entrypoints";
+import { DEPLOY_CONFIG_RE, extraBackendEntryCandidates } from "../inject/entrypoints";
 import { executableModuleSpecifiers } from "../inject/amend";
-import { SOURCE_EXTENSIONS } from "../inject/integration";
+import { INTEGRATION_CONFIG_FILE, SOURCE_EXTENSIONS } from "../inject/integration";
 import type { FileReader } from "./types";
 
 /** Thrown when detection reads a path hydration did not prefetch. */
@@ -392,6 +392,9 @@ export async function hydrateGithubReader(
   const entryPaths: string[] = [];
   for (const dir of [ROOT, ...dirs]) {
     entryPaths.push(...serverlessDetectionSourceFiles(dir, snapshotReader));
+    entryPaths.push(...extraBackendEntryCandidates(
+      dir, githubInjectIO(snapshotReader), null,
+    ).map((entry) => entry.path));
     const at = (file: string) =>
       norm(dir === ROOT ? `/${file}` : `${dir}/${file}`);
     const pkgText = snap.contents.get(at("package.json")) ?? null;
@@ -416,6 +419,20 @@ export async function hydrateGithubReader(
     for (const name of snapshotReader.readDir(dir)) {
       if (DEPLOY_CONFIG_RE.test(name))
         discoveryPaths.push(path.join(dir, name));
+    }
+  }
+  const inspectionDirs = new Set<string>([ROOT]);
+  for (const serviceDir of dirs) {
+    let dir = serviceDir;
+    while (!inspectionDirs.has(dir)) {
+      inspectionDirs.add(dir);
+      dir = path.posix.dirname(dir);
+    }
+  }
+  for (const dir of inspectionDirs) {
+    for (const name of snapshotReader.readDir(dir)) {
+      if (INTEGRATION_CONFIG_FILE.test(name))
+        discoveryPaths.push(path.posix.join(dir, name));
     }
   }
   if (discoveryPaths.length) await fetchInto(snap, source, discoveryPaths);
@@ -446,6 +463,7 @@ export async function hydrateGithubReader(
   };
   const closureSeeds = [
     ...discoveryPaths,
+    ...entryPaths,
     ...[ROOT, ...dirs].flatMap((dir) =>
       TARGET_CANDIDATES.map((candidate) => path.join(dir, candidate)),
     ),

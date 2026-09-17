@@ -16,6 +16,7 @@ import {
 } from "../readers/github";
 import { detect } from "../detect";
 import { discoverServices } from "../discover";
+import { buildPlan } from "../inject/recipes";
 
 function source(
   files: Record<string, string>,
@@ -366,6 +367,47 @@ describe("hydrateGithubReader", () => {
         alreadyWired: () => false,
       }),
     ).not.toThrow();
+  });
+
+  it("plans a nested Hono bootstrap with ancestor configuration and utility scripts", async () => {
+    const { src, calls } = source({
+      "package.json": '{}',
+      "README.md": "Set CRUMBTRAIL_KEY in the server environment.",
+      "services/.env.example": "CRUMBTRAIL_KEY=example",
+      "services/api/package.json": JSON.stringify({
+        dependencies: { hono: "^4.0.0" },
+        scripts: {
+          dev: "tsx src/index.ts",
+          "suppliers:probe": "tsx utilities/probe.ts",
+        },
+      }),
+      "services/api/.gitignore": "dist/",
+      "services/api/src/index.ts": [
+        'import { serve } from "@hono/node-server";',
+        'import { loadEnvFile } from "./loadEnv.js";',
+        'loadEnvFile();',
+        'const { createApp } = await import("./app.js");',
+        'serve({ fetch: createApp().fetch });',
+      ].join("\n"),
+      "services/api/src/loadEnv.ts": "export function loadEnvFile() {}",
+      "services/api/src/app.ts": 'import { Hono } from "hono"; export const createApp = () => new Hono();',
+      "services/api/utilities/probe.ts": 'console.log("one shot probe");',
+    });
+    const reader = await hydrateGithubReader(src);
+    const detected = detect("/services/api", reader);
+    const plan = buildPlan({
+      cwd: "/services/api",
+      recipe: detected.recipe!,
+      entryFile: detected.entryFile,
+      endpoint: "https://example.invalid",
+      serviceName: "api",
+    }, githubInjectIO(reader));
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe("/services/api/src/index.ts");
+    expect(plan.content).toContain("autoCapture");
+    expect(reader.readFile("/services/.env.example")).toContain("CRUMBTRAIL_KEY");
+    expect(calls.paths).not.toContain("services/api/.gitignore");
+    expect(plan.extraEdits ?? []).toEqual([]);
   });
 
   it("hydrates every serverless config and source candidate detection reads", async () => {
