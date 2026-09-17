@@ -268,8 +268,8 @@ export function nuxtPluginSnippet(
  * hono, fastify, nest and a hand-written server all record the requests the
  * browser correlated without another line of app code. It is dynamically
  * imported so the block is valid whether the entry file is ESM, CommonJS, or
- * TypeScript, and it is a plain expression (no top-level await) so it is safe to
- * prepend at the very top of an entry file. The ingest key is read from
+ * TypeScript. Entries which already use top-level await also await SDK readiness
+ * before continuing their bootstrap; other entries keep the compatible expression. The ingest key is read from
  * `keyExpr` (never inlined server-side) — one variable for the whole project,
  * with `service` naming which app in it this is. Express apps additionally get
  * `createCrumbtrailExpressMiddleware`, which claims the request so it is
@@ -279,6 +279,7 @@ export function nodeInitSnippet(
   endpoint: string,
   keyExpr: string,
   serviceName?: string | null,
+  awaitReady = false,
 ): string {
   return [
     "// Crumbtrail — records every inbound HTTP request that arrives carrying the",
@@ -294,7 +295,7 @@ export function nodeInitSnippet(
     "// Crumbtrail dashboard).",
     ...keyGuardOpen(keyExpr, ""),
     `  const __crumbtrailKey = ${keyExpr};`,
-    '  import("crumbtrail-node")',
+    `  ${awaitReady ? "await " : ""}import("crumbtrail-node")`,
     // The token is passed rather than left to the SDK's own default so the
     // snippet reads the framework's variable rather than whatever the SDK
     // happens to fall back to.

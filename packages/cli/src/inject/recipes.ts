@@ -1503,6 +1503,20 @@ function planCra(input: BuildPlanInput, io: InjectIO): Plan {
  * cosmetic diff/lint noise. Every other backend-JS recipe keeps the
  * double-quoted `nodeInitSnippet` (Prettier's own default).
  */
+function hasTopLevelAwait(source: string): boolean {
+  const program = parseSourceProgram(source);
+  const visit = (node: any): boolean => {
+    if (!node || typeof node !== "object") return false;
+    if (/Function|Method/.test(node.type ?? "")) return false;
+    if (node.type === "AwaitExpression" ||
+      (node.type === "ForOfStatement" && node.await)) return true;
+    return Object.values(node).some((child) =>
+      Array.isArray(child) ? child.some(visit) : visit(child),
+    );
+  };
+  return visit(program);
+}
+
 function planNode(input: BuildPlanInput, io: InjectIO): Plan {
   const keyRef = keyRefFor(input)!;
   const keyExpr = keyRef.expr;
@@ -1516,7 +1530,12 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
   const init =
     input.recipe === "nestjs"
       ? nestInitSnippet(input.endpoint, keyExpr, input.serviceName)
-      : nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      : nodeInitSnippet(
+          input.endpoint,
+          keyExpr,
+          input.serviceName,
+          hasTopLevelAwait(input.entryFile ? io.readFile(input.entryFile) ?? "" : ""),
+        );
   // Preload first: the init below reads the key, and on a laptop the key is in
   // .env and nothing has loaded it yet.
   const block = `${envPreloadSnippet(keyRef.envVar, quote, packageDirFromRepoRoot(input.cwd, io))}\n\n${init}`;
@@ -3445,7 +3464,7 @@ function planDockerBuildArg(
  * so extracted app factories and middleware modules are covered without a
  * repository-wide crawl or path-name guessing.
  */
-function parseCorsProgram(source: string): any | null {
+function parseSourceProgram(source: string): any | null {
   for (const jsx of [false, true]) {
     try {
       return parse(source, {
@@ -3546,7 +3565,7 @@ function installedCorsImports(
   source: string,
   executedFactories: ReadonlySet<string> = new Set(),
 ): Array<{ specifier: string; imported: string; local: string }> {
-  const program = parseCorsProgram(source);
+  const program = parseSourceProgram(source);
   if (!program) return [];
   const bindings = new Map<
     string,
@@ -3812,7 +3831,7 @@ function calledLocalImports(
   source: string,
   executedFactories: ReadonlySet<string> = new Set(),
 ): Array<{ specifier: string; imported: string }> {
-  const program = parseCorsProgram(source);
+  const program = parseSourceProgram(source);
   if (!program) return [];
   const imports = new Map<string, { specifier: string; imported: string }>();
   for (const statement of program.body as any[]) {
@@ -4004,7 +4023,7 @@ function calledLocalImports(
 
 function resolveInstalledExport(source: string, imported: string): string {
   if (imported !== "default") return imported;
-  const program = parseCorsProgram(source);
+  const program = parseSourceProgram(source);
   if (!program) return "__unresolved_default_export__";
   for (const statement of program.body as any[]) {
     if (statement.type === "ExportDefaultDeclaration") {
@@ -4037,7 +4056,7 @@ function resolveInstalledExport(source: string, imported: string): string {
 }
 
 function exportHasCorsEvidence(source: string, binding: string): boolean {
-  const program = parseCorsProgram(source);
+  const program = parseSourceProgram(source);
   if (!program) return false;
   let body = "";
   const visit = (node: any): void => {
