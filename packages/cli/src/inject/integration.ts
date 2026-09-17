@@ -101,7 +101,7 @@ const ENDPOINT_ENV =
 const ENV_NAME =
   /\b(?:[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*|CRUMBTRAIL[A-Z0-9_]*)\b/g;
 
-const ENV_CONFIG_FILE =
+export const INTEGRATION_CONFIG_FILE =
   /^(?:\.env(?:\.[^/]+)*|docker-compose[^/]*\.ya?ml|Dockerfile[^/]*|fly\.toml|render\.ya?ml|vercel\.json|netlify\.toml|README\.md)$/;
 
 function isKeyEnvName(name: string): boolean {
@@ -139,7 +139,7 @@ function inspectionFiles(
   while (files.length < maxFiles) {
     const names = input.io.listFiles?.(dir) ?? [];
     for (const name of [...names].sort()) {
-      if (!ENV_CONFIG_FILE.test(name)) continue;
+      if (!INTEGRATION_CONFIG_FILE.test(name)) continue;
       const file = path.join(dir, name);
       if (seen.has(file)) continue;
       const text = input.io.readFile(file);

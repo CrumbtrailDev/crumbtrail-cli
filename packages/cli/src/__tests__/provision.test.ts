@@ -92,6 +92,32 @@ describe("single-retry on transient failure", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it("recovers service provisioning when fetch wraps a closed socket", async () => {
+    const closed = new TypeError("fetch failed", {
+      cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" }),
+    });
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(closed)
+      .mockResolvedValueOnce(jsonResponse(409, { error: "Service already exists" }))
+      .mockResolvedValueOnce(jsonResponse(200, { services: [
+        { id: "svc_existing", name: "api", sourcePath: "apps/api", repo: "owner/repo" },
+      ] })) as unknown as typeof fetch;
+    const service = await createService("https://example.invalid", "test", "project", {
+      name: "api", identity: { sourcePath: "apps/api", repo: "owner/repo" },
+    }, fetchImpl);
+    expect(service).toMatchObject({ id: "svc_existing", adopted: true, adoptionMatch: "same-source" });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops after one retry when the fetch socket remains closed", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new TypeError("fetch failed", {
+      cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" }),
+    })) as unknown as typeof fetch;
+    await expect(listProjects("https://example.invalid", "test", fetchImpl))
+      .rejects.toThrow("Request failed");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("surfaces a NetworkError (with method+URL) when both attempts fail", async () => {
     const fetchImpl = vi.fn(async () => {
       throw econnreset();

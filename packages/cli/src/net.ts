@@ -164,7 +164,7 @@ function isTransient(err: unknown): boolean {
         )
       : "";
   return [code, causeCode].some((c) =>
-    ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE"].includes(c),
+    ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET"].includes(c),
   );
 }
 

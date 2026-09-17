@@ -615,6 +615,7 @@ function deploymentStartsScript(
     return next?.toLowerCase() === "run" && tokens[2] === entry.script;
   };
   for (const name of io.listFiles(cwd)) {
+    if (!DEPLOY_CONFIG_RE.test(name)) continue;
     const raw = io.readFile(path.join(cwd, name));
     if (!raw) continue;
     if (/^railway.*\.json$/i.test(name)) {
@@ -737,13 +738,13 @@ function escapeRe(text: string): string {
  * Deterministic: candidates are ranked by how likely they are to be a process
  * that stays up, and ties break on path, so a re-run plans the same edits.
  */
-export function findExtraBackendEntries(
+export function extraBackendEntryCandidates(
   cwd: string,
   io: InjectIO,
   mainEntry: string | null | undefined,
-): ExtraEntriesResult {
+): ExtraEntry[] {
   const scripts = readScripts(cwd, io);
-  if (!scripts) return { entries: [], unwired: [] };
+  if (!scripts) return [];
 
   const main = mainEntry ? path.resolve(mainEntry) : null;
   const found = new Map<string, ExtraEntry>();
@@ -775,15 +776,24 @@ export function findExtraBackendEntries(
     }
   }
 
+  return [...found.values()];
+}
+
+export function findExtraBackendEntries(
+  cwd: string,
+  io: InjectIO,
+  mainEntry: string | null | undefined,
+): ExtraEntriesResult {
+  const candidates = extraBackendEntryCandidates(cwd, io, mainEntry);
   const deployConfigText = readDeployConfigText(cwd, io);
   const scored = new Map<string, number>();
-  for (const entry of found.values()) {
+  for (const entry of candidates) {
     scored.set(
       entry.path,
       longRunningScore(entry, path.relative(cwd, entry.path), deployConfigText),
     );
   }
-  const sorted = [...found.values()].sort((a, b) => {
+  const sorted = candidates.sort((a, b) => {
     const byScore = (scored.get(b.path) ?? 0) - (scored.get(a.path) ?? 0);
     if (byScore !== 0) return byScore;
     return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;

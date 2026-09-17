@@ -1292,6 +1292,54 @@ describe("buildPlan — dirty file + ambiguity", () => {
   });
 });
 
+describe("backend bootstrap sequencing", () => {
+  for (const recipe of ["hono", "node"] as const) {
+    it(`${recipe}: waits for capture readiness before continuing an async entry`, async () => {
+      const original = 'if (!process.env.VITEST) { await import("./app.js"); }';
+      const io = fakeInjectIO({
+        [p("package.json")]: '{"type":"module"}',
+        [p("src/index.ts")]: original,
+        [p("src/app.ts")]: 'export const start = () => {};',
+      });
+      const plan = buildPlan({ cwd: CWD, recipe, endpoint: ENDPOINT,
+        entryFile: p("src/index.ts") }, io);
+      expect(plan.kind).toBe("prepend");
+      expect(plan.content).toContain('await import("crumbtrail-node")');
+      let release!: () => void;
+      let captureStarted!: () => void;
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      const started = new Promise<void>((resolve) => { captureStarted = resolve; });
+      let appStarted = false;
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const bootstrap = new AsyncFunction("process", "loadSdk", "startApp",
+        plan.content!.replace('import("crumbtrail-node")', 'loadSdk()') +
+        '\nstartApp();');
+      const running = bootstrap({ env: { CRUMBTRAIL_KEY: "test" } },
+        async () => ({ autoCapture: () => { captureStarted(); return pending; } }),
+        () => { appStarted = true; });
+      await started;
+      expect(appStarted).toBe(false);
+      release();
+      await running;
+      expect(appStarted).toBe(true);
+    });
+  }
+
+  it("does not emit top-level await for CommonJS or function-local awaits", () => {
+    for (const source of [
+      'const app = require("hono"); app.start();',
+      'async function start() { await import("./app.js"); } start();',
+      '// await import("./app.js")\nconst note = "await example";',
+    ]) {
+      const io = fakeInjectIO({ [p("package.json")]: '{}', [p("index.js")]: source });
+      const plan = buildPlan({ cwd: CWD, recipe: "node", endpoint: ENDPOINT,
+        entryFile: p("index.js") }, io);
+      expect(plan.kind).toBe("prepend");
+      expect(plan.content).not.toContain('await import("crumbtrail-node")');
+    }
+  });
+});
+
 describe("buildPlan — backend-JS recipes (express/hono/fastify)", () => {
   for (const recipe of ["express", "hono", "fastify"] as const) {
     it(`${recipe}: prepends the headless-session block reading process.env.CRUMBTRAIL_KEY`, () => {
